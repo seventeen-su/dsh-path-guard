@@ -74,7 +74,27 @@ export function buildNeedles(rules, ctx) {
  */
 export function scanCommand(command, needles, windows) {
   if (typeof command !== 'string' || command === '' || needles.length === 0) return undefined
-  const haystack = windows ? command.toLowerCase() : command
+  const direct = scanText(command, needles, windows)
+  if (direct !== undefined) return direct
+  // A path inside a JSON/JS string literal carries DOUBLED backslashes
+  // (`"C:\\Users\\..."`), which is how any program-string channel spells a
+  // Windows path — a workflow script above all. Collapsing the doubling and
+  // scanning again is the difference between catching that and missing it
+  // entirely; without this pass `readFileSync("C:\\\\Users\\\\...")` reads as an
+  // unrelated string.
+  if (command.includes('\\\\')) return scanText(command.replaceAll('\\\\', '\\'), needles, windows)
+  return undefined
+}
+
+/**
+ * Plain substring search of one haystack.
+ * @param {string} text - already-normalized haystack.
+ * @param {Array<{needle: string, pattern: string, access: string}>} needles - the needles.
+ * @param {boolean} windows - compare case-insensitively.
+ * @returns {{needle: string, pattern: string, access: string} | undefined} the match, if any.
+ */
+function scanText(text, needles, windows) {
+  const haystack = windows ? text.toLowerCase() : text
   for (const entry of needles) {
     const needle = windows ? entry.needle.toLowerCase() : entry.needle
     if (haystack.includes(needle)) return entry

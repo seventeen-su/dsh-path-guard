@@ -60,7 +60,7 @@ window.__ModuleLoader__.load({
       shellDeny: '整体禁用 shell（唯一真正堵住的档位）',
       shellOff: '不处理（已知漏洞）',
       exotic: '无法拦截的工具',
-      exoticHint: 'MCP 服务、run_code、外部子代理循环在独立进程里访问文件系统，插件层无法观察。',
+      exoticHint: 'MCP 服务、run_code、外部子代理循环在独立进程里访问文件系统，插件层既看不到参数也看不到输出。workflow 不在此列——它和 shell 一样按脚本文本扫描（尽力而为）。',
       exoticDeny: '直接拒绝（默认）',
       exoticAllow: '放行（接受漏洞）',
       selfProtection: '自我保护',
@@ -79,7 +79,6 @@ window.__ModuleLoader__.load({
       addRule: '添加规则',
       presets: '常用位置（点一下即添加）',
       presetSsh: '~/.ssh → 仅文件名',
-      presetExempt: '~/.ssh 里放行 README.md',
       presetAws: '~/.aws → 完全禁止',
       presetGnupg: '~/.gnupg → 完全禁止',
       presetDocker: '~/.docker → 完全禁止',
@@ -134,7 +133,7 @@ window.__ModuleLoader__.load({
       shellDeny: 'Deny shell entirely (the only setting that really closes it)',
       shellOff: 'Do nothing (known hole)',
       exotic: 'Unfenceable tools',
-      exoticHint: 'MCP servers, run_code and foreign subagent loops touch the filesystem in their own process; a plugin cannot observe them.',
+      exoticHint: 'MCP servers, run_code and foreign subagent loops touch the filesystem in their own process; the plugin sees neither their arguments nor their output. workflow is NOT in this list — its script text is scanned like a shell command (best effort).',
       exoticDeny: 'Deny (default)',
       exoticAllow: 'Allow (accept the hole)',
       selfProtection: 'Self-protection',
@@ -153,7 +152,6 @@ window.__ModuleLoader__.load({
       addRule: 'Add rule',
       presets: 'Common locations (click to add)',
       presetSsh: '~/.ssh → names only',
-      presetExempt: 'Allow README.md inside ~/.ssh',
       presetAws: '~/.aws → blocked',
       presetGnupg: '~/.gnupg → blocked',
       presetDocker: '~/.docker → blocked',
@@ -197,20 +195,9 @@ window.__ModuleLoader__.load({
      * access level is the conservative-but-usable default for each: SSH keeps
      * names visible so the agent can still tell a key exists, everything else
      * is hidden outright.
-     *
-     * `presetExempt` demonstrates the exemption mechanism and carries a
-     * `parent`: an exemption is not a special syntax, it is a SECOND, more
-     * specific rule, so clicking it adds both the protected directory and the
-     * one file allowed inside it.
      */
     const PRESETS = [
       { key: 'presetSsh', path: '~/.ssh', access: 'list' },
-      {
-        key: 'presetExempt',
-        path: '~/.ssh/README.md',
-        access: 'read',
-        parent: { path: '~/.ssh', access: 'list' },
-      },
       { key: 'presetAws', path: '~/.aws', access: 'none' },
       { key: 'presetGnupg', path: '~/.gnupg', access: 'none' },
       { key: 'presetDocker', path: '~/.docker', access: 'none' },
@@ -389,20 +376,10 @@ window.__ModuleLoader__.load({
         /** Append one rule to the draft, creating the draft if needed. */
         const appendRule = rule => setDraft([...rows, rule])
 
-        /**
-         * Append one preset. An exemption carries a `parent`, so clicking it adds
-         * the protected directory as well — and paths already present are not
-         * duplicated, so the chip is safe to click twice.
-         */
+        /** Append one preset; a path already present is not duplicated. */
         const appendPreset = preset => {
-          const next = [...rows]
-          const add = candidate => {
-            if (next.some(row => row.path === candidate.path)) return
-            next.push({ path: candidate.path, access: candidate.access, note: '' })
-          }
-          if (preset.parent !== undefined) add(preset.parent)
-          add(preset)
-          setDraft(next)
+          if (rows.some(row => row.path === preset.path)) return
+          setDraft([...rows, { path: preset.path, access: preset.access, note: '' }])
         }
 
         /** Ask the Host's directory picker and put the result in one row. */

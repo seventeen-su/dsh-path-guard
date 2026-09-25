@@ -59,19 +59,24 @@ export function denialText({ toolName, shownPath, access, required, ruleId, rule
 }
 
 /**
- * The refusal for a shell call whose command text references a protected path.
- * @param {{toolName: string, needle: string, rulePath?: string, access: string}} input - the match facts.
+ * The refusal for an opaque-program call (shell command or workflow script)
+ * whose text references a protected path.
+ * @param {{toolName: string, needle: string, rulePath?: string, access: string,
+ *          kind?: 'shell'|'script'}} input - the match facts.
  * @returns {string} the model-facing reason.
  */
-export function shellDenialText({ toolName, needle, rulePath, access }) {
+export function shellDenialText({ toolName, needle, rulePath, access, kind = 'shell' }) {
+  const script = kind === 'script'
   return [
-    '访问被拒绝：这条命令引用了用户通过 dsh-path-guard 保护的路径。这不是系统错误。',
+    `访问被拒绝：这${script ? '段脚本' : '条命令'}引用了用户通过 dsh-path-guard 保护的路径。这不是系统错误。`,
     '',
     `- 工具：${toolName}`,
-    `- 命令中出现：${needle}`,
+    `- ${script ? '脚本' : '命令'}中出现：${needle}`,
     `- 命中规则：${rulePath ?? '(默认档位)'} → access: ${access}`,
     '',
-    'shell 命令无法被可靠地逐路径约束，因此这里只做文本扫描，但被扫描到的引用一律拒绝。',
+    script
+      ? 'workflow 脚本在独立上下文里运行，插件无法逐路径约束它，因此只做文本扫描；被扫描到的引用一律拒绝。'
+      : 'shell 命令无法被可靠地逐路径约束，因此这里只做文本扫描，但被扫描到的引用一律拒绝。',
     '',
     NO_BYPASS,
   ].join('\n')

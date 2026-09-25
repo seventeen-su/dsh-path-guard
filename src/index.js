@@ -42,7 +42,15 @@ import {
   redactGlobValue,
   redactGrepValue,
 } from './redact.js'
-import { PATH_TOOLS, SHELL_TOOLS, collectPaths, isExoticTool, opForCommand } from './tool-fields.js'
+import {
+  PATH_TOOLS,
+  SHELL_TOOLS,
+  collectPaths,
+  isExoticTool,
+  isScriptTool,
+  opForCommand,
+  scriptOf,
+} from './tool-fields.js'
 import {
   denialText,
   exoticDenialText,
@@ -227,6 +235,7 @@ export function apply(ctx, config) {
   /** Whether this plugin is the component responsible for judging a tool call. */
   const governs = (toolName) => PATH_TOOLS[toolName] !== undefined
     || SHELL_TOOLS.has(toolName)
+    || isScriptTool(toolName)
     || isExoticTool(toolName)
     || toolName === 'plugin_manager'
 
@@ -455,15 +464,20 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Evaluate the shell-shaped surfaces.
+   * Evaluate the opaque-program surfaces: a shell command string, or a workflow
+   * script. Both are scanned rather than executed-and-inspected, so both are
+   * best effort by construction.
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
-   * @returns {string | undefined} a denial reason, or undefined to allow.
+   * @returns {{reason: string, target: string, access: string, rulePath?: string} | undefined} the verdict.
    */
-  const evaluateShell = (exec) => {
+  const evaluateOpaque = (exec) => {
+    const script = isScriptTool(exec.name)
+    const text = script ? scriptOf(exec.name, exec.arguments) : commandOf(exec.arguments)
+    if (text === undefined) return undefined
+    const kind = script ? 'script' : 'shell'
     const mode = read('shell')
-    if (mode === 'off') return undefined
-    if (!SHELL_TOOLS.has(exec.name)) return undefined
-    if (mode === 'deny') {
+    if (!script && mode === 'off') return undefined
+    if (!script && mode === 'deny') {
       return {
         reason: shellDenialText({ toolName: exec.name, needle: 'shell 已被整体禁用（shell: deny）', access: 'none' }),
         target: '(shell)',
@@ -474,7 +488,7 @@ export function apply(ctx, config) {
     if (needles.length === 0) {
       // No needle at all must not read as "nothing is dangerous". With
       // `defaultAccess` set to anything but allow the user asked for deny by
-      // default, and the shell is the one channel where "nothing matched" is
+      // default, and these are the channels where "nothing matched" is
       // indistinguishable from "not looked for".
       const fallback = read('defaultAccess')
       if (fallback === 'allow') return undefined
@@ -483,12 +497,13 @@ export function apply(ctx, config) {
           toolName: exec.name,
           needle: 'defaultAccess 不是 allow，但没有任何可用的路径规则供扫描',
           access: String(fallback),
+          kind,
         }),
-        target: '(shell)',
+        target: '(opaque program)',
         access: String(fallback),
       }
     }
-    const hit = scanCommand(commandOf(exec.arguments), needles, windows)
+    const hit = scanCommand(text, needles, windows)
     if (hit === undefined) return undefined
     return {
       reason: shellDenialText({
@@ -496,6 +511,7 @@ export function apply(ctx, config) {
         needle: hit.needle,
         rulePath: hit.pattern,
         access: hit.access,
+        kind,
       }),
       target: hit.needle,
       access: hit.access,
@@ -592,9 +608,9 @@ export function apply(ctx, config) {
         verdict = reason === undefined
           ? undefined
           : { reason, kind: 'self', target: String(exec.arguments?.target ?? '') }
-      } else {
-        const shell = evaluateShell(exec)
-        verdict = shell === undefined ? undefined : { ...shell, kind: 'shell' }
+      } else if (SHELL_TOOLS.has(exec.name) || isScriptTool(exec.name)) {
+        const opaque = evaluateOpaque(exec)
+        verdict = opaque === undefined ? undefined : { ...opaque, kind: 'shell' }
       }
       if (verdict !== undefined) reportDenial(exec, verdict, verdict.kind)
       return verdict?.reason
@@ -639,8 +655,8 @@ export function apply(ctx, config) {
       // without ever writing it as a literal produces output this cannot
       // recognise either. Withholding the whole block is deliberate — a partial
       // redaction of arbitrary command output would be guesswork.
-      if (SHELL_TOOLS.has(exec.name)) {
-        if (read('shell') !== 'scan') return next()
+      if (SHELL_TOOLS.has(exec.name) || isScriptTool(exec.name)) {
+        if (read('shell') !== 'scan' && !isScriptTool(exec.name)) return next()
         const needles = shellNeedles(exec)
         if (needles.length === 0) return next()
         const filtered = redactTextBlocks(result.content, needles, windows)

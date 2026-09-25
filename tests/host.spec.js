@@ -515,9 +515,9 @@ test('notify: always bypasses the focus gate, notify: off sends nothing', async 
 test('guard-side denials notify too, and a missing service is silent', async () => {
   const exotic = fakeCtx({ notifyService: {} })
   apply(exotic, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false, notify: 'always' })
-  exotic.guards[0]({ name: 'workflow', arguments: { script: 'x' } })
+  exotic.guards[0]({ name: 'run_code', arguments: { code: 'x' } })
   assert.equal(exotic.pushedAlways.length, 1)
-  assert.match(exotic.pushedAlways[0].message, /workflow/)
+  assert.match(exotic.pushedAlways[0].message, /run_code/)
 
   // No `dsh-desktop-notify` in the profile: denials must still work and log.
   const bare = fakeCtx()
@@ -551,18 +551,39 @@ test('an internal failure notifies as a malfunction', async () => {
 // Regressions for the adversarial verification findings (reports/verification.md)
 // ---------------------------------------------------------------------------
 
-test('V-2: workflow is treated as unfenceable, not silently ignored', () => {
+test('V-2: workflow is scanned as an opaque program, not refused outright', () => {
   const ctx = fakeCtx()
-  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', exoticTools: 'deny', selfProtection: false })
-  // A workflow script runs in a node:vm context that reaches the real process
-  // and spawns an unconfined runtime under danger-full-access, so there is no
-  // argument to inspect.
-  assert.match(ctx.guards[0]({ name: 'workflow', arguments: { script: 'x' } }), /访问被拒绝/)
-  assert.match(ctx.guards[0]({ name: 'ralph', arguments: {} }), /访问被拒绝/)
-  assert.equal(isExoticTool('workflow'), true)
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', exoticTools: 'deny', selfProtection: false })
+  const guard = ctx.guards[0]
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+
+  // A workflow that never mentions a protected path stays usable: refusing the
+  // whole tool would cost a headline capability in every session, including the
+  // ones that never touch a protected path.
+  assert.equal(guard({ name: 'workflow', arguments: { script: 'return 1' } }), undefined)
+  // The escape is still real (`node:vm` -> real `process`), so a script that
+  // names a protected path is refused like a shell command.
+  assert.match(guard({ name: 'workflow', arguments: { script: `readFileSync(${JSON.stringify(target)})` } }), /访问被拒绝/)
+  // Genuinely unobservable surfaces keep the hard refusal.
+  assert.match(guard({ name: 'run_code', arguments: { code: 'x' } }), /访问被拒绝/)
+  assert.match(guard({ name: 'ralph', arguments: {} }), /访问被拒绝/)
+  assert.equal(isExoticTool('workflow'), false)
+  assert.equal(isExoticTool('run_code'), true)
   // In-process delegation stays usable: the global guard covers those children.
-  assert.equal(ctx.guards[0]({ name: 'subagent', arguments: { prompt: 'x' } }), undefined)
-  assert.equal(ctx.guards[0]({ name: 'subagent_fork', arguments: { prompt: 'x' } }), undefined)
+  assert.equal(guard({ name: 'subagent', arguments: { prompt: 'x' } }), undefined)
+  assert.equal(guard({ name: 'subagent_fork', arguments: { prompt: 'x' } }), undefined)
+})
+
+test('a JSON-escaped Windows path is still detected in an opaque program', () => {
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'scan', selfProtection: false })
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+  // Every program-string channel spells a Windows path inside a JS/JSON string
+  // literal, i.e. with DOUBLED backslashes. Before the normalization pass this
+  // read as an unrelated string and slipped through.
+  const script = `const fs = await import('node:fs'); return fs.readFileSync(${JSON.stringify(target)}, 'utf8')`
+  assert.ok(script.includes('\\\\'), 'the fixture must actually contain doubled backslashes')
+  assert.match(ctx.guards[0]({ name: 'workflow', arguments: { script } }), /访问被拒绝/)
 })
 
 test('V-1: shell output blocks mentioning a protected path are withheld', async () => {

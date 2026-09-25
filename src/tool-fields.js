@@ -54,22 +54,35 @@ export const PATH_TOOLS = {
 export const SHELL_TOOLS = new Set(['bash', 'pwsh', 'terminal_open', 'terminal_send'])
 
 /**
- * Tools that reach the filesystem through a process or loop this plugin cannot
- * observe at all.
+ * Tools whose argument is an opaque PROGRAM string. Their text is scanned for
+ * protected paths exactly like a shell command — best effort — instead of being
+ * refused outright.
  *
- * - `run_code` is a real Node/Python process
- *   (packages/ptc-runtime/ptc-runtime-node/src/index.ts:68).
- * - `workflow` runs its script in a `node:vm` context that DSH's own test
- *   escapes on purpose: `globalThis.constructor.constructor('return process')()`
- *   yields the real `process`, and under `danger-full-access` the spawned
- *   runtime is not confined (packages/workflow/workflow-ptc/tests/built-runtime.e2e.ts:58,
- *   packages/ptc-runtime/ptc-runtime-node/src/index.ts:224).
+ * `workflow` deserves the nuance. Its script runs in a `node:vm` context that
+ * DSH's own test escapes on purpose (`globalThis.constructor.constructor('return
+ * process')()`, packages/workflow/workflow-ptc/tests/built-runtime.e2e.ts:58),
+ * and under `danger-full-access` the runtime it spawns is not confined
+ * (packages/ptc-runtime/ptc-runtime-node/src/index.ts:224). Refusing it outright
+ * closes that hole but costs a headline capability in EVERY session, including
+ * the ones that never touch a protected path — which is a bad trade. Scanning
+ * the script keeps the capability and still rejects the naive case; the escape
+ * remains a documented hole, and `exoticTools: deny` is there for anyone who
+ * wants it closed.
+ */
+export const SCRIPT_TOOLS = new Map([['workflow', 'script']])
+
+/**
+ * Tools that reach the filesystem through a process or loop this plugin can
+ * observe neither by argument nor by output.
+ *
+ * - `run_code` is a real Node/Python process whose code argument this plugin has
+ *   no verified field name for (packages/ptc-runtime/ptc-runtime-node/src/index.ts:68).
+ * - `ralph` drives repeated subagent rounds.
  * - MCP tools carry server-supplied schemas.
  * - The codex/claude-code/acp subagents run their own agent loop in a child process.
  */
 export const EXOTIC_TOOLS = new Set([
   'run_code',
-  'workflow',
   'ralph',
   'subagent_codex',
   'subagent_claude_code',
@@ -90,6 +103,28 @@ const SRE_READ_COMMANDS = new Set(['view'])
 export function opForCommand(args) {
   const command = args !== null && typeof args === 'object' ? args.command : undefined
   return typeof command === 'string' && SRE_READ_COMMANDS.has(command) ? OP.READ : OP.WRITE
+}
+
+/**
+ * Whether a tool carries an opaque program string this plugin can scan.
+ * @param {string} toolName - the model-facing tool name.
+ * @returns {boolean} true for a script tool.
+ */
+export function isScriptTool(toolName) {
+  return SCRIPT_TOOLS.has(toolName)
+}
+
+/**
+ * The program text of a script-shaped tool call.
+ * @param {string} toolName - the model-facing tool name.
+ * @param {unknown} args - the parsed tool arguments.
+ * @returns {string | undefined} the script text, when present.
+ */
+export function scriptOf(toolName, args) {
+  const field = SCRIPT_TOOLS.get(toolName)
+  if (field === undefined || args === null || typeof args !== 'object') return undefined
+  const value = args[field]
+  return typeof value === 'string' && value !== '' ? value : undefined
 }
 
 /**
