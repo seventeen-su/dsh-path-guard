@@ -46,17 +46,21 @@
 
 ### 2.1 AI 可见的文件系统表面
 
-| 表面 | 实现位置 | 是否经过 `ctx.fs` | 能否硬拦 |
+| 表面 | 实现位置 | 底层通道 | 能否硬拦 |
 | --- | --- | --- | --- |
-| `read` / `read_image` / `write` / `edit` | `packages/fs/tool-fs/src/index.ts:22,61-78` | ✅ 全部经 `ctx.fs` | ✅ |
-| `glob` / `grep` | `packages/fs/tool-fs-search/src/index.ts`、`search-core.ts:3-12,238` | ❌ 直接 `ctx.subprocess.spawn()` 拉起打包的 ripgrep | ⚠️ 需工具层过滤/拒绝 |
-| `pwsh`（Windows）| `packages/shell/pwsh-sandbox/src/index.ts` | ❌ 经 `ctx.shell` → `ctx.subprocess` | ⚠️ 仅能命令文本扫描（见 §9）|
+| `read` / `read_image` / `write` / `edit` | `packages/fs/tool-fs/src/index.ts:22,61-78` | `ctx.fs` | ✅ |
+| `glob` / `grep` | `packages/fs/tool-fs-search`、`search-core.ts:238-248` | **`ctx.subprocess.spawn()` 拉起打包 ripgrep** | ⚠️ 见 §4-L2 |
+| `str_replace_editor`（若挂载）| `packages/fs/tool-str-replace-editor/src/index.ts:194` | `ctx.fs.listDir` | ✅ |
+| `pwsh`（Windows）| `packages/shell/pwsh-sandbox/src/index.ts` | `ctx.shell` → `ctx.subprocess` | ⚠️ 仅命令文本扫描（§9）|
 | `run_code`（PTC 模式）| `packages/extensions/tool-cordis` | 子调用仍走 tools 管线 | ✅ 继承 guard |
-| 子代理 / workflow / agent-teams | `tool-subagent*`、`tool-workflow` | 子 agent 使用自己的 scope | ✅ 全局 `ctx.fs` 天然覆盖；工具 guard 需验证 scope 继承 |
-| skills / agent-instructions / deliverables / document | 各自包 | ✅ 经 `ctx.fs` | ✅ |
-| GUI 文件树、编辑器 | `ctx.workspaceFiles`（Host Remote）| ✅ 经 `ctx.fs` | ⛔ **不应拦**（G6）|
+| 子代理 / workflow / agent-teams | `tool-subagent*`、`tool-workflow` | 子 agent 各自的工具 scope | ✅ 全局服务替换天然覆盖 |
+| skills / agent-instructions / deliverables / document | 各自包（如 `skill-filesystem/src/index.ts:770`）| `ctx.fs` | ✅ |
+| GUI 文件树、编辑器 | `ctx.workspaceFiles`（`packages/api/workspace-files/src/index.ts:322`）| `ctx.fs` | ⛔ **不应拦**（G6）|
 
-关键结论：**`ctx.fs` 是唯一同时覆盖「大部分 AI 表面」与「GUI 表面」的接缝**，所以必须能区分调用者。
+两条关键结论：
+
+1. **`ctx.fs` 是唯一同时承载「大部分 AI 表面」与「GUI 表面」的接缝**，所以 L1 必须能区分调用者（§2.2）。
+2. **AI 的目录/结构枚举主路径不是 `ctx.fs.listDir`，而是 ripgrep**：`read` 工具不列目录，`glob`（`rg --files`）/`grep`（`rg --json`）才是模型「看结构」的主要手段。因此 `none` 档位（G2）**必须在搜索层解决**，不能只靠 L1 的 `listDir` 过滤。
 
 ### 2.2 区分「AI 调用」与「GUI 调用」
 
@@ -155,26 +159,28 @@ rules:
 ## 4. 架构：分层防护
 
 ```
-                 ┌─────────────────────────────────────────────┐
-   AI 工具调用 → │ L2 tools 层：guard(硬拒) + post-execute(脱敏) │
-                 └─────────────────────────────────────────────┘
-                                     │
-                 ┌─────────────────────────────────────────────┐
-   AI 文件访问 → │ L1 ctx.fs 围栏（PathGuardFileSystem）        │ ← 主防线，覆盖 read/write/edit/
-                 │   仅当 currentInitiator() 存在时启用         │   read_image/skills/instructions…
-                 └─────────────────────────────────────────────┘
-                                     │
-                 ┌─────────────────────────────────────────────┐
-   AI 执行命令 → │ L3 ctx.shell 围栏 + shell 结果脱敏（尽力）   │
-                 └─────────────────────────────────────────────┘
+  AI 文件读写 ─→ ┌──────────────────────────────────────────────┐
+                 │ L1  ctx.fs 围栏 PathGuardFileSystem          │ ← 覆盖 read/read_image/write/edit/
+                 │     仅 currentInitiator() 存在时武装          │   skills/instructions/deliverables…
+                 └──────────────────────────────────────────────┘
+  AI 结构搜索 ─→ ┌──────────────────────────────────────────────┐
+                 │ L2a ctx.subprocess 围栏：给 ripgrep argv 追加 │ ← glob/grep 的结构化排除
+                 │     --glob=!<受保护路径>  （结构性，无泄漏）  │
+                 ├──────────────────────────────────────────────┤
+                 │ L2b tools/post-execute：结果脱敏 + 兜底       │ ← 格式漂移时的保险
+                 └──────────────────────────────────────────────┘
+  AI 执行命令 ─→ ┌──────────────────────────────────────────────┐
+                 │ L3  ctx.shell 围栏（命令文本扫描）+ 输出脱敏  │ ← 尽力而为，非安全边界
+                 └──────────────────────────────────────────────┘
 
-   L0 策略引擎（pathGuard 服务）＝ 上面三层的共同大脑，配置来自前端页面
+  横切：ctx.tools.guard() 对显式路径参数硬拒（顺序无关的兜底）
+  L0  策略引擎（pathGuard 服务）＝ 以上各层的共同大脑，配置来自前端页面
 ```
 
 ### L0 策略引擎（`pathGuard` 服务）
 
 - 拥有 Config 与编译后的规则表；`evaluate(target) → { access, ruleId }`。
-- 纯函数核心（`src/policy.ts`）不依赖 Cordis，便于单测。
+- 纯函数核心（`src/policy.js`）不依赖 Cordis，便于单测。
 - 配置变更后原子替换编译结果；发 `path-guard/changed` 事件。
 
 ### L1 `ctx.fs` 围栏（主防线）
@@ -190,15 +196,38 @@ rules:
 - **门控**：仅当 `ctx.agents.currentInitiator() !== undefined` 时启用。GUI/宿主调用原样放行（G6）。
 - 服务缺失兜底：若 `pathGuard` 服务不可用（配置校验失败等），**退化为父类行为**并打 warning，避免整机不可用；同时在前端页面显示「未武装」状态。
 
-### L2 工具层
+### L2a `ctx.subprocess` 围栏（搜索层，结构性）
 
-1. **硬拒绝（guard）**：对 `read`/`read_image`/`write`/`edit`/`glob`/`grep` 的显式路径参数做 L0 判定，不足则拒绝。作为 L1 之外的**顺序无关**保险（例如 L1 未接管时）。
-2. **`glob` 结果过滤**：`tools/post-execute` 中对返回的路径列表逐条过 L0，剔除 `none` 条目。
-3. **`grep` 结果处理**：命中文件按能力分流——
-   - `none`：整条丢弃，且不出现文件名；
-   - `list`：保留文件名，**移除匹配行内容**；
-   - `read`/`write`：保留。
-   由于 `grep` 走 ripgrep 子进程、可递归整个 cwd，这一层是 `none` 语义不被 `grep` 绕过的必要环节（§2.1）。
+`glob`/`grep` 的真实通道是 `ctx.subprocess.spawn()` 拉起打包的 ripgrep（`search-core.ts:238-248`），argv 形如：
+
+```
+[rg, --no-config, --files, --glob=<模型给的 pattern>, --sort=modified,
+ --no-ignore, --hidden, ...VCS 排除, --, <path>?]
+```
+
+做法：`PathGuardSubprocess extends LocalSubprocessRuntime`（`packages/subprocess/subprocess-local/src/index.ts:59`），只覆写 `spawn(spec)`，识别 ripgrep 调用后在 **`--` 分隔符之前**插入否定 glob：
+
+```
+--glob=!**/<相对路径>      --glob=!**/<相对路径>/**
+```
+
+（两种形式都需要，正是 `glob.ts:96-103` 对 VCS 目录采用同一技巧的原因：当搜索根**位于**目标目录内部时，只有 `/**` 形式会命中。）
+
+排除范围按档位区分 —— 这是「可见名字但不可读内容」的关键：
+
+| 工具 | 排除哪些档位 | 效果 |
+| --- | --- | --- |
+| `glob`（`rg --files`，只出文件名）| 仅 `none` | `list`/`read` 路径的文件名**照常出现**（满足 G3）|
+| `grep`（`rg --json`，带匹配内容）| `none` + `list` | 受保护文件根本不被搜索，**内容零泄漏** |
+
+优点：ripgrep 从头就不会打开受保护文件，不存在「输出里被截掉一行的痕迹」，也不依赖文本解析。我们的否定 glob 追加在模型给的 `--glob` **之后**，按 ripgrep「后者覆盖前者」的语义，模型无法用更宽的 pattern 把保护覆盖掉。
+
+若搜索根本身就是受保护路径（或落在其内部），ripgrep 无意义，直接在 L2b 的 guard 层拒绝整次调用。
+
+### L2b 工具层
+
+1. **硬拒绝（guard）**：对 `read`/`read_image`/`write`/`edit`/`glob`/`grep` 的**显式路径参数**做 L0 判定，不足则拒绝。这是与注册顺序无关的兜底（`ctx.tools.guard()` 的语义保证），也负责给出可读的拒绝理由。
+2. **结果兜底过滤**（`tools/post-execute`）：对 `glob`/`grep` 的文本结果再逐行过一遍 L0，剔除仍命中受保护路径的条目。定位是**防格式漂移的保险**，不是主机制——如果兜底解析拿不准，就在「搜索范围与受保护路径有交集」时**整体阻断**该次结果（fail-closed），宁可少给结果也不泄漏。
 
 ### L3 shell 尽力围栏
 
@@ -214,25 +243,27 @@ rules:
 dsh-path-guard/
 ├─ README.md
 ├─ package.json              # bundle 清单：dsh.bundle.patch
-├─ cordis.patch.yml          # Loader 补丁：接管 fs/shell row + 插入本插件 row
+├─ cordis.patch.yml          # Loader 补丁：接管 fs/subprocess/shell row + 插入本插件 row
 ├─ icon.svg                  # 插件卡片图标
 ├─ locale/{zh,en}.json       # 插件显示名与描述
 ├─ src/
-│  ├─ index.js               # 主插件：注册 pathGuard 服务 + L2 guard/post-execute
+│  ├─ index.js               # 主插件：注册 pathGuard 服务 + L2b guard/post-execute
 │  ├─ policy.js              # L0 纯策略引擎（匹配、优先级、归一化）
 │  ├─ config.js              # schemastery Config（前端页面由此生成）
 │  ├─ fs.js                  # L1 PathGuardFileSystem
+│  ├─ subprocess.js          # L2a PathGuardSubprocess（ripgrep argv 排除）
 │  ├─ shell.js               # L3 PathGuardShellExecutor
-│  └─ result-filter.js       # glob/grep/shell 结果脱敏
+│  └─ result-filter.js       # L2b/L3 结果脱敏
 ├─ tests/
 │  ├─ policy.spec.js
 │  ├─ fs-guard.spec.js
+│  ├─ search-exclude.spec.js
 │  ├─ tool-guard.spec.js
 │  └─ e2e.spec.js
 └─ docs/PLAN.md
 ```
 
-> 说明：bundle 为纯 JS（`references/host-plugin.md:7` 明确「Host-only bundle needs no dependencies, install scripts, or build tool」）。三个服务模块通过 `package.json` 的 `exports` 暴露为子路径（`.`、`./fs`、`./shell`），Loader 的 row `name` 直接写 `dsh-path-guard/fs` 这类说明符。
+> 说明：bundle 为纯 JS（`references/host-plugin.md:7` 明确「Host-only bundle needs no dependencies, install scripts, or build tool」）。四个服务模块通过 `package.json` 的 `exports` 暴露为子路径（`.`、`./fs`、`./subprocess`、`./shell`），Loader 的 row `name` 直接写 `dsh-path-guard/fs` 这类说明符。**该写法有官方先例**：shipped bundle 已用子路径作为 row 名，如 `@deepseek-ai/dsh-tool-subagent/list-agents`（`packages/bundle/web-app/presets/standard.patch.yml:89`）、`@deepseek-ai/dsh-tool-cordis/host`（同文件 :151）。
 
 ---
 
@@ -249,6 +280,7 @@ dsh-path-guard/
   "exports": {
     ".": "./src/index.js",
     "./fs": "./src/fs.js",
+    "./subprocess": "./src/subprocess.js",
     "./shell": "./src/shell.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
@@ -266,19 +298,25 @@ dsh-path-guard/
 - id: fs-sandbox
   name: 'dsh-path-guard/fs'
 
-# 2) 接管 Windows shell 围栏（非 Windows 部署对应改写 pwsh→bash）
+# 2) 接管子进程围栏（ripgrep 搜索排除）
+- id: subprocess
+  name: 'dsh-path-guard/subprocess'
+
+# 3) 接管 Windows shell 围栏（非 Windows 部署对应改写 pwsh→bash）
 - id: pwsh-sandbox
   name: 'dsh-path-guard/shell'
 
-# 3) 插入策略所有者与工具层
+# 4) 插入策略所有者与工具层
 - insert:
     - id: path-guard
       name: 'dsh-path-guard'
       config:
         defaultAccess: allow
-        enforce: { fs: true, tools: true, search: true, shell: scan }
+        enforce: { fs: true, search: exclude, tools: true, shell: scan }
         rules: []
 ```
+
+被覆盖的三个 row 在上游的位置：`subprocess` `packages/bundle/base/cordis.patch.yml:219-220`、`pwsh-sandbox` `:240-242`、`fs-sandbox` `:517-518`。
 
 前端配置页面 = row `id: path-guard` 的命名空间，schema 来自 `Config`。
 
@@ -294,10 +332,10 @@ export const Config = z.object({
   defaultAccess: z.union(['none', 'list', 'read', 'write', 'allow']).default('allow'),
   denyShape: z.union(['not-found', 'denied']).default('not-found'),
   enforce: z.object({
-    fs: z.boolean().default(true),
-    tools: z.boolean().default(true),
-    search: z.boolean().default(true),
-    shell: z.union(['off', 'scan', 'deny-all']).default('scan'),
+    fs: z.boolean().default(true),                              // L1 是否接管 ctx.fs
+    search: z.union(['exclude', 'filter', 'off']).default('exclude'), // L2 搜索层档位
+    tools: z.boolean().default(true),                            // guard/post-execute 兜底
+    shell: z.union(['off', 'scan', 'deny-all']).default('scan'), // L3
   }).default({}),
   rules: z.array(z.object({
     path: z.string().role('text'),
@@ -329,7 +367,9 @@ export const Config = z.object({
 
 ### 8.2 父目录列举（G2 核心）
 
-`listDir(dir)` 返回前过滤：对每个 `entry.target` 跑 L0，`access === 'none'` 的条目**整个移除**。因此 `~` 的列表里不会出现 `.ssh`。同理 `glob` 的结果集在 L2 过滤。
+`listDir(dir)` 返回前过滤：对每个 `entry.target` 跑 L0，`access === 'none'` 的条目**整个移除**。因此 `~` 的列表里不会出现 `.ssh`。
+
+但注意 §2.1 的结论：**模型「看结构」主要靠 ripgrep（`glob`/`grep`），不是 `listDir`**。所以 G2 的完整达成依赖三处协同：L1 的 `listDir` 过滤（覆盖 `str_replace_editor`、skills 与 GUI）、L2a 的 argv 排除（覆盖 `glob`/`grep` 的结构枚举）、L2b 的 guard（覆盖显式点名受保护路径的调用）。
 
 ### 8.3 符号链接与规范化
 
@@ -352,11 +392,11 @@ export const Config = z.object({
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | **shell 命令可混淆** | `pwsh` 中变量拼接、编码、外部程序可绕过文本扫描读取 `none` 路径 | 提供 `shell: deny-all`；长期方案见 §11 M5（ACL）|
-| **`grep`/`glob` 走子进程** | 不经过 `ctx.fs`，只能靠 L2 过滤 | 已设计结果过滤；`none` 条目整条剔除 |
-| **上游 row id 变化** | 覆盖失效，围栏静默消失 | §8.5 自检 + 页面告警 + 测试断言 |
+| **覆盖上游 row 依赖 row id** | DSH 升级若改 id/包名，围栏静默消失 | §8.5 自检 + 页面告警 + 单测断言；升级后必须重跑 §10 验收 |
+| **L2a argv 注入依赖 ripgrep argv 形态** | `tool-fs-search` 若改变 argv 结构（如 `--` 位置）则注入点失效 | 注入点按「`--` 之前」计算并对无 `--` 情形回退；L2b 兜底过滤；单测直接断言生成的 argv |
 | **TOCTOU** | 检查后路径被替换成符号链接 | 与 `fs-sandbox` 同等威胁模型，判定在 resolve 后、操作前紧邻执行 |
-| **插件自身可被 AI 关闭** | 模型有 `plugin_manager` 工具（`web-app` 预设含 `tool-plugin-manager`）| 建议同时用 `ctx.tools.restrict()` 对该 agent 隐藏 `plugin_manager`（列为 M3 可选项，需用户确认）|
-| **模型可读本插件配置** | 配置文件本身若在被保护路径内会泄露规则 | 建议规则中把插件配置文件设为 `none`（文档提示）|
+| **插件自身可被 AI 关闭** | 模型有 `plugin_manager` 工具（web-app 预设含 `tool-plugin-manager`）| 建议 `ctx.tools.restrict()` 对该 agent 隐藏 `plugin_manager`（M3 可选项，见 §12-3）|
+| **模型可读本插件配置** | 规则本身若在被保护路径内会泄露 | 文档提示把插件配置/本仓库设为 `none` |
 | **不防用户本人** | 用户仍可自行查看 | 符合 G6，非缺陷 |
 
 ---
@@ -367,15 +407,16 @@ export const Config = z.object({
 
 - `policy.spec.js`：优先级（最具体胜出）、`~`/`${workspace}` 展开、Windows 大小写、祖先命中、last-wins、空规则表。
 - `fs-guard.spec.js`：用内存/临时目录 + 桩 `agents`，断言各档位下 `readText`/`listDir`/`writeText` 的行为；**断言 `currentInitiator()===undefined` 时全部放行**（G6）。
-- `tool-guard.spec.js`：`glob`/`grep` 结果过滤（`none` 剔除条目、`list` 保留文件名去掉内容）。
+- `search-exclude.spec.js`：直接对生成的 argv 断言——`glob` 只为 `none` 注入否定 glob、`grep` 为 `none`+`list` 注入、注入位置在 `--` 之前、模型自带的 `--glob` 无法覆盖。
+- `tool-guard.spec.js`：guard 对显式受保护路径的拒绝；`post-execute` 兜底过滤与 fail-closed 分支。
 
 ### 10.2 端到端验收（必须在本机真实运行）
 
 1. 造样例目录：`D:\dsh-path-guard-fixture\{open,hidden,listed,ro}\`。
 2. 安装 bundle，在页面配置规则。
 3. 新开 session，逐条执行并核对：
-   - `read` `hidden/secret.txt` → 不存在/拒绝；`glob '**/*'` → 不含 `hidden`；`grep` 命中被剔除。
-   - `read` `listed/a.txt` → 拒绝但 `glob` 能看到 `a.txt`。
+   - `read` `hidden/secret.txt` → 不存在/拒绝；`glob '**/*'` → **不含 `hidden`**（含其文件名）；`grep` 命中 → 完全不出现。
+   - `read` `listed/a.txt` → 拒绝，但 `glob` 能看到 `a.txt`（G3 半访问）；`grep` 搜 `listed` 内内容 → 无结果、无内容泄漏。
    - `write` `ro/b.txt` → 拒绝；`read` 成功。
    - `.ssh` 半访问 + `.ssh/README.md` 可读 → **豁免生效**。
    - `pwsh` 直接 `Get-Content hidden/secret.txt` → 拒绝（scan 档）。
@@ -393,23 +434,25 @@ export const Config = z.object({
 
 | 里程碑 | 内容 | 产出 | 状态 |
 | --- | --- | --- | --- |
-| **M0** | 规划、git 初始化、计划文档 | 本文件 | ✅ 进行中 |
-| **M1** | 骨架：`policy.js` + `config.js` + 单测；bundle 清单可被 `install_bundle` 识别 | 可安装、页面出现配置表单 | 待办 |
-| **M2** | L1 fs 围栏 + L2 工具层（read/write/edit/glob/grep）| G1–G4、G6 达成 | 待办 |
-| **M3** | 自检、审计、页面告警；可选隐藏 `plugin_manager` | G7 | 待办 |
-| **M4** | L3 shell 扫描 + 输出脱敏 | shell 场景尽力覆盖 | 待办 |
-| **M5** | （可选）Windows ACL 强隔离档位，把 `none` 提升为内核级 | 消除 §9 首行风险 | 待定 |
-| **M6** | 自定义客户端页面（富表格、拖拽排序、拒绝日志面板）| 替代自动生成表单 | 待定 |
+| **M0** | 规划、git 初始化、计划文档 | 本文件 | ✅ 完成 |
+| **M1** | 骨架：`policy.js` + `config.js` + 单测；bundle 可被 `install_bundle` 识别；**先验证 §6 的 row 覆盖与子路径 `name` 在真实 profile 中生效**（这是全案最大假设）| 可安装、页面出现配置表单 | 待办 |
+| **M2** | L1 `ctx.fs` 围栏 + L2b 工具层（read/write/edit/glob/grep 的 guard 与兜底过滤）| G1、G3、G4、G6 | 待办 |
+| **M3** | L2a `ctx.subprocess` ripgrep 排除（G2 的结构性解法）| G2 | 待办 |
+| **M4** | 自检、审计日志、页面告警；可选隐藏 `plugin_manager` | G7 | 待办 |
+| **M5** | L3 shell 扫描 + 输出脱敏（`scan`/`deny-all`）| shell 场景尽力覆盖 | 待办 |
+| **M6** | （可选）Windows ACL 强隔离档位，把 `none` 提升为内核级 | 消除 §9 首行风险 | 待定 |
+| **M7** | （可选）自定义客户端页面（富表格、拖拽排序、拒绝日志面板）| 替代自动生成表单 | 待定 |
 
 ---
 
 ## 12. 待确认的决策点
 
-1. **默认拒绝形态**：`none` 是否默认伪装成「文件不存在」（不泄露存在性）？建议：是。
-2. **shell 档位默认值**：建议默认 `scan`（尽力扫描 + 输出脱敏），把 `deny-all` 留给高安全需求。
-3. **是否同时隐藏 `plugin_manager` 工具**，防止模型自行关闭本插件？建议：是，但需你确认（会改变模型可见工具集）。
-4. **是否要做 M5（Windows ACL 内核级）**：工作量最大，但只有它能真正堵住 shell 绕过。
-5. **规则路径写法偏好**：`~/.ssh` 这类家目录写法是否够用，还是需要 `${env:VAR}`、正则等更复杂语法？
+1. **本方案要覆盖 3 个上游 row**（`fs-sandbox`/`subprocess`/`pwsh-sandbox`）。替代的「保守版」只做 L1+L2b，不动 `subprocess`：代价是 `glob`/`grep` 只能靠结果过滤，G2 从「结构性保证」降级为「解析后过滤」。**建议：先按保守版打通 M1–M2，M3 再决定是否加 L2a**，用真实回归数据判断风险。
+2. **默认拒绝形态**：`none` 是否默认伪装成「文件不存在」（不泄露存在性）？建议：是。
+3. **shell 档位默认值**：建议默认 `scan`（尽力扫描 + 输出脱敏），把 `deny-all` 留给高安全需求。
+4. **是否同时隐藏 `plugin_manager` 工具**，防止模型自行关闭本插件？建议：是，但需你确认（会改变模型可见工具集）。
+5. **是否要做 M6（Windows ACL 内核级）**：工作量最大，但只有它能真正堵住 shell 绕过。
+6. **规则路径写法偏好**：`~/.ssh` 这类家目录写法是否够用，还是需要 `${env:VAR}`、正则等更复杂语法？
 
 ---
 
@@ -425,7 +468,13 @@ export const Config = z.object({
 | `ToolGuard` 契约（同步、只能拒绝）| `packages/core/tools/src/index.ts:723-731` |
 | `ctx.tools.guard()` | `packages/core/tools/src/index.ts:1136` |
 | `tools/pre-execute` / `tools/post-execute` | Host Event 目录（运行时 `cordis_inspect_query`）|
-| `glob`/`grep` 走 ripgrep 子进程 | `packages/fs/tool-fs-search/src/search-core.ts:3-12,238` |
+| `glob`/`grep` 走 ripgrep 子进程 | `packages/fs/tool-fs-search/src/search-core.ts:3-12,238-248` |
+| ripgrep argv 结构（`--` 分隔、双重否定 glob 技巧）| `packages/fs/tool-fs-search/src/glob.ts:89-107` |
+| `SubprocessRuntime.spawn` 抽象方法 | `packages/subprocess/subprocess/src/index.ts:117,153` |
+| `LocalSubprocessRuntime` 与 `subprocess` row | `packages/subprocess/subprocess-local/src/index.ts:59`；`packages/bundle/base/cordis.patch.yml:219-220` |
+| `listDir` 的 AI 侧消费者 | `packages/fs/tool-str-replace-editor/src/index.ts:194`、`packages/skill/skill-filesystem/src/index.ts:770` |
+| GUI 文件树经 `ctx.fs` | `packages/api/workspace-files/src/index.ts:322` |
+| 子路径 row 名先例 | `packages/bundle/web-app/presets/standard.patch.yml:89,151` |
 | pwsh 执行器 `resolve()` 与完全权限放行 | `packages/shell/pwsh-sandbox/src/index.ts:92-104` |
 | 设置表单自动生成 | `packages/settings/settings/src/index.ts:266-277,312` |
 | `SettingsNamespaceView.autoGenerate` | `packages/settings/settings/src/types.ts:22-45` |
