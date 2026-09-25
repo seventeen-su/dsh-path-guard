@@ -35,6 +35,9 @@ window.__ModuleLoader__.load({
     /** Settings namespace == the plugin row id in the profile patch. */
     const NS = 'path-guard'
 
+    /** Bundle package name, the other half of the plugin-list row key. */
+    const PKG = 'dsh-path-guard'
+
     /** Locale key for this page. */
     const L10N = 'path-guard'
 
@@ -107,6 +110,7 @@ window.__ModuleLoader__.load({
       accessWrite: '完全允许（读写）',
       required: '必填',
       revision: '修订号',
+      configSummary: '按路径阻止 AI 访问；打开后在设置里添加规则',
     }
 
     const en = {
@@ -178,6 +182,7 @@ window.__ModuleLoader__.load({
       accessWrite: 'Unrestricted (read and write)',
       required: 'Required',
       revision: 'revision',
+      configSummary: 'Block AI access by path; add rules in Settings',
     }
 
     /** Access levels in ladder order, weakest first. */
@@ -581,14 +586,40 @@ window.__ModuleLoader__.load({
 
         // Register only while the Host actually serves the namespace, so a
         // profile without this bundle's row shows no trace of the page.
-        ctx.effect(() => ctx.configForms.whileServed([NS], () => ctx.slots.inject('settings.section', () =>
-          ctx.slots.register({
-            name: 'settings.section',
-            id: NS,
-            order: 60,
-            label: () => t('title'),
-            locale: L10N,
-          }, Section))), 'path-guard: settings page')
+        //
+        // The same editor is registered in THREE places, because users look for
+        // it in different ones and a missing page reads as "the plugin has no
+        // settings at all":
+        //   - `settings.section`      → its own nav entry in the Settings dialog
+        //   - `plugins.row.config`    → the configure control on this bundle's
+        //                               row in the Plugins page, keyed
+        //                               `<package name>#<row id>`
+        //   - `plugins.bundle.config` → the bundle card's own page, keyed by the
+        //                               bundle package name
+        ctx.effect(() => ctx.configForms.whileServed([NS], () => {
+          const disposers = [
+            ctx.slots.inject('settings.section', () => ctx.slots.register({
+              name: 'settings.section',
+              id: NS,
+              order: 60,
+              label: () => t('title'),
+              locale: L10N,
+            }, Section)),
+
+            ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+              name: 'plugins.row.config',
+              key: `${PKG}#${NS}`,
+              locale: L10N,
+            }, props => (props?.view === 'summary' ? t('configSummary') : h(Section, null)))),
+
+            ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+              name: 'plugins.bundle.config',
+              key: PKG,
+              locale: L10N,
+            }, props => (props?.view === 'summary' ? null : h(Section, null)))),
+          ]
+          return () => { for (const dispose of disposers) dispose() }
+        }), 'path-guard: settings pages')
       },
     }
   },
