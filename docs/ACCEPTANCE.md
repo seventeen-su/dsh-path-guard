@@ -3,6 +3,28 @@
 这份手册让你（或任何接手的人）在真实 DSH 里验证 dsh-path-guard。
 所有断言都是「用一个工具调用去试，看结果是否符合预期」。
 
+## 0.1 已完成的实际验收记录
+
+**2026-09-25，活体 DSH（`danger-full-access`，配置：`~/.ssh → list` + `~/.ssh/README.md → read`，自我保护开启）。**
+全部为真实工具调用，不是推演：
+
+| 断言 | 调用 | 实测结果 |
+| --- | --- | --- |
+| 自保护的 shell 扫描 | `pwsh Get-Content '<profile>\cordis.patch.yml'` | ✅ 拒绝，报出命中规则 `…cordis.patch.yml → access: read` |
+| `read` 档可读 | `read '<profile>\cordis.patch.yml'` | ✅ 放行 |
+| `read` 档不可写 | `edit '<profile>\cordis.patch.yml'`（探针串故意不匹配） | ✅ 拒绝，文案写明「允许读取，不允许写入或修改」 |
+| 自我保护（反绕过） | `plugin_manager install_bundle`，target **不含**本插件名 | ✅ 拒绝 |
+| 不误伤 | `pwsh node --version` | ✅ 放行 |
+| **豁免生效** | `read C:\Users\…\.ssh\README.md` | ✅ **放行并返回内容**（覆盖了更宽的 `list` 规则） |
+| 半访问·仅文件名（拒绝读） | `read C:\Users\…\.ssh\config` | ✅ 拒绝，规则 `~/.ssh → access: list` |
+| 半访问·仅文件名（允许列名） | `glob` `C:\Users\…\.ssh` `*` | ✅ 放行，全部文件名可见（含各私钥文件名） |
+| grep 需要内容 ⇒ 拒绝 | `grep` `ProxyJump` 于 `~/.ssh` | ✅ 拒绝 |
+| shell 扫描 | `pwsh Select-String … 'C:\Users\…\.ssh\config'` | ✅ 拒绝 |
+| `list` 档不可写 | `edit C:\Users\…\.ssh\config`（探针串故意不匹配） | ✅ 拒绝 |
+
+尚未在活体上跑的是第 2 节里依赖 `D:\dsh-path-guard-fixture` 的那些条目（隐藏目录、符号链接绕过、
+超限搜索的 spill 行为）——夹具与步骤都已就绪，随时可跑。
+
 ## 0. 前置条件
 
 1. **必须重启 DSH 进程**。插件从源码目录以 `link:` 方式安装，改动源码后 Node 的 ESM
