@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Path Guard",
+    "description": "Blocks AI file access to the paths you mark, even when DSH runs with danger-full-access."
+  }
+}

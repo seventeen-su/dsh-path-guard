@@ -1,0 +1,12 @@
+# dsh-path-guard — 按路径限制 AI 的文件访问，在 danger-full-access 下依然生效。
+#
+# 纯插入：不覆盖任何上游 row，不替换任何服务。
+# 本 row 的 id (`path-guard`) 同时是前端配置页写入的 settings 命名空间。
+
+- insert:
+    - id: path-guard
+      name: 'dsh-path-guard'
+      config:
+        enabled: true
+        defaultAccess: allow
+        rules: []

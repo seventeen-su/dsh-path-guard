@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Path Guard">
+  <path d="M32 5 55 13v19c0 14.2-9.3 24.6-23 27C18.3 56.6 9 46.2 9 32V13L32 5Z"
+        fill="none" stroke="#247bbf" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M21 31h22v16H21z" fill="none" stroke="#247bbf" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M26 31v-5a6 6 0 0 1 12 0v5" fill="none" stroke="#247bbf" stroke-width="4" stroke-linecap="round"/>
+</svg>

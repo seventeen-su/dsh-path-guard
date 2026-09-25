@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "路径守卫",
+    "description": "即使 DSH 处于完全权限（danger-full-access），也按你标注的路径阻止 AI 访问。"
+  }
+}
