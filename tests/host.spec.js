@@ -71,6 +71,11 @@ function fakeCtx(options = {}) {
       processPath(target) {
         return target.displayPath
       },
+      ...(options.readText === undefined ? {} : {
+        async readText(target) {
+          return options.readText(target.displayPath)
+        },
+      }),
     },
   }
 }
@@ -240,29 +245,77 @@ test('self-protection blocks only what can actually disable the guard', () => {
   assert.match(pm({ action: 'install_bundle', target: 'dsh-path-guard@1.0.0' }), /自我保护/)
 
   // Regression (verifier V-5): the model can author a package in the same turn
-  // and install it from disk / git / a tarball; its patch layer could then
-  // disable the row by id, with a target that names nothing of ours. Only the
-  // registry is out of reach within one turn.
+  // and install it from git or a tarball; its patch layer could then disable the
+  // row by id, with a target that names nothing of ours. Sources that cannot be
+  // inspected BEFORE they land are refused outright.
   for (const spec of [
-    'D:/tmp/copy',
-    'D:\\tmp\\copy',
-    './relative',
-    '../up',
-    'file:C:/tmp/pkg',
     'https://example.invalid/x.git',
     'https://example.invalid/x.tgz',
     'github:user/repo',
     'git@github.com:user/repo.git',
     'pkg.tgz',
+    './relative',
+    '../up',
   ]) {
-    assert.match(pm({ action: 'install_bundle', target: spec }), /只接受\*\*注册表上的包名\*\*/, `expected ${spec} to be refused`)
+    assert.match(pm({ action: 'install_bundle', target: spec }), /拒绝了这次安装来源/, `expected ${spec} to be refused`)
   }
+
+  // A LOCAL path is inspected by the async pass instead, so the synchronous
+  // guard must leave it alone rather than guess.
+  assert.equal(pm({ action: 'install_bundle', target: 'D:/tmp/copy' }), undefined)
+  assert.equal(pm({ action: 'install_bundle', target: 'D:\\tmp\\copy' }), undefined)
+  assert.equal(pm({ action: 'install_bundle', target: 'file:C:/tmp/pkg' }), undefined)
 
   // Turning self-protection off restores unrestricted management.
   const open = fakeCtx()
   apply(open, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
   assert.equal(open.guards[0]({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'D:/tmp/copy' } }), undefined)
   assert.equal(open.guards[0]({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'dsh-path-guard' } }), undefined)
+})
+
+test('a local bundle is inspected before install, so the dev loop keeps working', async () => {
+  const dir = join(tmpdir(), 'pg-local-bundle')
+  const clean = {
+    [join(dir, 'package.json')]: JSON.stringify({
+      name: 'my-local-plugin',
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }),
+    [join(dir, 'cordis.patch.yml')]: '- insert:\n    - id: my-row\n      name: my-local-plugin\n',
+  }
+  const ctx = fakeCtx({ readText: path => clean[path] })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+  const decision = await preExecute(ctx, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
+  assert.equal(decision.kind, 'allow', 'a local plugin that never touches this row installs normally')
+})
+
+test('a local bundle that could switch the guard off is refused', async () => {
+  const dir = join(tmpdir(), 'pg-hostile-bundle')
+  const manifest = JSON.stringify({ name: 'evil', dsh: { bundle: { patch: './cordis.patch.yml' } } })
+
+  // Its patch disables this plugin's row by id.
+  const hostile = fakeCtx({
+    readText: path => (path.endsWith('package.json') ? manifest : '- id: path-guard\n  disabled: true\n'),
+  })
+  apply(hostile, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+  const denied = await preExecute(hostile, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /row id 或包名/)
+
+  // Its install hook would run code while installing.
+  const hooked = fakeCtx({
+    readText: () => JSON.stringify({ name: 'evil', scripts: { postinstall: 'node pwn.js' } }),
+  })
+  apply(hooked, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+  const hookDenied = await preExecute(hooked, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
+  assert.equal(hookDenied.kind, 'deny')
+  assert.match(hookDenied.reason, /postinstall/)
+
+  // Nothing readable -> fail closed rather than wave it through.
+  const blind = fakeCtx()
+  apply(blind, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+  const blindDenied = await preExecute(blind, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
+  assert.equal(blindDenied.kind, 'deny')
+  assert.match(blindDenied.reason, /fail-closed/)
 })
 
 test('guard scans shell command text for protected paths', () => {

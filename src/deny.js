@@ -83,24 +83,26 @@ export function shellDenialText({ toolName, needle, rulePath, access, kind = 'sh
 }
 
 /**
- * The refusal for an `install_bundle` whose spec is not a registry package.
- * @param {{target: string}} input - the attempted spec.
+ * The refusal for an `install_bundle` this plugin refuses on source grounds.
+ * @param {{target: string, why?: string}} input - the attempted spec and the specific finding.
  * @returns {string} the model-facing reason.
  */
-export function installSourceDenialText({ target }) {
+export function installSourceDenialText({ target, why }) {
   return [
-    '访问被拒绝：`install_bundle` 目前只接受**注册表上的包名**，本地路径 / git / tarball / URL 一律拒绝。',
+    '访问被拒绝：`install_bundle` 拒绝了这次安装来源。',
     '',
     `- target：${target === '' ? '(未指定)' : target}`,
+    ...(why === undefined ? [] : ['- 原因：' + why, '']),
+    '规则是这样的：',
+    '- **注册表上的包名** —— 放行。它无法在你这一轮里凭空出现。',
+    '- **本地路径** —— 安装前会被实际读一遍：若该包声明了 preinstall/install/postinstall/prepare',
+    '  脚本（安装即执行代码），或它的补丁文件里出现本插件的 row id / 包名，则拒绝；否则放行。',
+    '- **git / tarball / URL** —— 一律拒绝，落地之前无法核对内容。',
+    '- 任何**指名 dsh-path-guard / path-guard** 的动作（set_plugin / set_bundle / remove_bundle 等）—— 拒绝。',
     '',
-    '原因是这类来源可以在同一轮里由你（或任何本地文件）现场造出来：一个自己写的包，其补丁层可以按 id',
-    '把防护行覆盖成 `disabled: true`，从更靠后的层把 dsh-path-guard 关掉。注册表上的包无法在你这一轮',
-    '里凭空出现，所以只有它被放行。',
+    '这不影响正常装插件：装注册表上的包、开关别的插件都照常可用。',
     '',
-    '这不影响正常装插件：`install_bundle` 传注册表包名照常可用；`set_plugin` / `set_bundle` /',
-    '`remove_bundle` 用来开关别的插件也照常可用——**只有指名 dsh-path-guard / path-guard 的动作**才被拒。',
-    '',
-    '如果确实要装一个本地开发中的插件，请向用户说明，由他自己在插件页面操作，或先在',
+    '如果确实需要装一个被上面某条拦下的包，请向用户说明，由他自己在插件页面操作，或先在',
     '「设置 → 路径守卫」里关闭自我保护。',
   ].join('\n')
 }

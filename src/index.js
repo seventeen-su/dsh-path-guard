@@ -131,6 +131,25 @@ function isRegistrySpec(raw) {
   return true
 }
 
+/**
+ * The absolute directory a local install spec points at, when it is one.
+ * @param {unknown} raw - the `install_bundle` target.
+ * @returns {string | undefined} the absolute directory, or undefined.
+ */
+function localSpecPath(raw) {
+  const spec = String(raw ?? '').trim()
+  if (spec === '') return undefined
+  const stripped = spec.replace(/^(?:file|link):/, '')
+  if (stripped !== spec) return isAbsolute(stripped) ? stripped : undefined
+  return isAbsolute(spec) ? spec : undefined
+}
+
+/** Install-lifecycle hooks that run code while the package is being installed. */
+const INSTALL_HOOKS = ['preinstall', 'install', 'postinstall', 'prepare']
+
+/** Cap on how much of a candidate patch this plugin will read while inspecting it. */
+const MAX_PATCH_BYTES = 512 * 1024
+
 /** Profile composition files the AI may read but must not rewrite. */
 const PROFILE_FILES = ['cordis.patch.yml', 'cordis.yml', 'package.json']
 
@@ -573,8 +592,12 @@ export function apply(ctx, config) {
     }
     // Installing from anywhere but the registry would let the model author the
     // very patch layer that switches this row off — the one bypass a target
-    // string cannot rule out.
-    if (action === 'install_bundle' && !isRegistrySpec(target)) {
+    // string cannot rule out. A LOCAL directory is the exception: it can be
+    // inspected before it lands, which the async `tools/pre-execute` pass does,
+    // so this synchronous guard leaves it alone rather than guessing.
+    if (action === 'install_bundle') {
+      if (isRegistrySpec(target)) return undefined
+      if (localSpecPath(target) !== undefined) return undefined
       return installSourceDenialText({ target })
     }
     return undefined
@@ -616,6 +639,69 @@ export function apply(ctx, config) {
     })
   }
 
+  /**
+   * Inspect a LOCAL bundle before it is installed.
+   *
+   * Refusing every local path was the blunt answer to the bypass that a target
+   * string cannot rule out: a package the model authored in the same turn can
+   * ship a patch layer doing `- id: path-guard` + `disabled: true`, and a newly
+   * installed bundle's layer applies AFTER this one. But refusing them all also
+   * blocks the ordinary dev loop of installing a plugin you are writing — the
+   * far more common case. So the directory is read first:
+   *   - an install-lifecycle script runs code at install time -> refuse;
+   *   - a declared patch that mentions this row id or bundle name -> refuse;
+   *   - anything unreadable -> refuse (fail-closed);
+   *   - otherwise -> allow.
+   * Residual: a patch that computes the row id through `!!js` instead of
+   * spelling it cannot be seen by a text scan. That is deliberate effort against
+   * this specific plugin, and `plugin_manager` still cannot name us directly.
+   *
+   * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
+   * @returns {Promise<{reason: string, target: string} | undefined>} a denial, or undefined to allow.
+   */
+  const evaluateLocalInstall = async (exec) => {
+    if (read('selfProtection') !== true || exec.name !== 'plugin_manager') return undefined
+    const args = exec.arguments
+    if (args === null || typeof args !== 'object' || args.action !== 'install_bundle') return undefined
+    const target = typeof args.target === 'string' ? args.target : ''
+    const dir = localSpecPath(target)
+    if (dir === undefined) return undefined // registry / git / tarball: handled by the guard
+    const reason = why => ({ reason: installSourceDenialText({ target, why }), target })
+    const fs = ctx.fs
+    if (fs === undefined || typeof fs.readText !== 'function') {
+      return reason('无法读取该本地包的内容（fail-closed）')
+    }
+    try {
+      const read = async relative => {
+        const resolved = await fs.resolve(join(dir, relative), { signal: exec.signal })
+        return await fs.readText(resolved, exec.signal)
+      }
+      const manifest = JSON.parse(await read('package.json'))
+      const scripts = manifest?.scripts
+      if (scripts !== null && typeof scripts === 'object') {
+        for (const hook of INSTALL_HOOKS) {
+          if (typeof scripts[hook] === 'string' && scripts[hook] !== '') {
+            return reason(`该包声明了 ${hook} 安装脚本，安装时会执行代码`)
+          }
+        }
+      }
+      const declared = manifest?.dsh?.bundle?.patch
+      const patches = typeof declared === 'string' ? [declared] : Array.isArray(declared) ? declared : []
+      for (const relative of patches) {
+        if (typeof relative !== 'string' || relative === '') continue
+        const text = await read(relative)
+        if (text.length > MAX_PATCH_BYTES) return reason(`补丁 ${relative} 过大，无法核对`)
+        if (text.includes(SELF_ROW_ID) || text.includes(SELF_PACKAGE)) {
+          return reason(`补丁 ${relative} 引用了本插件的 row id 或包名`)
+        }
+      }
+      return undefined
+    } catch (error) {
+      ctx.logger.warn('path-guard: cannot inspect local bundle %s: %s', target, String(error))
+      return reason('无法读取该本地包的内容（fail-closed）')
+    }
+  }
+
   // ---- L1: the authority on paths -----------------------------------------
   //
   // Every registration below is wrapped: an exception raised here becomes a tool
@@ -625,6 +711,11 @@ export function apply(ctx, config) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     try {
       if (read('enabled') !== true) return next()
+      const install = await evaluateLocalInstall(exec)
+      if (install !== undefined) {
+        reportDenial(exec, install, 'self')
+        return { kind: 'deny', reason: install.reason }
+      }
       const hit = await evaluatePaths(exec)
       if (hit !== undefined) {
         reportDenial(exec, hit, 'path')
