@@ -1,8 +1,27 @@
 # dsh-path-guard 实施计划
 
-> 目标 DSH 版本：`0.1.7-rc.2`（检出目录 `D:\Program\deepseek-harness`，`package.json` 版本 `0.1.7-rc.2`）
+> 目标 DSH 版本：`0.1.7-rc.2`（检出 `D:\Program\deepseek-harness`，`package.json` 版本 `0.1.7-rc.2`）
 > 当前 profile：`web`（`DSH_PROFILE_DIR=C:\Users\SuSeventeen\.dsh\profiles\web`）
-> 文档状态：待评审。评审通过后按 §11 里程碑实施。
+> 文档状态：**第 2 版，待评审**（第 1 版已被研究结论推翻，见 §0）
+
+---
+
+## 0. 本版相对第 1 版的修订（先看这里）
+
+第 1 版打算**接管 DSH 的 `ctx.fs` / `ctx.subprocess` / `ctx.shell` 三个服务**。两份深度研究报告完成后，两个承重前提被推翻：
+
+| 第 1 版的假设 | 实际（有据） | 影响 |
+| --- | --- | --- |
+| 可以用「服务类默认导出 + 覆盖上游 row」接管 `ctx.fs`，只对 AI 生效 | 能接管，但 `ctx.fs` 还同时服务 GUI 文件树（`api/workspace-files`）与 prompt 装配（`agent-instructions`、`skill-filesystem`），会**连人一起挡**；且 `ctx.fs` **无法被增量包裹**（Cordis `provide` 拒绝重名；`internal/get` 会被 `ctx.get('fs')` 绕过，有 7 处真实消费者）| 放弃接管 |
+| 可以在 `ctx.subprocess` 层给 ripgrep 注入 `--glob=!<路径>` 排除 | 技术上可行，但要接管一个**所有子进程共用**的中枢服务 | 放弃接管（理由见 §4.2，**不是**因为性能） |
+
+**所以你提出的「不要接管、改用增量劫持」是对的方向**，而且比我原方案更省事：
+
+- 新版**不替换任何现有服务、不覆盖任何上游 row**，只插入自己的一个 row；
+- 全部防护通过 **4 个已有的扩展点**完成：`tools/pre-execute`（异步、可 await 真实路径）、`ctx.tools.guard()`（同步兜底）、`fs/write-intent`/`fs/edit-intent`（已解析目标的写否决）、`tools/post-execute`（结构化结果改写）；
+- 「增量劫持」体现在 **`tools/post-execute` 直接改写工具的结构化 `value`**（不是解析渲染后的文本），`glob` 的路径列表、`grep` 的匹配项都以 JSON 结构到达，改起来精确、无格式漂移风险。
+
+同时按你的其余三条答复改：拒绝语义改成**明确拒绝 + 禁止绕过 + 引导向用户申请**（§5）；`plugin_manager` **保留**，改为精确拦住「针对本插件自身」的那些动作（§6）。
 
 ---
 
@@ -10,423 +29,356 @@
 
 ### 1.1 问题
 
-当前 profile 的权限预设默认是 `danger-full-access`（`C:\Users\SuSeventeen\.dsh\profiles\web\cordis.patch.yml:27-40`，`defaultPreset: danger-full-access`）。DSH 的文件沙箱在该档位下**完全不做限制**：
+当前 profile 默认 `danger-full-access`（`C:\Users\SuSeventeen\.dsh\profiles\web\cordis.patch.yml:27-40`）。该档位下 DSH 文件沙箱完全不设限：
 
 - `packages/fs/fs-sandbox/src/index.ts:5-8` —— "Reads pass through untouched: every mode permits reading."
-- `packages/fs/fs-sandbox/src/index.ts:125` —— `if (mode === 'danger-full-access') return target`，写操作也不设围栏。
-- `packages/shell/pwsh-sandbox/src/index.ts:99-104` —— 同一档位下 shell 直接委托本地执行器，不设围栏。
-
-因此 AI 可以读取本机任意文件（SSH 私钥、凭据、个人目录等）。用户需要一层**独立于权限预设**的策略，在完全权限下依然生效。
+- 同文件 `:125` —— `if (mode === 'danger-full-access') return target`，写也不围栏。
+- `packages/shell/pwsh-sandbox/src/index.ts:99-104` —— shell 在同一档位直接委托本地执行器。
 
 ### 1.2 目标
 
-构建插件 `dsh-path-guard`，满足：
-
 | 编号 | 需求 | 验收方式 |
 | --- | --- | --- |
-| G1 | 在 `danger-full-access` 下，被保护路径无法被 AI 读取 | 端到端测试：模型调用 `read` 被拒 |
-| G2 | 档位一「完全无访问」：AI 既拿不到内容，也拿不到目录结构/文件名 | 列表、`glob`、`grep`、父目录列举均不暴露该条目 |
-| G3 | 档位二「半访问控制」：可见文件名与目录结构，但不可读内容；或可读不可写 | 三种能力（列出/读/写）可独立配置 |
-| G4 | 支持豁免：更具体路径覆盖更宽泛路径（`.ssh/**` 半访问，`.ssh/README.md` 可读） | 策略单测 + 端到端 |
-| G5 | 通过 DSH 0.1.7-rc2 前端插件页面配置，改动热生效 | 浏览器中打开 Settings → 内置插件 → dsh-path-guard，改一项后立即生效 |
-| G6 | 不影响用户自己（GUI）浏览同一路径 | 文件树/编辑器仍可打开被保护文件 |
-| G7 | 策略可审计：每次拒绝有日志，可查当前生效策略 | 拒绝事件出现在 session 日志与 Host 日志 |
+| G1 | `danger-full-access` 下受保护路径无法被 AI 读取 | 端到端：模型调 `read` 被拒 |
+| G2 | 档位一「完全无访问」：拿不到内容，也拿不到目录结构/文件名 | `read`/`glob`/`grep` 均不暴露 |
+| G3 | 档位二「半访问」：可见文件名与结构但不可读内容；或可读不可写 | 三种能力独立可配 |
+| G4 | 豁免：更具体路径覆盖更宽泛路径（`.ssh/**` 半访问，`.ssh/README.md` 可读） | 策略单测 + 端到端 |
+| G5 | 通过 0.1.7-rc2 前端插件页面配置，热生效 | Settings → 内置插件 / Plugins 页改一项立即生效 |
+| G6 | 不影响用户自己用 GUI 浏览同一路径 | 文件树/编辑器仍可打开被保护文件 |
+| G7 | 可审计：每次拒绝有日志、可看当前生效策略 | Host 日志 + 页面状态区 |
+| G8 | **不接管任何现有服务**，不改变既有权限档位语义 | 代码审查 + 卸载后无残留 |
 
-### 1.3 非目标（本期不做）
+### 1.3 非目标
 
-- 不做内核级隔离（不修改文件系统 ACL / 不建受限令牌）。见 §9 残余风险。
-- 不阻止用户自己通过 GUI、外部编辑器访问被保护路径。
-- 不加密、不隐藏文件（磁盘上仍是普通文件）。
+- 不做内核级隔离。研究报告确认：**现有 `sandbox-windows-acl` 无法表达「按路径拒绝」**——它的策略词汇只有 `mode` + 一个 `workspaceRoot` 允许根 + 可选 `sessionId`（`packages/sandbox/sandbox/src/index.ts:40-73`），没有 deny 列表字段。原计划的 M6 因此**不可行**，已删除。
+- 不阻止用户本人访问。
+- 不加密、不隐藏文件。
 
 ---
 
-## 2. 侦察结论（DSH 0.1.7-rc.2 事实）
+## 2. 侦察结论（关键事实）
 
-以下均为读源码/运行时检查器得到的事实，行号对应当前检出。
+### 2.1 防护管线在完全权限下依然生效
 
-### 2.1 AI 可见的文件系统表面
+`packages/core/tools/src/index.ts` 中没有任何地方读沙箱策略，`tools/pre-execute`、`ctx.tools.guard()`、`tools/post-execute` 在**所有档位下行为一致**（对照 `:1493-1539` 的执行准备流程，无 `sandboxPolicy` 读取、无早退）。
 
-| 表面 | 实现位置 | 底层通道 | 能否硬拦 |
+### 2.2 AI 文件访问分成三类，只有 A 类能被完全拦
+
+| 类 | 表面 | 底层通道 | 可拦性 |
 | --- | --- | --- | --- |
-| `read` / `read_image` / `write` / `edit` | `packages/fs/tool-fs/src/index.ts:22,61-78` | `ctx.fs` | ✅ |
-| `glob` / `grep` | `packages/fs/tool-fs-search`、`search-core.ts:238-248` | **`ctx.subprocess.spawn()` 拉起打包 ripgrep** | ⚠️ 见 §4-L2 |
-| `str_replace_editor`（若挂载）| `packages/fs/tool-str-replace-editor/src/index.ts:194` | `ctx.fs.listDir` | ✅ |
-| `pwsh`（Windows）| `packages/shell/pwsh-sandbox/src/index.ts` | `ctx.shell` → `ctx.subprocess` | ⚠️ 仅命令文本扫描（§9）|
-| `run_code`（PTC 模式）| `packages/extensions/tool-cordis` | 子调用仍走 tools 管线 | ✅ 继承 guard |
-| 子代理 / workflow / agent-teams | `tool-subagent*`、`tool-workflow` | 子 agent 各自的工具 scope | ✅ 全局服务替换天然覆盖 |
-| skills / agent-instructions / deliverables / document | 各自包（如 `skill-filesystem/src/index.ts:770`）| `ctx.fs` | ✅ |
-| GUI 文件树、编辑器 | `ctx.workspaceFiles`（`packages/api/workspace-files/src/index.ts:322`）| `ctx.fs` | ⛔ **不应拦**（G6）|
+| **A** | `read`、`write`、`edit`、`read_image`、`str_replace_editor`、`present`、`lsp` | `ctx.fs` | ✅ 调用层可拦 |
+| **B** | `glob`、`grep` | 打包 ripgrep 经 `ctx.subprocess`，**从不经过 `ctx.fs`、也不调 `ctx.sandbox.confine`**（`tool-fs-search/src/search-core.ts:222-248`，该包连 `'sandbox'` 都没注入）| ⚠️ 能拒绝调用、能改写结果，不能改参数 |
+| **B'** | `mcp__*`、`cua_driver_native__*` | 外部进程，schema 由服务端给 | ⚠️ 只能按工具名拒绝 |
+| **C** | `bash`、`pwsh`、`terminal_*`、`run_code`、外部 `subagent-claude-code`/`-codex`/`-acp` | 真实 OS 进程 | ❌ 插件层拦不住 |
+| **D** | 指令文件 → 系统提示、skill 正文 → 上下文 | `ctx.get('fs')`，`agent-instructions` 还有裸 `node:fs` 兜底（`files.ts:146,330`）| ❌ **没有工具调用可拦** |
 
-两条关键结论：
+C 类不可拦的原因是结构性的：`run_code` 是一个真实 Node/Python 进程（`ptc-runtime-node/src/index.ts:68` 明说 "Node APIs are available through `await import(...)`"；`ptc-runtime-python:1038` 直接报 "sandbox policy is unsupported"），shell 命令串是图灵完备的，任何参数分析都不健全。**这一条必须如实告诉用户，不能靠文案掩盖。**
 
-1. **`ctx.fs` 是唯一同时承载「大部分 AI 表面」与「GUI 表面」的接缝**，所以 L1 必须能区分调用者（§2.2）。
-2. **AI 的目录/结构枚举主路径不是 `ctx.fs.listDir`，而是 ripgrep**：`read` 工具不列目录，`glob`（`rg --files`）/`grep`（`rg --json`）才是模型「看结构」的主要手段。因此 `none` 档位（G2）**必须在搜索层解决**，不能只靠 L1 的 `listDir` 过滤。
+### 2.3 四个扩展点的确切契约
 
-### 2.2 区分「AI 调用」与「GUI 调用」
-
-`packages/core/agent-loop/src/agent.ts:234`：
-
-```ts
-this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
-```
-
-整个 turn（含工具派发）运行在 `withInitiator(agent)` 的 AsyncLocalStorage 作用域内；`ctx.agents.currentInitiator()`（`packages/core/agent/src/index.ts:295`）在工具调用期间返回该 Agent，在 Host 处理 GUI Remote 请求的异步链中返回 `undefined`。
-
-→ **这就是「只对 AI 生效」的判定依据**，不需要区分工具名，也不会误伤 GUI。
-
-### 2.3 可用扩展点（由弱到强）
-
-| 机制 | 契约 | 用途 |
+| 扩展点 | 契约 | 我们用它做什么 |
 | --- | --- | --- |
-| `ctx.tools.restrict()` | `{allow?, deny?}`，只做可见性裁剪 | 不适用（过粗）|
-| `ctx.tools.guard()` | `type ToolGuard = (execution) => string \| undefined`，同步、只能拒绝、与注册顺序无关（`packages/core/tools/src/index.ts:723-731,1136`）| **硬拒绝**的首选 |
-| `tools/pre-execute`（waterfall）| 可 `allow/deny/cancel/ask`，可 await | 需要异步决策时 |
-| `tools/post-execute`（waterfall）| 接受/替换/丰富/阻断规范化结果 | **结果脱敏**（`glob`/`grep`/shell 输出）|
-| 服务替换 | 插件以「服务类默认导出」注册，抢占同名服务 | `ctx.fs`、`ctx.shell` 的围栏 |
-| `system-prompt/assemble` | 整体替换装配 | 不用 |
+| `tools/pre-execute`（waterfall，**异步**）| `(exec, next) => Promise<PreToolDecision>`；`PreToolDecision = allow \| deny{reason,info?} \| cancel \| ask{reason?}`（`:607-611`）。**不能改参数**（`:604-605` 明确排除）| **主决策点**：可 `await ctx.fs.resolve()` 拿到真实路径后判定 |
+| `ctx.tools.guard()` | `(exec) => string \| undefined`，**同步**、只能拒绝、与注册顺序无关（`:723-731`、`:1136-1142`）| 同步词法兜底 |
+| `fs/write-intent` / `fs/edit-intent` | waterfall，携带**已解析**的 `FsTarget`，签名里可 `throw` | `write`/`edit` 的写否决 |
+| `tools/post-execute`（waterfall）| `PostToolDecision = accept{content?} \| accept{value} \| block{feedback}`（`:617-620`）| **结构化脱敏**：`value` 会重跑 `render` 与 `presentationMeta`，连持久化 `meta` 一起干净 |
 
-`packages/preset/agent-preset/skills/cordis-plugin-development/references/practices.md:10` 明确要求「使用足够的最弱机制」；`references/practices.md:17` 明确「与顺序无关的拒绝要用 `ctx.tools.guard()`」。
+执行顺序：`pre-execute` →（`ask` 走审批）→ `guard` → 调用工具体（`:1504-1535`）。guard 在 pre-execute **之后**且单调，任何监听器都无法把拒绝翻回来。
 
-### 2.4 前端插件配置页机制（0.1.7-rc2）
+**三个容易踩的细节**（都会写进实现约定）：
+1. `{kind:'accept', value}` 才会重算 `meta`；`{kind:'accept', content}` 只换模型可见文本，**不会**清掉持久化投影。脱敏必须用 `value`。
+2. `value` 与 `content` 同时给会抛错；对**失败**结果给 `value` 也会抛错（`:1796-1806`）。必须先判 `isError`。
+3. `{ prepend: true }` 在 Cordis 里是 `unshift`，即**最外层、最后发言**（`vendor/cordis/src/events.ts:255`）。脱敏监听器必须 `prepend`，并且在前一个监听器已经给了 `value` 时让位（照抄 `spill-policy:135` 的 `Object.hasOwn(decision,'value')` 判断）。
 
-- `packages/settings/settings/src/index.ts:266-277` —— `ctx.settings.configure({ auto })`；`auto` 默认 `true`（`:312` `this.presentations.get(entry.fiber)?.auto ?? true`）。
-- `packages/settings/settings/src/types.ts:22-45` —— `SettingsNamespaceView { autoGenerate, ns, schema, value, applies: 'live', secrets, revision }`；`autoGenerate` 注释即 "Generate a page if no custom page is registered for this instance"。
-- `packages/client/ui-settings-plugins/src/client/index.ts:74-83` —— 该包拥有 Settings 的「内置插件」导航项，并声明列表插槽 `settings.plugins.tab`；`packages/client/ui-settings-plugin-inventory/src/client/index.ts:56-57` 是一个向该插槽注册页面的现成范例。
-- schema 由插件导出的 `Config`（schemastery）投影而来；表单写入走 `remote.settings.mutate(ns, ops, expectedRevision)`，`applies: 'live'`。
+### 2.4 工具入参与拒绝文案
 
-→ **结论：插件只要导出 `Config`，且在 profile 补丁中有独立 `id`，就会自动获得一个可编辑的配置页（命名空间 = 该 row 的 `id`）。** 本期不需要自己写客户端页面；自研页面列为可选增强（§11 M4）。
+- `exec.arguments` 在任何策略运行前已被**快照并深冻结**（`:1441-1445`），可以安全读。
+- 拒绝原因会**逐字**以 `Error: <reason>` 形式进入模型上下文（`:1526`）。所以文案要按 §5 精心写。
+- 全局 guard 覆盖**同进程**的子代理 / workflow / agent-team 子会话（`scope/src/index.ts:176` 的无 tag 监听器分支 + `guardReason` 无条件读 `layers.global`，`:1146`）。跨进程子代理（claude-code/codex/acp）不受管。
 
-### 2.5 当前 composition 中与本插件相关的 row
+### 2.5 前端配置页机制
 
-`packages/bundle/base/cordis.patch.yml`：
+- 命名空间 = **profile 补丁里该 row 的 `id`**（`settings/src/index.ts:315,382`）。
+- 自动生成页由 `settings` 服务投影 `Config` schema 得到；`ctx.settings.configure({ auto })` 默认 `auto: true`（`:266-277,312`）。
+- ⚠️ **只有标记为 `.volatile()` 的 schemastery 字段才会出现在表单里**：`settings/src/index.ts:308` 用 `volatileForm(schema)` 过滤，没有 volatile 字段的 schema **直接不生成表单**（`:309 return []`）；写入非 volatile 字段会抛 `Config field "<path>" is not volatile`（`:388,406`）。→ **本插件的每个可编辑字段都必须 `.volatile()`**，这是 G5 的硬前提。
+- 若要自研页面：配置页插槽是 `plugins.item`（list/root，`plugins.item` 的 `view: 'summary'|'page'`），也可以用 `plugins.row.config`（key = `<包名>#<row id>`）。范例：`packages/client/ui-settings-agent-loop/src/client/index.ts:47-49`。
+- `install_bundle` **只跑 `pnpm add`，不会构建包**（`plugin-manager/src/index.ts:461-559`）。→ 若做客户端半页，**必须直接发布手写的 `client.js`**（`apps/web/tests/fixtures/plugins/fixture-live-client/` 是唯一完整的纯 JS 可安装范例）。
 
-| row id | 包 | 说明 |
-| --- | --- | --- |
-| `sandbox-policy`（:228）| `@deepseek-ai/dsh-sandbox-policy` | 唯一的沙箱策略来源 |
-| `pwsh-sandbox`（:240）| `@deepseek-ai/dsh-pwsh-sandbox` | Windows 下注册 `ctx.shell` |
-| `tool-fs`（:280）| `@deepseek-ai/dsh-tool-fs` | `read`/`read_image`/`write`/`edit` |
-| `tool-fs-search`（:283）| `@deepseek-ai/dsh-tool-fs-search` | `glob`/`grep`（ripgrep 子进程）|
-| `fs-sandbox`（:517）| `@deepseek-ai/dsh-fs-sandbox` | 注册 `ctx.fs`，只围栏写 |
+### 2.6 现在这个会话的 GUI
+
+客户端插件的热重载需要同一检出里 `pnpm run dev:web` 在跑。本插件**默认不带客户端半页**（§8 说明为什么），所以不受此约束。
 
 ---
 
 ## 3. 策略模型
 
-### 3.1 能力档位（access ladder）
+### 3.1 能力档位
 
-每条规则把「路径」映射到一档访问能力，能力**累积**：
-
-| `access` | 列目录/看结构 | 读文件内容 | 写/改/删 |
+| `access` | 列目录 / 看结构 | 读文件内容 | 写 / 改 / 删 |
 | --- | --- | --- | --- |
 | `none` | ✗ | ✗ | ✗ |
 | `list` | ✓ | ✗ | ✗ |
 | `read` | ✓ | ✓ | ✗ |
 | `write` | ✓ | ✓ | ✓ |
 
-这正好覆盖用户要的三种语义：完全隔离 = `none`；可见结构不可读内容 = `list`；可读不可写 = `read`。
+对应你的三种语义：完全隔离 = `none`；可见结构不可读内容 = `list`；可读不可写 = `read`。
 
-### 3.2 规则与优先级
+### 3.2 规则与豁免
 
 ```yaml
 rules:
-  - path: "~/.ssh"          # 目录：作用到自身与其全部后代
-    access: list            # 半访问：能看到 .ssh 里有那些文件名
+  - path: "~/.ssh"
+    access: list          # 半访问：能看到 .ssh 里有哪些文件名
   - path: "~/.ssh/README.md"
-    access: read            # 豁免：更具体 → 覆盖上一条
+    access: read          # 豁免：更具体 → 覆盖上一条
   - path: "D:/secrets/**"
     access: none
 ```
 
-**匹配算法**：对目标绝对规范路径，收集所有「路径本身或祖先」命中规则，取**最具体**的一条：
+**匹配**：对目标的**真实规范路径**，收集所有「自身或祖先」命中的规则，取**最具体**的一条：
 
 1. 字面量前缀更长者优先；
 2. 通配符更少者优先；
-3. 仍相同则规则表中靠后者优先（`last-wins`，便于用户追加覆盖）。
+3. 仍相同则表中靠后者优先（`last-wins`）。
 
-未命中任何规则时使用 `defaultAccess`（默认 `allow`，即不受限，保持向后兼容）。
+未命中任何规则时用 `defaultAccess`（默认 `allow`，保持向后兼容）。
 
-> 设计取舍：用「最具体命中」而不是「先匹配优先」，让豁免天然成立（`.ssh/README.md` 比 `.ssh` 具体），不需要单独的 `exempt` 字段或否定语法。文档需给出优先级示例。
+> 取舍：用「最具体命中」而不是「首条匹配」，豁免天然成立（`.ssh/README.md` 比 `.ssh` 具体），不需要 `exempt` 字段或否定语法。
 
-### 3.3 路径归一化
+### 3.3 路径判定必须基于解析后的身份
 
-- 支持 `~`、`${workspace}`、绝对路径、相对路径（相对 session cwd）。
-- 归一化在**解析（resolve）之后**进行：用 `ctx.fs.resolve()` 得到的规范 `targetKey` 做判定，避免符号链接绕过（`..`、大小写、短路径）。
-- Windows 下大小写不敏感比较；同时比较 `targetKey` 与 `processPath()` 两种形态。
-- 判定使用 fs provider 自身的 `contains()`，不自己拼字符串前缀（`packages/fs/fs/src/index.ts:173`）。
+`FsTarget.targetKey` 文档明确标注 opaque，**禁止解析**（`fs/src/types.ts:11-15`）。判定一律：
 
----
+1. `await ctx.fs.resolve(raw, { cwd: exec.agent?.session.header.cwd })`（`fs-local/src/index.ts:133-138` 会 realpath）；
+2. 用 `ctx.fs.contains(rootTarget, target)` 或 `ctx.fs.processPath(target)` 比较，**不拼字符串前缀**。
 
-## 4. 架构：分层防护
+这条直接决定 §2.3 里「主决策点必须是异步的 `tools/pre-execute`」——同步 guard 只能做词法匹配，而**工作区里一个指向 `~/.ssh` 的符号链接就能骗过纯词法判定**。
 
-```
-  AI 文件读写 ─→ ┌──────────────────────────────────────────────┐
-                 │ L1  ctx.fs 围栏 PathGuardFileSystem          │ ← 覆盖 read/read_image/write/edit/
-                 │     仅 currentInitiator() 存在时武装          │   skills/instructions/deliverables…
-                 └──────────────────────────────────────────────┘
-  AI 结构搜索 ─→ ┌──────────────────────────────────────────────┐
-                 │ L2a ctx.subprocess 围栏：给 ripgrep argv 追加 │ ← glob/grep 的结构化排除
-                 │     --glob=!<受保护路径>  （结构性，无泄漏）  │
-                 ├──────────────────────────────────────────────┤
-                 │ L2b tools/post-execute：结果脱敏 + 兜底       │ ← 格式漂移时的保险
-                 └──────────────────────────────────────────────┘
-  AI 执行命令 ─→ ┌──────────────────────────────────────────────┐
-                 │ L3  ctx.shell 围栏（命令文本扫描）+ 输出脱敏  │ ← 尽力而为，非安全边界
-                 └──────────────────────────────────────────────┘
+### 3.4 残留 TOCTOU
 
-  横切：ctx.tools.guard() 对显式路径参数硬拒（顺序无关的兜底）
-  L0  策略引擎（pathGuard 服务）＝ 以上各层的共同大脑，配置来自前端页面
-```
-
-### L0 策略引擎（`pathGuard` 服务）
-
-- 拥有 Config 与编译后的规则表；`evaluate(target) → { access, ruleId }`。
-- 纯函数核心（`src/policy.js`）不依赖 Cordis，便于单测。
-- 配置变更后原子替换编译结果；发 `path-guard/changed` 事件。
-
-### L1 `ctx.fs` 围栏（主防线）
-
-新服务类 `PathGuardFileSystem extends SandboxedFileSystem`（`@deepseek-ai/dsh-fs-sandbox`），通过 bundle 补丁**覆盖 `fs-sandbox` row 的 `name`** 来接管 `ctx.fs`（这正是 `fs-sandbox` 文档描述的官方替换方式：`packages/fs/fs-sandbox/src/index.ts:48-54`）。
-
-- **继承**而非重写，保留原有 `read-only` / `workspace-write` 围栏语义（先跑原沙箱检查，再跑 path-guard）。
-- 覆写下列方法，插入 path-guard 检查：
-  - 读族：`readText`、`streamText`、`readBytes`、`readByteRange`  → 需 `read`
-  - 观察族：`stat`、`lstat`、`watch`、`fileUrl`、`processPath` → 需 `list`
-  - 列举族：`listDir` → 自身需 `list`；**并过滤掉 access=`none` 的子条目**（G2 的关键）
-  - 写族：`writeText`、`editText` → 需 `write`
-- **门控**：仅当 `ctx.agents.currentInitiator() !== undefined` 时启用。GUI/宿主调用原样放行（G6）。
-- 服务缺失兜底：若 `pathGuard` 服务不可用（配置校验失败等），**退化为父类行为**并打 warning，避免整机不可用；同时在前端页面显示「未武装」状态。
-
-### L2a `ctx.subprocess` 围栏（搜索层，结构性）
-
-`glob`/`grep` 的真实通道是 `ctx.subprocess.spawn()` 拉起打包的 ripgrep（`search-core.ts:238-248`），argv 形如：
-
-```
-[rg, --no-config, --files, --glob=<模型给的 pattern>, --sort=modified,
- --no-ignore, --hidden, ...VCS 排除, --, <path>?]
-```
-
-做法：`PathGuardSubprocess extends LocalSubprocessRuntime`（`packages/subprocess/subprocess-local/src/index.ts:59`），只覆写 `spawn(spec)`，识别 ripgrep 调用后在 **`--` 分隔符之前**插入否定 glob：
-
-```
---glob=!**/<相对路径>      --glob=!**/<相对路径>/**
-```
-
-（两种形式都需要，正是 `glob.ts:96-103` 对 VCS 目录采用同一技巧的原因：当搜索根**位于**目标目录内部时，只有 `/**` 形式会命中。）
-
-排除范围按档位区分 —— 这是「可见名字但不可读内容」的关键：
-
-| 工具 | 排除哪些档位 | 效果 |
-| --- | --- | --- |
-| `glob`（`rg --files`，只出文件名）| 仅 `none` | `list`/`read` 路径的文件名**照常出现**（满足 G3）|
-| `grep`（`rg --json`，带匹配内容）| `none` + `list` | 受保护文件根本不被搜索，**内容零泄漏** |
-
-优点：ripgrep 从头就不会打开受保护文件，不存在「输出里被截掉一行的痕迹」，也不依赖文本解析。我们的否定 glob 追加在模型给的 `--glob` **之后**，按 ripgrep「后者覆盖前者」的语义，模型无法用更宽的 pattern 把保护覆盖掉。
-
-若搜索根本身就是受保护路径（或落在其内部），ripgrep 无意义，直接在 L2b 的 guard 层拒绝整次调用。
-
-### L2b 工具层
-
-1. **硬拒绝（guard）**：对 `read`/`read_image`/`write`/`edit`/`glob`/`grep` 的**显式路径参数**做 L0 判定，不足则拒绝。这是与注册顺序无关的兜底（`ctx.tools.guard()` 的语义保证），也负责给出可读的拒绝理由。
-2. **结果兜底过滤**（`tools/post-execute`）：对 `glob`/`grep` 的文本结果再逐行过一遍 L0，剔除仍命中受保护路径的条目。定位是**防格式漂移的保险**，不是主机制——如果兜底解析拿不准，就在「搜索范围与受保护路径有交集」时**整体阻断**该次结果（fail-closed），宁可少给结果也不泄漏。
-
-### L3 shell 尽力围栏
-
-- 覆盖 `pwsh-sandbox` row（Windows）为 `PathGuardShellExecutor extends SandboxPwshExecutor`，在 `resolve(request)`（`packages/shell/pwsh-sandbox/src/index.ts:92`）里扫描命令文本：出现受保护路径的字面量 / `~` 展开 / 变量展开结果时拒绝。
-- 对 shell 工具输出做 `post-execute` 脱敏（按路径前缀剥离行）。
-- **明确标注为尽力而为**，不是安全边界；理由与残余风险见 §9。
+resolved 判定与工具体自己再 `resolve` 一次之间存在窗口。这与 `fs-sandbox` 自己声明的威胁模型一致（`fs-sandbox/src/index.ts:10-18`：「This is containment, not a security boundary … residual TOCTOU … is accepted for this threat model」）。如实列在 §9。
 
 ---
 
-## 5. 仓库结构
+## 4. 架构：纯增量，不接管服务
+
+```
+  AI 工具调用
+      │
+      ├─ L1  tools/pre-execute（异步）      ← 主决策：resolve 真实路径 → 按档位 允许/拒绝
+      ├─ L2  ctx.tools.guard()（同步）       ← 词法兜底，顺序无关
+      ├─ L3  fs/write-intent / fs/edit-intent ← write/edit 的写否决（已解析目标）
+      ├─ L4  tools/post-execute（prepend）   ← 结构化脱敏 glob/grep/shell 的 value
+      ├─ L5  不可拦表面的按名拒绝（可配）     ← bash/pwsh/terminal_*/run_code/subagent*/mcp__*
+      └─ L6  自我保护                        ← 拦住针对本插件与 profile 组合的动作
+      ┌──────────────────────────────────────────────────────────┐
+      │ L0 策略引擎（pathGuard 服务）— 上面各层的共同大脑          │
+      │ 配置来自前端页面；纯函数核心，可单测                       │
+      └──────────────────────────────────────────────────────────┘
+```
+
+### 4.1 L4 为什么用「改写结构化 value」而不是解析文本
+
+`glob` 的返回值是路径列表、`grep` 的返回值是带上文件路径的匹配项——都是 JSON 结构，在 `tools/post-execute` 里能精确按条剔除，不存在「解析渲染文本」的格式漂移问题。这正是你说的**增量劫持**：不动服务，只改这一次调用的结果。
+
+- `glob`：剔除命中 `none` 的路径（`list`/`read` 的文件名照常出现 → 满足 G3）。
+- `grep`：剔除命中 `none` **或** `list` 的匹配项（`grep` 带内容，所以 `list` 也不能给内容）。
+- 判不准时 **fail-closed**：整体 `{kind:'block'}`，宁可少给结果。
+
+### 4.2 为什么最终没有去劫持 `ctx.subprocess`（回答你的问题）
+
+**`ctx.subprocess` 是什么**：DSH 抽象出来的**子进程服务**，是「跑一个子进程」的唯一接缝——`packages/subprocess/subprocess/src/index.ts:117` `abstract class SubprocessRuntime extends Service`、`:153` `abstract spawn(spec)`，由 `@deepseek-ai/dsh-subprocess-local` 在 row `subprocess` 注册（`packages/bundle/base/cordis.patch.yml:219-220`）。走它的人包括：`pwsh`/`bash` 执行器、`glob`/`grep` 背后的 ripgrep、终端、以及跨进程子代理。
+
+**第 1 版为什么想接管它**：在 ripgrep 的 argv 里插 `--glob=!<受保护路径>`，让 ripgrep **根本不去打开**受保护文件。相比「读完再删结果」，这是结构性保证。
+
+**为什么放弃**，两个理由，**第一个才是我真正在意的，不是性能**：
+
+1. **爆炸半径**（真实理由）：它是所有子进程的必经之路。包装函数本身很便宜（每次 spawn 一次函数调用 + 一次 argv 扫描，不是逐字节成本），但一旦这里出错，受影响的是 shell、终端、搜索、子代理——是整台机器，不是本插件。收益（搜索层多一层结构性保证）与这个风险不成比例。
+2. **收益可以用更小的代价拿到大部分**：L4 的结构化脱敏对「模型看到什么」是等价的，且完全可回滚。
+
+**代价我也如实说**（§9 有完整表）：L4 是「ripgrep 读到了、我们删掉了」。如果搜索结果超过内联上限，`search-core.ts:382-399` 会**把完整结果落盘为 spill 文件**（`suggestedName: 'grep-results.txt'`），模型之后可能通过 `job_output` 拿到。这是我放弃 argv 方案后**唯一真正变差的地方**，已在 §9 列为已知缺口，并在 §12 留了「要不要为它单独做增量劫持」的决策点。
+
+> 备选方案对比（互斥、二选一）：
+> - **A. 接管 `ctx.subprocess` row**：结构性无泄漏，但动中枢服务，卸载/升级都要靠 row id 不变。
+> - **B. 纯增量（本版选定）**：零服务接管、可回滚、覆盖「模型可见面」等价；残留 spill 缺口。
+> - 选 B 的理由是爆炸半径与可回滚性；A 不是被性能否掉的。
+> - **可证伪点**：如果实测发现 `grep` 在受保护目录上经常触发 spill，B 的缺口就从「理论」变成「常见」，那时应当重新评估 A，或对 `tool-fs-search` 的 `rawOutputMaxBytes` 做 row 配置覆盖（这是纯配置覆盖，不接管服务）。
+
+---
+
+## 5. 拒绝语义（按你的答复）
+
+被拒时返回 `{ kind: 'deny', reason }`，文案逐字进模型上下文（`:1526`）。统一模板：
+
+```
+该路径已被用户通过 dsh-path-guard 明确禁止访问，这不是系统错误，也不是权限不足。
+
+- 路径：<displayPath>
+- 生效规则：<ruleId>（access: <none|list|read>）
+- 当前禁止：查看内容 / 列目录与文件名 / 写入
+
+不要尝试绕过此限制：换用其他工具、其他路径写法、相对路径、符号链接、大小写变体、
+压缩/编码后再读、或通过 shell 命令间接读取，都会同样被拒绝，并且会被记录。
+
+如果任务确实需要该路径，请向用户说明用途并请求其调整策略；经用户同意后由用户
+在本插件的配置页修改规则。
+```
+
+要点：
+- **明确说是「用户设定」**，不是 bug、不是 entitlement 问题；
+- **点名禁止的绕过手段**（对应 §9 残余风险的常见路径）；
+- **给出合法出口**（向用户申请），避免模型陷入死循环或反复重试；
+- 对 `list` 档位读内容的场景，文案改成「该路径仅允许查看名称，不允许读取内容」。
+
+模型可见的 `access` 档位名与拒绝原因会**同时写 Host 日志**（G7）。
+
+---
+
+## 6. 防绕过（保留 `plugin_manager`，精确拦截）
+
+你问「能否在保留的情况下依旧阻止模型绕过」——**能，但要分层说清楚**。
+
+### 6.1 拦住「针对本插件自身」的动作
+
+`plugin_manager` 工具的参数是可见的（`boot/plugin-manager/src/tools.ts:22-32`：`action` ∈ `list_plugins|list_bundles|set_plugin|set_bundle|install_bundle|remove_bundle|list_version_exemptions|set_version_exemption`，加 `target`）。在 L1 里按参数拒绝：
+
+| `action` | 拒绝条件 |
+| --- | --- |
+| `set_plugin` / `set_bundle` | `target` 命中本插件 row id 或本 bundle 包名 |
+| `remove_bundle` | `target` 命中本 bundle 包名 |
+| `install_bundle` | `target` 解析后指向本包（防「重装覆盖」）|
+| `set_version_exemption` | `target` 以本包名开头 |
+
+**列表类动作（`list_*`）一律放行**——保留可观测性，模型仍然能看到装了哪些插件。这满足你「保留但不让它绕过」的要求，也避免把工具整个禁掉带来的副作用。
+
+### 6.2 堵住不经过 `plugin_manager` 的改写路径
+
+模型还有别的办法关掉防护，需要一起堵：
+
+| 路径 | 处置 |
+| --- | --- |
+| 用 `write`/`edit` 直接改 profile 的 `cordis.patch.yml` / `package.json` / `cordis.yml` | L1 内置**自我保护规则**：这些路径永远视为 `read`（可读不可写）。注意 `plugin_manager` **不**通过模型的 `write` 工具写文件（它走 Host 的 `configEditor`），所以这条**不会破坏正常装插件** |
+| 用 `pwsh`/`run_code` 改上述文件 | L5 的 shell 扫描覆盖（尽力）；`deny-all` 档位直接禁掉 |
+| 改本插件自己的配置（把规则清空）| 配置页写入走 Host `configEditor`，模型无对应工具；直接改补丁文件被上一条挡 |
+
+### 6.3 诚实结论
+
+这三层之后，「模型主动关掉防护」这条路径**从一条命令变成了需要连续绕过三层**，且每次都会留日志。但**不是绝对不可能**——C 类表面（§2.2）本就拦不住。所以 §12 仍保留「是否要把 `shell` 默认档位收紧」的问题。
+
+---
+
+## 7. 模块与文件结构
 
 ```
 dsh-path-guard/
 ├─ README.md
-├─ package.json              # bundle 清单：dsh.bundle.patch
-├─ cordis.patch.yml          # Loader 补丁：接管 fs/subprocess/shell row + 插入本插件 row
-├─ icon.svg                  # 插件卡片图标
-├─ locale/{zh,en}.json       # 插件显示名与描述
+├─ package.json          # bundle 清单：dsh.bundle.patch（纯 JS，无构建步骤）
+├─ cordis.patch.yml      # 只 insert 自己的一个 row，不覆盖任何上游 row
+├─ icon.svg
+├─ locale/{zh,en}.json
 ├─ src/
-│  ├─ index.js               # 主插件：注册 pathGuard 服务 + L2b guard/post-execute
-│  ├─ policy.js              # L0 纯策略引擎（匹配、优先级、归一化）
-│  ├─ config.js              # schemastery Config（前端页面由此生成）
-│  ├─ fs.js                  # L1 PathGuardFileSystem
-│  ├─ subprocess.js          # L2a PathGuardSubprocess（ripgrep argv 排除）
-│  ├─ shell.js               # L3 PathGuardShellExecutor
-│  └─ result-filter.js       # L2b/L3 结果脱敏
+│  ├─ index.js           # apply()：注册 pathGuard 服务 + 四个扩展点
+│  ├─ policy.js          # L0 纯策略引擎（匹配/优先级/归一化），无 Cordis 依赖
+│  ├─ config.js          # schemastery Config（每个可编辑字段 .volatile()）
+│  ├─ paths.js           # 各工具的路径字段抽取表 + resolve 判定
+│  ├─ deny.js            # 拒绝文案模板
+│  ├─ redact.js          # L4：glob/grep/shell 的结构化脱敏
+│  └─ self-guard.js      # L6：plugin_manager 参数拦截 + 自我保护路径表
 ├─ tests/
 │  ├─ policy.spec.js
-│  ├─ fs-guard.spec.js
-│  ├─ search-exclude.spec.js
-│  ├─ tool-guard.spec.js
+│  ├─ extract.spec.js
+│  ├─ redact.spec.js
+│  ├─ self-guard.spec.js
 │  └─ e2e.spec.js
-└─ docs/PLAN.md
+├─ docs/PLAN.md
+└─ reports/              # 研究证据（只读留档）
 ```
 
-> 说明：bundle 为纯 JS（`references/host-plugin.md:7` 明确「Host-only bundle needs no dependencies, install scripts, or build tool」）。四个服务模块通过 `package.json` 的 `exports` 暴露为子路径（`.`、`./fs`、`./subprocess`、`./shell`），Loader 的 row `name` 直接写 `dsh-path-guard/fs` 这类说明符。**该写法有官方先例**：shipped bundle 已用子路径作为 row 名，如 `@deepseek-ai/dsh-tool-subagent/list-agents`（`packages/bundle/web-app/presets/standard.patch.yml:89`）、`@deepseek-ai/dsh-tool-cordis/host`（同文件 :151）。
-
----
-
-## 6. 包清单与 Loader 补丁
-
-`package.json`：
-
-```json
-{
-  "name": "dsh-path-guard",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "exports": {
-    ".": "./src/index.js",
-    "./fs": "./src/fs.js",
-    "./subprocess": "./src/subprocess.js",
-    "./shell": "./src/shell.js",
-    "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
-  },
-  "icon": "./icon.svg",
-  "meta": { "title": "Path Guard", "description": "在完全权限下仍阻止 AI 访问指定路径" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
-}
-```
-
-`cordis.patch.yml`（要点）：
+`cordis.patch.yml` 全文：
 
 ```yaml
-# 1) 接管文件系统围栏
-- id: fs-sandbox
-  name: 'dsh-path-guard/fs'
-
-# 2) 接管子进程围栏（ripgrep 搜索排除）
-- id: subprocess
-  name: 'dsh-path-guard/subprocess'
-
-# 3) 接管 Windows shell 围栏（非 Windows 部署对应改写 pwsh→bash）
-- id: pwsh-sandbox
-  name: 'dsh-path-guard/shell'
-
-# 4) 插入策略所有者与工具层
 - insert:
     - id: path-guard
       name: 'dsh-path-guard'
       config:
         defaultAccess: allow
-        enforce: { fs: true, search: exclude, tools: true, shell: scan }
         rules: []
 ```
 
-被覆盖的三个 row 在上游的位置：`subprocess` `packages/bundle/base/cordis.patch.yml:219-220`、`pwsh-sandbox` `:240-242`、`fs-sandbox` `:517-518`。
-
-前端配置页面 = row `id: path-guard` 的命名空间，schema 来自 `Config`。
-
-**安装方式**：用 Harness 的 `plugin_manager` 工具 `action: install_bundle`，`target` 为本目录绝对路径；**不要**手工改 profile 的 `package.json`/`cordis.patch.yml`（`references/host-plugin.md:58`）。
+**没有 row 覆盖，没有服务接管。** row id `path-guard` 同时就是前端配置页的命名空间。
 
 ---
 
-## 7. 配置 Schema
+## 8. 配置 Schema 与前端页面
 
 ```js
 export const Config = z.object({
-  enabled: z.boolean().default(true),
-  defaultAccess: z.union(['none', 'list', 'read', 'write', 'allow']).default('allow'),
-  denyShape: z.union(['not-found', 'denied']).default('not-found'),
-  enforce: z.object({
-    fs: z.boolean().default(true),                              // L1 是否接管 ctx.fs
-    search: z.union(['exclude', 'filter', 'off']).default('exclude'), // L2 搜索层档位
-    tools: z.boolean().default(true),                            // guard/post-execute 兜底
-    shell: z.union(['off', 'scan', 'deny-all']).default('scan'), // L3
-  }).default({}),
+  enabled: z.boolean().default(true).volatile(),
+  defaultAccess: z.union(['none','list','read','write','allow']).default('allow').volatile(),
   rules: z.array(z.object({
-    path: z.string().role('text'),
-    access: z.union(['none', 'list', 'read', 'write']).default('none'),
-    note: z.string().default(''),
-  })).default([]),
+    id: z.string().default('').volatile(),
+    path: z.string().default('').volatile(),
+    access: z.union(['none','list','read','write']).default('none').volatile(),
+    note: z.string().default('').volatile(),
+  })).default([]).volatile(),
+  unfenceable: z.union(['deny','allow']).default('deny').volatile(),   // §2.2 C/B' 类表面
+  shell: z.union(['off','scan','deny-all']).default('scan').volatile(),
+  selfProtection: z.boolean().default(true).volatile(),
 })
 ```
 
-- `denyShape: not-found`（默认）—— `none` 档位的拒绝伪装成「文件不存在」，**不泄露路径存在性**；`denied` 则显式报拒绝，便于调试。
-- `enforce.shell: deny-all` —— 对担心 shell 绕过的用户提供「直接用不了 shell」的强档。
+- **每个字段都 `.volatile()`**——否则表单不会生成（§2.5）。
+- `unfenceable: deny`（默认）——对 `bash`/`pwsh`/`terminal_*`/`run_code`/`subagent*`/`mcp__*` 直接拒绝，`allow` 交给 shell 扫描。这是「安全 vs 可用」的主开关，默认偏安全。
+- `selfProtection`——§6 的开关。
 
-前端表单体验：`rules` 渲染为可增删的列表；每行是「路径 / 档位 / 备注」三列。改动经 `remote.settings.mutate` 写回 profile 补丁，`applies: live` 热生效。
-
----
-
-## 8. 关键实现细节
-
-### 8.1 拒绝形态
-
-复用 DSH 既有错误码，让工具层自动渲染成模型可理解的提示（`packages/fs/fs/src/types.ts:175-188`）：
-
-| 档位 | 表现 |
-| --- | --- |
-| `none` + `denyShape: not-found` | 抛 `FS_NOT_FOUND`（与真实不存在同构）|
-| `none` + `denyShape: denied` | 抛 `FS_SANDBOX_DENIED`，消息注明 `path-guard` |
-| `list` 读内容 | `FS_PERMISSION_DENIED`，消息提示「该路径仅允许查看名称」|
-| `read` 写 | `FS_SANDBOX_DENIED`，消息提示「只读豁免」|
-
-### 8.2 父目录列举（G2 核心）
-
-`listDir(dir)` 返回前过滤：对每个 `entry.target` 跑 L0，`access === 'none'` 的条目**整个移除**。因此 `~` 的列表里不会出现 `.ssh`。
-
-但注意 §2.1 的结论：**模型「看结构」主要靠 ripgrep（`glob`/`grep`），不是 `listDir`**。所以 G2 的完整达成依赖三处协同：L1 的 `listDir` 过滤（覆盖 `str_replace_editor`、skills 与 GUI）、L2a 的 argv 排除（覆盖 `glob`/`grep` 的结构枚举）、L2b 的 guard（覆盖显式点名受保护路径的调用）。
-
-### 8.3 符号链接与规范化
-
-- 一律先 `resolve()` 再判定（真实路径），防止 `link → protected` 绕过。
-- `lstat`（不跟随末段）按**路径本身**判定，防止通过检查链接本身推断目标。
-
-### 8.4 审计
-
-- 每次拒绝：`ctx.logger.warn`（Host 日志）+ 可选 `session.append`。
-- 页面顶部展示：已生效规则数、最近 N 次拒绝、L1/L3 是否成功接管（自检结果）。
-
-### 8.5 自检（防静默失效）
-
-插件启动时校验：`ctx.fs.constructor.name === 'PathGuardFileSystem'`、`ctx.shell.sandboxMode !== undefined` 等；不满足则显示醒目告警——因为 row 覆盖依赖上游 row id 不变，DSH 升级可能使其静默失效。
+**页面形态**：默认走**自动生成的配置页**（命名空间 = row id `path-guard`），零客户端代码、零构建步骤、不受 `dev:web` 约束。
+**自研页面**列为可选（§11 M5），只在自动页不够用时才做——它需要手写 `client.js`、`exports['./client']`、`dsh.client.platform: 'web'`，并注册到 `plugins.item` 插槽。
 
 ---
 
-## 9. 已知限制与残余风险（必须如实告知）
+## 9. 残余风险（如实清单）
 
-| 风险 | 影响 | 缓解 |
+| 风险 | 说明 | 缓解 |
 | --- | --- | --- |
-| **shell 命令可混淆** | `pwsh` 中变量拼接、编码、外部程序可绕过文本扫描读取 `none` 路径 | 提供 `shell: deny-all`；长期方案见 §11 M5（ACL）|
-| **覆盖上游 row 依赖 row id** | DSH 升级若改 id/包名，围栏静默消失 | §8.5 自检 + 页面告警 + 单测断言；升级后必须重跑 §10 验收 |
-| **L2a argv 注入依赖 ripgrep argv 形态** | `tool-fs-search` 若改变 argv 结构（如 `--` 位置）则注入点失效 | 注入点按「`--` 之前」计算并对无 `--` 情形回退；L2b 兜底过滤；单测直接断言生成的 argv |
-| **TOCTOU** | 检查后路径被替换成符号链接 | 与 `fs-sandbox` 同等威胁模型，判定在 resolve 后、操作前紧邻执行 |
-| **插件自身可被 AI 关闭** | 模型有 `plugin_manager` 工具（web-app 预设含 `tool-plugin-manager`）| 建议 `ctx.tools.restrict()` 对该 agent 隐藏 `plugin_manager`（M3 可选项，见 §12-3）|
-| **模型可读本插件配置** | 规则本身若在被保护路径内会泄露 | 文档提示把插件配置/本仓库设为 `none` |
-| **不防用户本人** | 用户仍可自行查看 | 符合 G6，非缺陷 |
+| **shell / PTY / `terminal_send`** | 命令串图灵完备，任何参数分析都不健全 | `unfenceable: deny` 默认拒绝；`shell: scan` 只做尽力扫描 + 输出脱敏 |
+| **`run_code`** | 真实 Node/Python 进程，可 `await import('node:fs')`；`ptc-runtime-python` 完全无围栏 | 同上，默认拒绝 |
+| **跨进程子代理** | `subagent-claude-code`/`-codex`/`-acp` 有自己的一套权限模式（含 `bypassPermissions`）| 默认拒绝整个 `subagent` 工具 |
+| **MCP 服务** | `mcp__filesystem__read_file` 是一等公民的绕过通道，参数 schema 由服务端定义 | 按工具名拒绝 |
+| **搜索 spill 落盘** | 搜索结果超限时 `search-core.ts:382-399` 把完整结果写成 spill 文件，`job_output` 之后可能读到 | **本版已知缺口**；见 §4.2 决策点 |
+| **prompt 期摄取** | `agent-instructions`（含裸 `node:fs` 兜底）与 `skill-filesystem` 走 `ctx.get('fs')`，**没有工具调用可拦** | 无——文档明示：放进指令文件/skill 目录的受保护内容挡不住 |
+| **历史会话检索** | `session_*` 全文检索能捞回任何**曾被记录**的内容 | 无——一旦泄漏过就在日志里 |
+| **L4 脱敏可被工具自身的 finalize 覆盖** | `:1649-1650` → `:1687-1692` 在 post-execute 之后跑 | 已审计：`read`/`write`/`edit`/`glob`/`grep` 都没声明 `finalizeContent`，当前无影响；升级后需复核 |
+| **TOCTOU** | resolved 判定与工具体再 resolve 之间的窗口 | 与 `fs-sandbox` 同一威胁模型，声明接受 |
+| **`str_replace_editor` 不派发 `fs/*-intent`** | L3 对它无效 | 已由 L1 覆盖；不依赖 L3 |
+| **`lsp` 会拉起语言服务器** | 子进程自己读工作区，`hover`/`references` 可能漏内容 | 按路径拒绝调用；文档标注 |
 
 ---
 
 ## 10. 测试与验收
 
 ### 10.1 单元测试
+- `policy.spec.js`：优先级（最具体胜出）、`~`/`${workspace}` 展开、Windows 大小写不敏感、祖先命中、last-wins、空规则表。
+- `extract.spec.js`：各工具的路径字段抽取（`read`/`read_image`/`write`/`edit` → `file_path`；`str_replace_editor`/`present`/`lsp`/`glob`/`grep` 各自字段）。
+- `redact.spec.js`：`glob` 只剔 `none`、`grep` 剔 `none`+`list`；`isError` 时不动 `value`；`Object.hasOwn(decision,'value')` 时让位；判不准时走 `block`。
+- `self-guard.spec.js`：§6.1 的四类 `plugin_manager` 动作拦截；`list_*` 必须放行；profile 文件写保护。
 
-- `policy.spec.js`：优先级（最具体胜出）、`~`/`${workspace}` 展开、Windows 大小写、祖先命中、last-wins、空规则表。
-- `fs-guard.spec.js`：用内存/临时目录 + 桩 `agents`，断言各档位下 `readText`/`listDir`/`writeText` 的行为；**断言 `currentInitiator()===undefined` 时全部放行**（G6）。
-- `search-exclude.spec.js`：直接对生成的 argv 断言——`glob` 只为 `none` 注入否定 glob、`grep` 为 `none`+`list` 注入、注入位置在 `--` 之前、模型自带的 `--glob` 无法覆盖。
-- `tool-guard.spec.js`：guard 对显式受保护路径的拒绝；`post-execute` 兜底过滤与 fail-closed 分支。
-
-### 10.2 端到端验收（必须在本机真实运行）
-
-1. 造样例目录：`D:\dsh-path-guard-fixture\{open,hidden,listed,ro}\`。
-2. 安装 bundle，在页面配置规则。
-3. 新开 session，逐条执行并核对：
-   - `read` `hidden/secret.txt` → 不存在/拒绝；`glob '**/*'` → **不含 `hidden`**（含其文件名）；`grep` 命中 → 完全不出现。
-   - `read` `listed/a.txt` → 拒绝，但 `glob` 能看到 `a.txt`（G3 半访问）；`grep` 搜 `listed` 内内容 → 无结果、无内容泄漏。
-   - `write` `ro/b.txt` → 拒绝；`read` 成功。
+### 10.2 端到端验收（本机真实运行）
+1. 造 fixture：`D:\dsh-path-guard-fixture\{open,hidden,listed,ro}\` + 一个指向 `hidden` 的符号链接。
+2. 安装 bundle，在配置页写规则。
+3. 新开 session 逐条核对：
+   - `read hidden/secret.txt` → 明确拒绝（§5 文案）；`glob '**/*'` → **不含 `hidden` 及其文件名**；`grep` → 无该文件任何内容。
+   - `read listed/a.txt` → 拒绝但 `glob` 能看到 `a.txt`（G3）。
+   - `write ro/b.txt` → 拒绝；`read` 成功。
    - `.ssh` 半访问 + `.ssh/README.md` 可读 → **豁免生效**。
-   - `pwsh` 直接 `Get-Content hidden/secret.txt` → 拒绝（scan 档）。
-4. 用 **GUI 文件树**打开被保护文件 → 必须仍可打开（G6）。
-5. 页面改一条规则 → 无需重启立即生效（G5）。
+   - **符号链接**指向受保护目录 → 同样被拒（验证走的是 realpath 而非词法）。
+   - `pwsh Get-Content hidden/secret.txt` → 默认档位下拒绝（`unfenceable: deny`）。
+   - 让模型 `plugin_manager set_plugin {target: path-guard, enabled: false}` → 拒绝（§6.1），而 `list_plugins` 正常返回。
+4. GUI 文件树打开被保护文件 → **仍可打开**（G6）。
+5. 配置页改一条规则 → 无需重启立即生效（G5）。
 
 ### 10.3 回归
-
-- `danger-full-access` 下原沙箱行为不变（`workspace-write`/`read-only` 档位仍按原语义工作）。
-- 卸载 bundle 后 `ctx.fs` 回到 `fs-sandbox`，无残留。
+- `read-only` / `workspace-write` 档位行为不变。
+- 卸载 bundle 后无残留（无服务被改过，理论上天然满足 → 用第 3 条验收证明）。
 
 ---
 
@@ -434,25 +386,23 @@ export const Config = z.object({
 
 | 里程碑 | 内容 | 产出 | 状态 |
 | --- | --- | --- | --- |
-| **M0** | 规划、git 初始化、计划文档 | 本文件 | ✅ 完成 |
-| **M1** | 骨架：`policy.js` + `config.js` + 单测；bundle 可被 `install_bundle` 识别；**先验证 §6 的 row 覆盖与子路径 `name` 在真实 profile 中生效**（这是全案最大假设）| 可安装、页面出现配置表单 | 待办 |
-| **M2** | L1 `ctx.fs` 围栏 + L2b 工具层（read/write/edit/glob/grep 的 guard 与兜底过滤）| G1、G3、G4、G6 | 待办 |
-| **M3** | L2a `ctx.subprocess` ripgrep 排除（G2 的结构性解法）| G2 | 待办 |
-| **M4** | 自检、审计日志、页面告警；可选隐藏 `plugin_manager` | G7 | 待办 |
-| **M5** | L3 shell 扫描 + 输出脱敏（`scan`/`deny-all`）| shell 场景尽力覆盖 | 待办 |
-| **M6** | （可选）Windows ACL 强隔离档位，把 `none` 提升为内核级 | 消除 §9 首行风险 | 待定 |
-| **M7** | （可选）自定义客户端页面（富表格、拖拽排序、拒绝日志面板）| 替代自动生成表单 | 待定 |
+| **M0** | 规划、git 初始化、计划文档、深度研究 | 本文件 + `reports/` | ✅ 完成 |
+| **M1** | 骨架：`policy.js` + `config.js` + 单测；bundle 可安装；**验证自动生成配置页真的出现（且字段确实 `.volatile()` 生效）** | 可安装、页面可改配置 | 待办 |
+| **M2** | L1 `tools/pre-execute`（resolve 真实路径判定）+ L2 guard 兜底 | G1、G3、G4、G6 | 待办 |
+| **M3** | L3 `fs/*-intent` 写否决 + L4 结构化脱敏 | G2 | 待办 |
+| **M4** | L5 不可拦表面按名拒绝 + L6 自我保护；审计日志与页面状态区 | G7、防绕过 | 待办 |
+| **M5** | （可选）自研客户端页面（富表格、拖拽排序、拒绝日志面板）| 替代自动生成表单 | 待定 |
+| ~~M6~~ | ~~Windows ACL 内核级~~ | **不可行**：现有 ACL 沙箱无法表达按路径拒绝（§1.3）| 删除 |
 
 ---
 
-## 12. 待确认的决策点
+## 12. 待你确认的决策点
 
-1. **本方案要覆盖 3 个上游 row**（`fs-sandbox`/`subprocess`/`pwsh-sandbox`）。替代的「保守版」只做 L1+L2b，不动 `subprocess`：代价是 `glob`/`grep` 只能靠结果过滤，G2 从「结构性保证」降级为「解析后过滤」。**建议：先按保守版打通 M1–M2，M3 再决定是否加 L2a**，用真实回归数据判断风险。
-2. **默认拒绝形态**：`none` 是否默认伪装成「文件不存在」（不泄露存在性）？建议：是。
-3. **shell 档位默认值**：建议默认 `scan`（尽力扫描 + 输出脱敏），把 `deny-all` 留给高安全需求。
-4. **是否同时隐藏 `plugin_manager` 工具**，防止模型自行关闭本插件？建议：是，但需你确认（会改变模型可见工具集）。
-5. **是否要做 M6（Windows ACL 内核级）**：工作量最大，但只有它能真正堵住 shell 绕过。
-6. **规则路径写法偏好**：`~/.ssh` 这类家目录写法是否够用，还是需要 `${env:VAR}`、正则等更复杂语法？
+1. **`unfenceable` 默认值**：默认 `deny`（拒绝 `bash`/`pwsh`/`run_code`/`subagent`/`mcp__*`）最安全，但会显著改变你现在的使用体验（这一会话就在用 `pwsh`）。要不要默认 `deny`？
+2. **shell spill 缺口**（§4.2）：是否接受「`grep` 大结果可能经 spill + `job_output` 泄漏」这一处已知缺口？若不可接受，唯一结构性解法仍是增量劫持 `ctx.subprocess.spawn`（**不是 row 接管**：只包装实例方法，卸载时还原），需要先做一个可行性验证（Cordis 服务实例是否可被安全地就地包装）。建议：先做 M1–M4，用真实数据决定。
+3. **自我保护要不要挡 profile 文件写入**（§6.2）：会连带影响你以后让 AI 帮忙改 `cordis.patch.yml`。
+4. **拒绝文案**：§5 的模板是否照用，还是要调整语气/详略。
+5. **规则路径语法**：`~` / `${workspace}` / `**` 是否够用，还是要 `${env:VAR}`、正则。
 
 ---
 
@@ -461,26 +411,35 @@ export const Config = z.object({
 | 事实 | 位置 |
 | --- | --- |
 | 读操作完全不过沙箱 | `packages/fs/fs-sandbox/src/index.ts:5-8` |
-| `danger-full-access` 写也不围栏 | `packages/fs/fs-sandbox/src/index.ts:122-125` |
-| `ctx.fs` 官方替换方式 | `packages/fs/fs-sandbox/src/index.ts:48-54` |
-| turn 全程在 initiator 作用域 | `packages/core/agent-loop/src/agent.ts:234` |
-| `currentInitiator()` | `packages/core/agent/src/index.ts:295-298` |
-| `ToolGuard` 契约（同步、只能拒绝）| `packages/core/tools/src/index.ts:723-731` |
-| `ctx.tools.guard()` | `packages/core/tools/src/index.ts:1136` |
-| `tools/pre-execute` / `tools/post-execute` | Host Event 目录（运行时 `cordis_inspect_query`）|
-| `glob`/`grep` 走 ripgrep 子进程 | `packages/fs/tool-fs-search/src/search-core.ts:3-12,238-248` |
-| ripgrep argv 结构（`--` 分隔、双重否定 glob 技巧）| `packages/fs/tool-fs-search/src/glob.ts:89-107` |
-| `SubprocessRuntime.spawn` 抽象方法 | `packages/subprocess/subprocess/src/index.ts:117,153` |
-| `LocalSubprocessRuntime` 与 `subprocess` row | `packages/subprocess/subprocess-local/src/index.ts:59`；`packages/bundle/base/cordis.patch.yml:219-220` |
-| `listDir` 的 AI 侧消费者 | `packages/fs/tool-str-replace-editor/src/index.ts:194`、`packages/skill/skill-filesystem/src/index.ts:770` |
-| GUI 文件树经 `ctx.fs` | `packages/api/workspace-files/src/index.ts:322` |
-| 子路径 row 名先例 | `packages/bundle/web-app/presets/standard.patch.yml:89,151` |
-| pwsh 执行器 `resolve()` 与完全权限放行 | `packages/shell/pwsh-sandbox/src/index.ts:92-104` |
-| 设置表单自动生成 | `packages/settings/settings/src/index.ts:266-277,312` |
-| `SettingsNamespaceView.autoGenerate` | `packages/settings/settings/src/types.ts:22-45` |
-| `settings.plugins.tab` 插槽 | `packages/client/ui-settings-plugins/src/client/index.ts:74-83` |
-| 插槽注册范例 | `packages/client/ui-settings-plugin-inventory/src/client/index.ts:56-57` |
-| `FsErrorCode` 词表 | `packages/fs/fs/src/types.ts:175-188` |
-| 相关 row（fs-sandbox 等）| `packages/bundle/base/cordis.patch.yml:240,280,283,517` |
+| `danger-full-access` 写也不围栏 | 同上 `:122-125` |
+| 防护管线不读沙箱策略 | `packages/core/tools/src/index.ts:1493-1539` |
+| `PreToolDecision` / `PostToolDecision` | 同上 `:607-611`、`:617-620` |
+| 参数深冻结、不可改写 | 同上 `:604-605`、`:1441-1445` |
+| guard 同步、单调、顺序无关 | 同上 `:723-731`、`:1136-1142`、`:1504-1535` |
+| 拒绝文案逐字进上下文 | 同上 `:1526` |
+| `value` 重算 `meta`；`content` 不会 | 同上 `:1796-1806`、`:1839`、`:1845-1853` |
+| `finalizeContent` 在 post-execute 之后 | 同上 `:1649-1650`、`:1687-1692` |
+| `prepend` = 最外层 = 最后发言 | `vendor/cordis/src/events.ts:255` |
+| `fs/*-intent` 可 throw；`fs/observed` 不能 | `packages/fs/fs/src/index.ts:59,67,77` |
+| `targetKey` 是 opaque，禁止解析 | `packages/fs/fs/src/types.ts:11-15` |
+| `resolve` 做 realpath | `packages/fs/fs-local/src/index.ts:133-138` |
+| glob/grep 走 ripgrep 子进程、不调沙箱 | `packages/fs/tool-fs-search/src/search-core.ts:222-248`；`src/index.ts:70` |
+| 搜索 spill 落盘 | 同上 `:382-399` |
+| `ctx.subprocess` 契约与 row | `packages/subprocess/subprocess/src/index.ts:117,153`；`packages/bundle/base/cordis.patch.yml:219-220` |
+| shell 完全权限放行 | `packages/shell/pwsh-sandbox/src/index.ts:99-104` |
+| ACL 沙箱无路径 deny 词汇 | `packages/sandbox/sandbox/src/index.ts:40-73` |
+| `run_code` 是真实进程、Python 无围栏 | `packages/ptc-runtime/ptc-runtime-node/src/index.ts:68`；`packages/experimental/ptc-runtime-python/src/index.ts:1038,1046` |
+| 全局 guard 覆盖同进程子代理 | `packages/core/scope/src/index.ts:176`；`packages/core/tools/src/index.ts:1146` |
+| prompt 期摄取绕过工具层 | `packages/agent-instructions/src/files.ts:146,330`；`packages/skill/skill-filesystem/src/index.ts:843` |
+| `plugin_manager` 参数 schema | `packages/boot/plugin-manager/src/tools.ts:19-32` |
+| 配置页命名空间 = row id | `packages/settings/settings/src/index.ts:315,382` |
+| 自动页默认开启 | 同上 `:266-277,312` |
+| **只有 volatile 字段进表单** | 同上 `:308-309,388,406` |
+| 配置写入 = 改补丁 + Loader 重放 | `packages/boot/config-editor/src/index.ts:75-142` |
+| `install_bundle` 不构建包 | `packages/boot/plugin-manager/src/index.ts:461-559` |
+| 客户端半页/插槽规范 | `packages/client/modules/src/client/manifest.ts:9-16,80-94`；`packages/client/ui-plugin-manager/src/client/slot-contract.ts:79-102` |
+| 纯 JS 可安装 bundle 范例 | `apps/web/tests/fixtures/plugins/fixture-live-client/` |
 | bundle 清单与安装方式 | skill `cordis-plugin-development/references/host-plugin.md` |
-| 扩展点强弱与选用原则 | skill `.../references/practices.md:10,17` |
+| 扩展点强弱与选用原则 | skill `.../references/practices.md:10,17,19,20,35` |
+
+完整研究留档：`reports/fs-fence-surface-report.md`（文件系统防护面全景，含逐条 file:line）。
