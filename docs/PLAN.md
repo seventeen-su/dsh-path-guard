@@ -443,3 +443,76 @@ export const Config = z.object({
 | 扩展点强弱与选用原则 | skill `.../references/practices.md:10,17,19,20,35` |
 
 完整研究留档：`reports/fs-fence-surface-report.md`（文件系统防护面全景，含逐条 file:line）。
+
+---
+
+## 附录 B：实施记录与计划偏差
+
+实施过程中有 5 处发现改变了计划或值得记录。按发现顺序：
+
+### B1. 0.1.7-rc.2 **没有**通用自动配置页（推翻 §8 的默认方案）
+
+`settings` 服务确实会为每个 profile entry 投影 `autoGenerate`（`packages/settings/settings/src/index.ts:312`、
+`packages/api/settings-controller/src/index.ts:51`），但**全仓没有任何客户端渲染器消费它**——
+客户端侧所有 `autoGenerate` 出现处都在测试夹具里。`PluginManagerPage.tsx:495` 渲染的是
+`plugins.row.config` 这个 keyed 插槽，只有**配套客户端包**才会往里注册。
+
+→ 结论：想要配置页就必须自带客户端半页。已按此实现 `client/client.js`，注册到
+`settings.section`（Settings 对话框的导航项），绑定命名空间 `path-guard`。
+
+### B2. `Config` 需要真实的 schemastery 依赖
+
+profile 的 `node_modules` 里没有 `@deepseek-ai/*`，插件模块的内部 import 按 Node 规则从
+`<profile>/node_modules` 向上解析，因此 `import z from '@deepseek-ai/schemastery'` 会失败。
+该包在 npm 上**已发布**（`3.18.4`，与 `vendor/schemastery` 同版本），所以在 `package.json`
+里声明为 `dependencies`，由 `install_bundle` 的 `pnpm add` 安装。
+验证方式：`Config.listConfigs` 返回 `status: "schema"` 且 schema 完整。
+
+### B3. **volatile 配置是 `{get()}` 引用，不是纯值**（最重要的一个坑）
+
+schemastery 的 `.volatile()` 字段解析为冻结的 `{ get() }` 引用
+（`vendor/cosmokit/src/volatile.ts:39-45`），且该引用在用户保存设置时**原地更新**——
+这正是 `applies: 'live'` 的实现方式。
+
+第一版在 `apply()` 时把 `config.rules` 当普通数组快照，后果：
+- `Array.isArray(volatileRef)` 为 false → 规则被静默丢弃；
+- `evaluateShell` 里 `for (const rule of cfg.rules)` 抛异常；
+- **异常从 `ctx.tools.guard()` 外泄成工具失败**，把整个 shell 工具打死
+  （实施会话里真实发生：我自己的 `pwsh` 被自己的插件拒绝，且自我保护又禁止我用
+  `plugin_manager` 关掉它，只能请用户从前端停用）。
+
+修法：每次判定经 `unwrap()` 读当前快照；编译结果按**快照身份**缓存
+（`get()` 在值变化前返回同一个冻结对象，所以身份比较是 O(1) 的天然缓存键）。
+
+### B4. 拦截点必须 fail-closed 且不得抛异常
+
+B3 的教训：拦截点里的异常 = 工具失败，比拒绝更难诊断，而且如果是「被静默吞掉」则更糟——
+安全控件悄悄失效。现在三个拦截点全部 try/catch，内部出错返回 `internalErrorText()`：
+明确告诉模型这是插件缺陷、正在 fail-closed、并告诉用户去哪里关掉它。
+
+### B5. 计划里写错的一个测试用例
+
+第 1 版验收用例要求「`D:/x/*` 不匹配 `D:/x/y/z`」。这与「规则命中任一祖先即覆盖后代」
+的算法本体**直接矛盾**——而后者是豁免语义的基础（`~/.ssh` 必须覆盖 `~/.ssh/id_rsa`）。
+正确做法是用带字面尾巴的模式证明 `*` 不跨分隔符（`D:/x/*/z` 不匹配 `D:/x/a/b/z`），
+祖先覆盖行为单独断言。已按此修正。
+
+### 里程碑状态
+
+| 里程碑 | 状态 |
+| --- | --- |
+| M0 规划 / 研究 / git | ✅ |
+| M1 骨架 + 可安装 + 配置面 | ✅（配置面改为自带客户端页，见 B1） |
+| M2 L1 pre-execute + L2 guard | ✅ |
+| M3 L4 结构化脱敏（`fs/*-intent` 经评估后未使用，见下）| ✅ |
+| M4 L5 按名拒绝 + L6 自我保护 + 审计 | ✅ |
+| M5（原「自研客户端页」，因 B1 升级为必需）| ✅ |
+| ~~M6 Windows ACL~~ | 已删除（ACL 沙箱无法表达按路径拒绝） |
+| **实时端到端验收** | ⏳ 未执行：需要重启 DSH 以加载修复后的模块。步骤见 `docs/ACCEPTANCE.md` |
+
+**关于 `fs/write-intent` / `fs/edit-intent`**：计划里列为 L3 写否决。实施时未采用，
+原因是 `write`/`edit` 工具的路径参数已由 `tools/pre-execute` 在**同样的调用**上判定，
+再用 intent 事件否决属于重复防护且多一处可失效点；而 `str_replace_editor` 根本不派发
+这两个事件（研究报告 §5 已指出），所以 intent 并不能带来额外覆盖。若将来需要「写操作
+在解析后的目标上再确认一次」，这是个可加的独立层。
+
