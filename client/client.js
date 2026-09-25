@@ -62,6 +62,11 @@ window.__ModuleLoader__.load({
       exoticAllow: '放行（接受漏洞）',
       selfProtection: '自我保护',
       selfProtectionHint: '禁止 AI 改写本插件所在的 profile 组合文件，也禁止它用 plugin_manager 关闭本插件。',
+      notify: '拦截时发桌面通知',
+      notifyHint: '需要同 profile 装了 dsh-desktop-notify。没装就什么都不发生，装了之后改这里立即生效。',
+      notifyFocused: '只在你不看那个会话时弹（默认）',
+      notifyAlways: '任何情况都弹',
+      notifyOff: '关闭',
       rules: '路径规则',
       rulesHint: '更具体的路径覆盖更宽泛的路径，所以「豁免」就是再加一条更具体的规则。',
       colPath: '路径',
@@ -69,6 +74,25 @@ window.__ModuleLoader__.load({
       colNote: '备注',
       colActions: '操作',
       addRule: '添加规则',
+      presets: '常用位置（点一下即添加）',
+      presetSsh: '~/.ssh → 仅文件名',
+      presetAws: '~/.aws → 完全禁止',
+      presetGnupg: '~/.gnupg → 完全禁止',
+      presetDocker: '~/.docker → 完全禁止',
+      browse: '浏览…',
+      browseTitle: '把选中的目录填入这一行',
+      help: '怎么用？看四个例子',
+      helpHide: '收起说明',
+      helpBody: [
+        '① 完全禁止：规则路径填 ~/.ssh，档位选「完全禁止」。AI 连这个目录里有哪些文件名都看不到。',
+        '② 只让看名字、不让读内容：档位选「半访问·仅文件名」。glob 仍能看到文件名，read / grep 会被拒。',
+        '③ 可读但不可写：档位选「半访问·只读」。读得到，write / edit 会被拒。',
+        '④ 豁免某个文件：再加一条更具体的规则。例如先给 ~/.ssh 设「仅文件名」，再加 ~/.ssh/README.md 设「只读」，就只有那一个文件能读。',
+        '',
+        '规则不区分先后：越具体的路径自动优先——先比命中目录的深度，再比字面量前缀长度，然后比通配符多少。',
+        '路径写法：~ 是家目录；${workspace} 是当前会话的工作区；* 匹配一段，** 匹配任意层。',
+        '改动即时生效，不需要重启。写操作只会改 profile 补丁里本插件那一条 config。',
+      ].join('\n'),
       remove: '删除',
       save: '保存',
       revert: '放弃修改',
@@ -109,6 +133,11 @@ window.__ModuleLoader__.load({
       exoticAllow: 'Allow (accept the hole)',
       selfProtection: 'Self-protection',
       selfProtectionHint: 'Stop the AI from rewriting this profile composition or disabling this plugin through plugin_manager.',
+      notify: 'Desktop notification on refusal',
+      notifyHint: 'Requires dsh-desktop-notify in the same profile. Without it nothing happens; with it, changes here apply immediately.',
+      notifyFocused: 'Only when you are not watching that session (default)',
+      notifyAlways: 'Always',
+      notifyOff: 'Off',
       rules: 'Path rules',
       rulesHint: 'A more specific path overrides a broader one, so an exemption is just a more specific rule.',
       colPath: 'Path',
@@ -116,6 +145,25 @@ window.__ModuleLoader__.load({
       colNote: 'Note',
       colActions: 'Actions',
       addRule: 'Add rule',
+      presets: 'Common locations (click to add)',
+      presetSsh: '~/.ssh → names only',
+      presetAws: '~/.aws → blocked',
+      presetGnupg: '~/.gnupg → blocked',
+      presetDocker: '~/.docker → blocked',
+      browse: 'Browse…',
+      browseTitle: 'Put the chosen directory into this row',
+      help: 'How do I use this? Four examples',
+      helpHide: 'Hide help',
+      helpBody: [
+        '1. Blocked: set the path to ~/.ssh and the level to "Blocked". The AI cannot even see which file names live there.',
+        '2. Names only: pick "Half access · names only". glob still lists file names; read and grep are refused.',
+        '3. Read only: pick "Half access · read only". Reads succeed; write and edit are refused.',
+        '4. Exemption: add a second, more specific rule. Set ~/.ssh to "names only" and ~/.ssh/README.md to "read only" to make exactly that one file readable.',
+        '',
+        'Order does not matter: the more specific path wins automatically — first by how deep the matched directory is, then by literal prefix length, then by fewest wildcards.',
+        'Path syntax: ~ is your home directory; ${workspace} is the current session workspace; * matches one segment, ** matches any depth.',
+        'Changes apply immediately, no restart. A write only touches this plugin\'s own config entry in the profile patch.',
+      ].join('\n'),
       remove: 'Remove',
       save: 'Save',
       revert: 'Discard changes',
@@ -134,6 +182,19 @@ window.__ModuleLoader__.load({
 
     /** Access levels in ladder order, weakest first. */
     const LEVELS = ['none', 'list', 'read', 'write']
+
+    /**
+     * One-click rules for the locations people actually protect first. The
+     * access level is the conservative-but-usable default for each: SSH keeps
+     * names visible so the agent can still tell a key exists, everything else
+     * is hidden outright.
+     */
+    const PRESETS = [
+      { key: 'presetSsh', path: '~/.ssh', access: 'list' },
+      { key: 'presetAws', path: '~/.aws', access: 'none' },
+      { key: 'presetGnupg', path: '~/.gnupg', access: 'none' },
+      { key: 'presetDocker', path: '~/.docker', access: 'none' },
+    ]
 
     const STYLE = {
       root: {
@@ -217,6 +278,40 @@ window.__ModuleLoader__.load({
       ok: { color: 'var(--dsw-alias-state-success-primary, inherit)' },
       warn: { color: 'var(--dsw-alias-state-warn-primary, inherit)' },
       mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
+      presets: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '0 0 10px' },
+      chip: {
+        padding: '3px 9px',
+        borderRadius: '999px',
+        border: '1px solid var(--dsw-alias-border-l2, currentColor)',
+        background: 'var(--dsw-alias-bg-layer-2, transparent)',
+        color: 'var(--dsw-alias-label-primary, inherit)',
+        cursor: 'pointer',
+        fontSize: '11px',
+        fontFamily: 'inherit',
+      },
+      link: {
+        padding: 0,
+        border: 'none',
+        background: 'none',
+        color: 'var(--dsw-alias-brand-primary, currentColor)',
+        cursor: 'pointer',
+        fontSize: '12px',
+        fontFamily: 'inherit',
+        textDecoration: 'underline',
+      },
+      help: {
+        margin: '6px 0 0',
+        padding: '8px 10px',
+        border: '1px solid var(--dsw-alias-border-l1, currentColor)',
+        borderRadius: '6px',
+        background: 'var(--dsw-alias-bg-layer-2, transparent)',
+        color: 'var(--dsw-alias-label-secondary, inherit)',
+        fontSize: '12px',
+        whiteSpace: 'pre-wrap',
+        fontFamily: 'inherit',
+        lineHeight: 1.7,
+      },
+      actions: { display: 'flex', gap: '4px', flexWrap: 'wrap' },
       footer: { display: 'flex', alignItems: 'center', gap: '10px', marginTop: '6px' },
     }
 
@@ -226,7 +321,7 @@ window.__ModuleLoader__.load({
      * @param {(key: string) => string} t - locale lookup.
      * @returns {Function} the React component.
      */
-    function createSection(ctx, t) {
+    function createSection(ctx, t, picker) {
       const form = ctx.configForms.get(NS)
       const subscribe = listener => form.subscribe(listener)
       const getSnapshot = () => form.getSnapshot()
@@ -237,6 +332,7 @@ window.__ModuleLoader__.load({
         const [draft, setDraft] = React.useState(null)
         const [busy, setBusy] = React.useState(false)
         const [message, setMessage] = React.useState(null)
+        const [helpOpen, setHelpOpen] = React.useState(false)
 
         if (snapshot.status === 'loading') {
           return h('section', { style: STYLE.root, 'aria-busy': true }, h('p', null, label('statusLoading')))
@@ -269,6 +365,20 @@ window.__ModuleLoader__.load({
         }
 
         const toggleRow = (index, key) => event => updateRow(index, { [key]: event.target.value })
+
+        /** Append one rule to the draft, creating the draft if needed. */
+        const appendRule = rule => setDraft([...rows, rule])
+
+        /** Ask the Host's directory picker and put the result in one row. */
+        const browseInto = index => async () => {
+          if (!picker.available) return
+          try {
+            const chosen = await picker.pick(new AbortController().signal)
+            if (typeof chosen === 'string' && chosen !== '') updateRow(index, { path: chosen })
+          } catch (error) {
+            setMessage({ kind: 'error', text: String(error && error.message ? error.message : error) })
+          }
+        }
 
         const scalar = (field, key, options) => h('div', { key: field },
           h('div', { style: STYLE.row },
@@ -316,6 +426,24 @@ window.__ModuleLoader__.load({
           h('div', { style: STYLE.group },
             h('h3', { style: STYLE.groupTitle }, label('rules')),
             h('p', { style: STYLE.hint }, label('rulesHint')),
+            h('p', { style: { ...STYLE.hint, margin: '0 0 6px' } }, label('presets')),
+            h('div', { style: STYLE.presets }, PRESETS.map(preset => h('button', {
+              key: preset.key,
+              type: 'button',
+              style: STYLE.chip,
+              disabled: busy || !writable,
+              onClick: () => appendRule({ path: preset.path, access: preset.access, note: '' }),
+            }, label(preset.key)))),
+            h('div', { style: { margin: '0 0 10px' } },
+              h('button', {
+                type: 'button',
+                style: STYLE.link,
+                onClick: () => setHelpOpen(!helpOpen),
+              }, label(helpOpen ? 'helpHide' : 'help')),
+              helpOpen
+                ? h('pre', { style: STYLE.help }, label('helpBody'))
+                : null,
+            ),
             rows.length === 0
               ? h('p', { style: STYLE.hint }, label('empty'))
               : h('table', { style: STYLE.table },
@@ -323,7 +451,7 @@ window.__ModuleLoader__.load({
                   h('th', { style: { ...STYLE.th, width: '34%' } }, label('colPath')),
                   h('th', { style: { ...STYLE.th, width: '38%' } }, label('colAccess')),
                   h('th', { style: STYLE.th }, label('colNote')),
-                  h('th', { style: { ...STYLE.th, width: '56px' } }, label('colActions')),
+                  h('th', { style: { ...STYLE.th, width: '112px' } }, label('colActions')),
                 )),
                 h('tbody', null, rows.map((row, index) => h('tr', { key: index },
                   h('td', { style: STYLE.td }, h('input', {
@@ -349,12 +477,22 @@ window.__ModuleLoader__.load({
                     disabled: busy || !writable,
                     onChange: event => updateRow(index, { note: event.target.value }),
                   })),
-                  h('td', { style: STYLE.td }, h('button', {
-                    type: 'button',
-                    style: STYLE.button,
-                    disabled: busy || !writable,
-                    onClick: () => setDraft(rows.filter((_row, at) => at !== index)),
-                  }, label('remove'))),
+                  h('td', { style: STYLE.td }, h('div', { style: STYLE.actions },
+                    picker.available
+                      ? h('button', {
+                        type: 'button',
+                        style: STYLE.button,
+                        title: label('browseTitle'),
+                        disabled: busy || !writable,
+                        onClick: browseInto(index),
+                      }, label('browse'))
+                      : null,
+                    h('button', {
+                      type: 'button',
+                      style: STYLE.button,
+                      disabled: busy || !writable,
+                      onClick: () => setDraft(rows.filter((_row, at) => at !== index)),
+                    }, label('remove')))),
                 ))),
               ),
             h('div', { style: STYLE.footer },
@@ -362,7 +500,7 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 style: STYLE.button,
                 disabled: busy || !writable,
-                onClick: () => setDraft([...rows, { path: '', access: 'none', note: '' }]),
+                onClick: () => appendRule({ path: '', access: 'none', note: '' }),
               }, label('addRule')),
               draft === null ? null : h('span', { style: STYLE.warn }, label('unsaved')),
               draft === null ? null : h('button', {
@@ -403,6 +541,11 @@ window.__ModuleLoader__.load({
           h('div', { style: STYLE.group },
             checkbox('searchRedaction', 'searchRedaction'),
             checkbox('selfProtection', 'selfProtection'),
+            scalar('notify', 'notify', [
+              { value: 'focused', label: label('notifyFocused') },
+              { value: 'always', label: label('notifyAlways') },
+              { value: 'off', label: label('notifyOff') },
+            ]),
           ),
 
           message === null ? null : h('p', { style: message.kind === 'ok' ? STYLE.ok : STYLE.error }, message.text),
@@ -420,7 +563,21 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(L10N, { zh, en }), 'path-guard: locale')
         const t = ctx.locale.bind(L10N)
-        const Section = createSection(ctx, t)
+
+        // The Host's directory picker is an optional Remote: a deployment
+        // without `@deepseek-ai/dsh-directory-picker-auto` simply gets no
+        // "Browse…" button instead of a broken one.
+        const picker = { available: false, pick: async () => null }
+        ctx.inject(['remote', 'remote.directoryPicker'], pickerCtx => {
+          picker.available = true
+          picker.pick = signal => pickerCtx.remote.directoryPicker.pick(signal)
+          return () => {
+            picker.available = false
+            picker.pick = async () => null
+          }
+        })
+
+        const Section = createSection(ctx, t, picker)
 
         // Register only while the Host actually serves the namespace, so a
         // profile without this bundle's row shows no trace of the page.

@@ -31,16 +31,30 @@ function fakeCtx(options = {}) {
   const guards = []
   const listeners = new Map()
   const logs = []
+  const pushed = []
+  const pushedAlways = []
   const canonical = options.canonical ?? (raw => raw)
+  const service = options.notifyService === undefined
+    ? undefined
+    : {
+      push: item => { pushed.push(item); return true },
+      pushAlways: item => { pushedAlways.push(item); return true },
+      ...options.notifyService,
+    }
   return {
     guards,
     listeners,
     logs,
+    pushed,
+    pushedAlways,
     logger: {
       info: (...args) => logs.push(['info', ...args]),
       warn: (...args) => logs.push(['warn', ...args]),
       error: (...args) => logs.push(['error', ...args]),
       debug: (...args) => logs.push(['debug', ...args]),
+    },
+    get(name) {
+      return name === 'desktopNotify' ? service : undefined
     },
     tools: { guard: fn => { guards.push(fn); return () => {} } },
     on(event, handler) {
@@ -428,6 +442,68 @@ test('an internal failure fails closed instead of throwing', async () => {
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
   assert.equal(decision.kind, 'deny')
   assert.match(decision.reason, /内部出错/)
+})
+
+// ---------------------------------------------------------------------------
+// Desktop notification wiring (optional `desktopNotify` service)
+// ---------------------------------------------------------------------------
+
+test('a denial notifies through desktopNotify when it is mounted', async () => {
+  const ctx = fakeCtx({ notifyService: {} })
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(ctx.pushed.length, 1, 'the default `focused` mode rides the focus gate')
+  assert.equal(ctx.pushedAlways.length, 0)
+  assert.ok(ctx.pushed[0].title.includes('Path Guard'))
+  assert.ok(ctx.pushed[0].message.length > 0)
+})
+
+test('notify: always bypasses the focus gate, notify: off sends nothing', async () => {
+  const always = fakeCtx({ notifyService: {} })
+  apply(always, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false, notify: 'always' })
+  await preExecute(always, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(always.pushedAlways.length, 1)
+  assert.equal(always.pushed.length, 0)
+
+  const off = fakeCtx({ notifyService: {} })
+  apply(off, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false, notify: 'off' })
+  await preExecute(off, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(off.pushed.length + off.pushedAlways.length, 0)
+})
+
+test('guard-side denials notify too, and a missing service is silent', async () => {
+  const exotic = fakeCtx({ notifyService: {} })
+  apply(exotic, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false, notify: 'always' })
+  exotic.guards[0]({ name: 'workflow', arguments: { script: 'x' } })
+  assert.equal(exotic.pushedAlways.length, 1)
+  assert.match(exotic.pushedAlways[0].message, /workflow/)
+
+  // No `dsh-desktop-notify` in the profile: denials must still work and log.
+  const bare = fakeCtx()
+  apply(bare, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  const decision = await preExecute(bare, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(decision.kind, 'deny')
+  assert.ok(bare.logs.some(([level]) => level === 'warn'))
+})
+
+test('an internal failure notifies as a malfunction', async () => {
+  let reads = 0
+  const flaky = Object.freeze({
+    get: () => {
+      reads += 1
+      if (reads > 1) throw new Error('boom')
+      return []
+    },
+    [VOLATILE_WRITE]: () => {},
+  })
+  const ctx = fakeCtx({ notifyService: {} })
+  apply(ctx, { enabled: ref(true), rules: flaky, defaultAccess: ref('allow'), selfProtection: ref(false), notify: 'always' })
+  ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
+  // `malfunction` is throttled per extension point and rides the focus gate
+  // (`push`), unlike `always: true` denials.
+  assert.equal(ctx.pushed.length, 1)
+  assert.match(ctx.pushed[0].title, /内部错误/)
+  assert.equal(ctx.pushedAlways.length, 0)
 })
 
 // ---------------------------------------------------------------------------

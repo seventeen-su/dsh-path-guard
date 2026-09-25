@@ -52,6 +52,7 @@ import {
   shellDenialText,
 } from './deny.js'
 import { buildNeedles, commandOf, redactTextBlocks, scanCommand } from './scan.js'
+import { createNotifier } from './notify.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'path-guard'
@@ -109,6 +110,7 @@ const DEFAULTS = {
   shell: 'scan',
   exoticTools: 'deny',
   selfProtection: true,
+  notify: 'focused',
 }
 
 /** Stable empty rule list, so the compiled-policy cache key keeps its identity. */
@@ -349,14 +351,20 @@ export function apply(ctx, config) {
   const checkPath = async (exec, rawPath, required) => {
     const { decision, shown } = await decidePath(exec, rawPath)
     if (permits(decision, required)) return undefined
-    return denialText({
-      toolName: exec.name,
-      shownPath: shown,
+    return {
+      reason: denialText({
+        toolName: exec.name,
+        shownPath: shown,
+        access: decision.access,
+        required: REQUIRED_TEXT[required] ?? required,
+        ...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
+        ...(decision.pattern === undefined ? {} : { rulePath: decision.pattern }),
+      }),
+      target: shown,
       access: decision.access,
-      required: REQUIRED_TEXT[required] ?? required,
       ...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
       ...(decision.pattern === undefined ? {} : { rulePath: decision.pattern }),
-    })
+    }
   }
 
   /**
@@ -377,8 +385,8 @@ export function apply(ctx, config) {
         values.push(workspace)
       }
       for (const value of values) {
-        const reason = await checkPath(exec, value, required)
-        if (reason !== undefined) return reason
+        const hit = await checkPath(exec, value, required)
+        if (hit !== undefined) return hit
       }
     }
     return undefined
@@ -394,7 +402,11 @@ export function apply(ctx, config) {
     if (mode === 'off') return undefined
     if (!SHELL_TOOLS.has(exec.name)) return undefined
     if (mode === 'deny') {
-      return shellDenialText({ toolName: exec.name, needle: 'shell 已被整体禁用（shell: deny）', access: 'none' })
+      return {
+        reason: shellDenialText({ toolName: exec.name, needle: 'shell 已被整体禁用（shell: deny）', access: 'none' }),
+        target: '(shell)',
+        access: 'none',
+      }
     }
     const needles = shellNeedles(exec)
     if (needles.length === 0) {
@@ -404,20 +416,29 @@ export function apply(ctx, config) {
       // indistinguishable from "not looked for".
       const fallback = read('defaultAccess')
       if (fallback === 'allow') return undefined
-      return shellDenialText({
-        toolName: exec.name,
-        needle: 'defaultAccess 不是 allow，但没有任何可用的路径规则供扫描',
+      return {
+        reason: shellDenialText({
+          toolName: exec.name,
+          needle: 'defaultAccess 不是 allow，但没有任何可用的路径规则供扫描',
+          access: String(fallback),
+        }),
+        target: '(shell)',
         access: String(fallback),
-      })
+      }
     }
     const hit = scanCommand(commandOf(exec.arguments), needles, windows)
     if (hit === undefined) return undefined
-    return shellDenialText({
-      toolName: exec.name,
-      needle: hit.needle,
-      rulePath: hit.pattern,
+    return {
+      reason: shellDenialText({
+        toolName: exec.name,
+        needle: hit.needle,
+        rulePath: hit.pattern,
+        access: hit.access,
+      }),
+      target: hit.needle,
       access: hit.access,
-    })
+      rulePath: hit.pattern,
+    }
   }
 
   /**
@@ -434,6 +455,42 @@ export function apply(ctx, config) {
     return selfDenialText({ action, target: typeof args.target === 'string' ? args.target : '(未指定)' })
   }
 
+  // Desktop notifications go through the OPTIONAL `desktopNotify` service that
+  // `dsh-desktop-notify` registers. Resolved per call, so enabling that plugin
+  // later takes effect without a restart, and absent it nothing happens at all.
+  const notifier = createNotifier({
+    resolveService: () => {
+      try {
+        return ctx.get('desktopNotify')
+      } catch {
+        return undefined
+      }
+    },
+    logger: ctx.logger,
+  })
+
+  /**
+   * Record a refusal: one log line, plus a desktop notification when enabled.
+   * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the refused call.
+   * @param {{reason: string, target?: string, access?: string, rulePath?: string, ruleId?: string}} hit - the verdict.
+   * @param {string} kind - `path` | `shell` | `exotic` | `self` | `redaction`.
+   */
+  const reportDenial = (exec, hit, kind) => {
+    ctx.logger.warn('path-guard: denied %s — %s', exec.name, String(hit.reason).split('\n')[0])
+    const mode = read('notify')
+    if (mode === 'off') return
+    notifier.denial({
+      kind,
+      toolName: exec.name,
+      ...(hit.target === undefined ? {} : { target: hit.target }),
+      ...(hit.access === undefined ? {} : { access: hit.access }),
+      ...(hit.rulePath === undefined ? {} : { rulePath: hit.rulePath }),
+      ...(hit.ruleId === undefined ? {} : { ruleId: hit.ruleId }),
+      ...(exec.agent?.session === undefined ? {} : { sessionId: exec.agent.session }),
+      always: mode === 'always',
+    })
+  }
+
   // ---- L1: the authority on paths -----------------------------------------
   //
   // Every registration below is wrapped: an exception raised here becomes a tool
@@ -443,10 +500,10 @@ export function apply(ctx, config) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     try {
       if (read('enabled') !== true) return next()
-      const reason = await evaluatePaths(exec)
-      if (reason !== undefined) {
-        ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
-        return { kind: 'deny', reason }
+      const hit = await evaluatePaths(exec)
+      if (hit !== undefined) {
+        reportDenial(exec, hit, 'path')
+        return { kind: 'deny', reason: hit.reason }
       }
       return next()
     } catch (error) {
@@ -456,6 +513,7 @@ export function apply(ctx, config) {
       // human-escalation ones (`ask_user_question`), which are how a stuck model
       // reaches the user.
       if (!governs(exec.name)) return next()
+      notifier.malfunction('tools/pre-execute')
       return { kind: 'deny', reason: internalErrorText('tools/pre-execute') }
     }
   })
@@ -464,21 +522,24 @@ export function apply(ctx, config) {
   ctx.tools.guard((exec) => {
     try {
       if (read('enabled') !== true) return undefined
-      let reason
+      let verdict
       if (read('exoticTools') === 'deny' && isExoticTool(exec.name)) {
-        reason = exoticDenialText({ toolName: exec.name })
+        verdict = { reason: exoticDenialText({ toolName: exec.name }), kind: 'exotic', target: exec.name }
       } else if (read('selfProtection') === true && exec.name === 'plugin_manager') {
-        reason = selfTargetVerdict(exec.arguments)
+        const reason = selfTargetVerdict(exec.arguments)
+        verdict = reason === undefined
+          ? undefined
+          : { reason, kind: 'self', target: String(exec.arguments?.target ?? '') }
       } else {
-        reason = evaluateShell(exec)
+        const shell = evaluateShell(exec)
+        verdict = shell === undefined ? undefined : { ...shell, kind: 'shell' }
       }
-      if (reason !== undefined) {
-        ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
-      }
-      return reason
+      if (verdict !== undefined) reportDenial(exec, verdict, verdict.kind)
+      return verdict?.reason
     } catch (error) {
       ctx.logger.error('path-guard: internal error in tools.guard: %s', error?.stack ?? String(error))
       if (!governs(exec.name)) return undefined
+      notifier.malfunction('ctx.tools.guard()')
       return internalErrorText('ctx.tools.guard()')
     }
   })
@@ -523,6 +584,10 @@ export function apply(ctx, config) {
         const filtered = redactTextBlocks(result.content, needles, windows)
         if (!filtered.changed) return next()
         ctx.logger.info('path-guard: withheld a %s output block mentioning a protected path', exec.name)
+        reportDenial(exec, {
+          reason: `\`${exec.name}\` 的输出提到了受保护路径，已整体扣留（fail-closed）。`,
+          target: '(output)',
+        }, 'redaction')
         return { kind: 'accept', content: filtered.content }
       }
 
@@ -543,6 +608,10 @@ export function apply(ctx, config) {
         const protects = rulesOf().some(rule => rule !== null && typeof rule === 'object' && rule.access !== 'write')
         if (!protects) return next()
         ctx.logger.warn('path-guard: withheld an unrecognized %s result (fail-closed)', kind)
+        reportDenial(exec, {
+          reason: `\`${kind}\` 的返回结构无法识别，已整体扣留（fail-closed）。`,
+          target: '(unrecognized result)',
+        }, 'redaction')
         return { kind: 'block', feedback: [{ type: 'text', text: redactionBlockedText(kind) }] }
       }
 
@@ -555,6 +624,7 @@ export function apply(ctx, config) {
       return { kind: 'accept', value: redacted.value }
     } catch (error) {
       ctx.logger.error('path-guard: internal error in tools/post-execute: %s', error?.stack ?? String(error))
+      notifier.malfunction('tools/post-execute')
       return { kind: 'block', feedback: [{ type: 'text', text: internalErrorText('tools/post-execute') }] }
     }
   }, { prepend: true })

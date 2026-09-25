@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "description": "Path-level access control for AI file access, effective even under danger-full-access.",
+  "license": "GPL-3.0-or-later",
+  "author": "苏拾柒 <seventeen_su@proton.me>",
   "icon": "./icon.svg",
   "exports": {
     ".": "./src/index.js",

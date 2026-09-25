@@ -35,6 +35,13 @@ export const DEFAULT_ACCESS_VALUES = ['allow', 'none', 'list', 'read', 'write']
 export const SHELL_VALUES = ['scan', 'deny', 'off']
 export const EXOTIC_VALUES = ['deny', 'allow']
 
+/**
+ * Desktop-notification policy for denials. `focused` rides the notify plugin's
+ * focus gate (no pop while the user is already looking at that session),
+ * `always` bypasses it, `off` disables notifications.
+ */
+export const NOTIFY_VALUES = ['focused', 'always', 'off']
+
 /** One user rule: a path pattern mapped to an access level. */
 const rule = z.object({
   /** Path pattern: `~`, `${workspace}`, an absolute path, `*`, `**`, `?`. */
@@ -84,6 +91,13 @@ export const Config = z.object({
    * Host's config editor, not through the model's file tools.
    */
   selfProtection: z.boolean().default(true).volatile(),
+
+  /**
+   * Desktop notification when a call is refused, through the optional
+   * `desktopNotify` service registered by `dsh-desktop-notify`. Absent that
+   * plugin nothing happens; the setting costs nothing.
+   */
+  notify: z.union(NOTIFY_VALUES).default('focused').volatile(),
 })
 
 export default Config
