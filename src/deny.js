@@ -83,6 +83,29 @@ export function shellDenialText({ toolName, needle, rulePath, access, kind = 'sh
 }
 
 /**
+ * The refusal for an `install_bundle` whose spec is not a registry package.
+ * @param {{target: string}} input - the attempted spec.
+ * @returns {string} the model-facing reason.
+ */
+export function installSourceDenialText({ target }) {
+  return [
+    '访问被拒绝：`install_bundle` 目前只接受**注册表上的包名**，本地路径 / git / tarball / URL 一律拒绝。',
+    '',
+    `- target：${target === '' ? '(未指定)' : target}`,
+    '',
+    '原因是这类来源可以在同一轮里由你（或任何本地文件）现场造出来：一个自己写的包，其补丁层可以按 id',
+    '把防护行覆盖成 `disabled: true`，从更靠后的层把 dsh-path-guard 关掉。注册表上的包无法在你这一轮',
+    '里凭空出现，所以只有它被放行。',
+    '',
+    '这不影响正常装插件：`install_bundle` 传注册表包名照常可用；`set_plugin` / `set_bundle` /',
+    '`remove_bundle` 用来开关别的插件也照常可用——**只有指名 dsh-path-guard / path-guard 的动作**才被拒。',
+    '',
+    '如果确实要装一个本地开发中的插件，请向用户说明，由他自己在插件页面操作，或先在',
+    '「设置 → 路径守卫」里关闭自我保护。',
+  ].join('\n')
+}
+
+/**
  * The refusal for a surface the plugin cannot fence at all.
  * @param {{toolName: string}} input - the tool identity.
  * @returns {string} the model-facing reason.

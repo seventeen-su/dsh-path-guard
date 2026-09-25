@@ -32,7 +32,7 @@
  */
 
 import os from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 
 import { Config } from './config.js'
 import { capabilities, compile, expandPath, match } from './policy.js'
@@ -54,6 +54,7 @@ import {
 import {
   denialText,
   exoticDenialText,
+  installSourceDenialText,
   internalErrorText,
   redactionBlockedText,
   selfDenialText,
@@ -73,20 +74,27 @@ export { Config }
 /** The cross-copy volatile marker (vendor/cosmokit/src/volatile.ts:3,52-54). */
 const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 
+/** This bundle's package name, the other half of its identity in the profile. */
+const SELF_PACKAGE = 'dsh-path-guard'
+
 /** This bundle's row id in the profile patch, also its settings namespace. */
 const SELF_ROW_ID = 'path-guard'
 
 /**
  * `plugin_manager` actions that change the profile composition.
  *
- * Self-protection refuses ALL of them, not just the ones naming this plugin.
- * The earlier "deny only self-targeting targets" rule matched the `target`
- * string against this bundle's names, which is bypassable: the model can copy
- * this package elsewhere and `install_bundle` that path — the target contains
- * neither name, yet the copy declares the same row id and overrides the row.
- * A `target` string is not a safe identity for "which row does this affect", so
- * the only sound rule is to keep the tool read-only while protection is on.
- * Turning `selfProtection` off restores full management.
+ * Those NAMING this plugin are refused outright: disabling, replacing or
+ * removing the protection row is exactly what self-protection exists to stop,
+ * and the entry id (`include:path-guard`) and the bundle name
+ * (`dsh-path-guard`) are stable identities, so a substring test is sound there.
+ *
+ * `install_bundle` needs a finer rule. A `target` string is NOT a reliable
+ * identity for "which row will this change": a package the model authored
+ * itself, installed from a local path, a git URL or a tarball, can carry a patch
+ * layer doing `- id: path-guard` + `disabled: true`, switching the guard off
+ * from a later layer. So an install is allowed only from the registry, where the
+ * model cannot mint the package within the same turn.
+ * Spec forms mirror packages/boot/plugin-manager/src/install-spec.ts:21-31.
  */
 const COMPOSITION_CHANGING_ACTIONS = new Set([
   'set_plugin',
@@ -95,6 +103,33 @@ const COMPOSITION_CHANGING_ACTIONS = new Set([
   'remove_bundle',
   'set_version_exemption',
 ])
+
+/** A pnpm git shorthand (`github:user/repo`). */
+const GIT_SHORTHAND = /^(?:github|gitlab|bitbucket|gist):/i
+/** A git URL or an scp-like `git@host:path`. */
+const GIT_URL = /^git(?:\+[a-z]+)?:\/\/|^git@[^:]+:/i
+/** A hosted repository URL. */
+const HOSTED_REPOSITORY_URL = /^https?:\/\/[^/]+\/[^/]+\/[^/#]+(?:\.git)?(?:#.*)?$/i
+/** A tarball, on disk or over HTTP. */
+const TARBALL_SPEC = /\.(?:tgz|tar\.gz)(?:#.*)?$/i
+
+/**
+ * Whether an install spec resolves through the registry, i.e. to a package the
+ * model cannot have authored in the same turn.
+ * @param {unknown} raw - the `install_bundle` target.
+ * @returns {boolean} true for a plain registry package spec.
+ */
+function isRegistrySpec(raw) {
+  const spec = String(raw ?? '').trim()
+  if (spec === '') return false
+  const path = spec.replace(/^(?:file|link):/, '')
+  if (path !== spec || isAbsolute(path)) return false
+  if (/^\.{1,2}(?:[\\/]|$)/.test(spec)) return false
+  if (GIT_SHORTHAND.test(spec) || GIT_URL.test(spec) || HOSTED_REPOSITORY_URL.test(spec)) return false
+  if (/^https?:\/\//i.test(spec)) return false
+  if (TARBALL_SPEC.test(spec)) return false
+  return true
+}
 
 /** Profile composition files the AI may read but must not rewrite. */
 const PROFILE_FILES = ['cordis.patch.yml', 'cordis.yml', 'package.json']
@@ -530,7 +565,19 @@ export function apply(ctx, config) {
     if (args === null || typeof args !== 'object') return undefined
     const action = args.action
     if (typeof action !== 'string' || !COMPOSITION_CHANGING_ACTIONS.has(action)) return undefined
-    return selfDenialText({ action, target: typeof args.target === 'string' ? args.target : '(未指定)' })
+    const target = typeof args.target === 'string' ? args.target : ''
+    // Identity by name: the entry id and the bundle name are stable, so nothing
+    // can dodge this by renaming a file.
+    if (target.includes(SELF_PACKAGE) || target.includes(SELF_ROW_ID)) {
+      return selfDenialText({ action, target })
+    }
+    // Installing from anywhere but the registry would let the model author the
+    // very patch layer that switches this row off — the one bypass a target
+    // string cannot rule out.
+    if (action === 'install_bundle' && !isRegistrySpec(target)) {
+      return installSourceDenialText({ target })
+    }
+    return undefined
   }
 
   // Desktop notifications go through the OPTIONAL `desktopNotify` service that
