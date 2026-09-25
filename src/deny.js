@@ -108,6 +108,27 @@ export function selfDenialText({ action, target }) {
 }
 
 /**
+ * The refusal used when the plugin's own code failed.
+ *
+ * An exception thrown from `ctx.tools.guard()` or `tools/pre-execute` becomes a
+ * tool failure, so an internal bug would otherwise take the whole tool surface
+ * down with a stack trace the model cannot act on — or, if swallowed, silently
+ * remove the protection the user asked for. Neither is acceptable for a
+ * security control, so the plugin fails CLOSED and says exactly what happened.
+ * @param {string} where - the extension point that failed.
+ * @returns {string} the model-facing reason.
+ */
+export function internalErrorText(where) {
+  return [
+    `访问被拒绝：dsh-path-guard 在 ${where} 内部出错，无法判定这次调用是否安全。`,
+    '',
+    '这是本插件的缺陷，不是你的调用有问题。作为安全控件，它在无法判定时选择拒绝而不是放行（fail-closed）。',
+    '',
+    '请把这条信息告诉用户：他可以在「设置 → 路径守卫」里关闭本插件，或查看 DSH 日志中 path-guard 的 error 行。',
+  ].join('\n')
+}
+
+/**
  * The refusal used when a search result had to be withheld because redaction
  * could not be applied safely (fail-closed).
  * @param {string} toolName - `glob` or `grep`.

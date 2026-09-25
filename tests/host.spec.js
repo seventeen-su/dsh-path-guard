@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply, Config, inject, name } from '../src/index.js'
+import { apply, Config, inject, name, unwrap } from '../src/index.js'
 import { opForCommand, collectPaths, isExoticTool } from '../src/tool-fields.js'
 import { buildNeedles, scanCommand, commandOf } from '../src/scan.js'
 
@@ -39,6 +39,7 @@ function fakeCtx(options = {}) {
     logger: {
       info: (...args) => logs.push(['info', ...args]),
       warn: (...args) => logs.push(['warn', ...args]),
+      error: (...args) => logs.push(['error', ...args]),
       debug: (...args) => logs.push(['debug', ...args]),
     },
     tools: { guard: fn => { guards.push(fn); return () => {} } },
@@ -320,4 +321,97 @@ test('the shell scanner finds home spellings and ignores short needles', () => {
   // Each surviving path yields a slash and a backslash spelling.
   assert.equal(buildNeedles([{ path: 'D:/a', access: 'none' }], { home: HOME }).length, 2, 'both separator spellings')
   assert.equal(buildNeedles([{ path: 'D:/', access: 'none' }], { home: HOME }).length, 0, 'too-short needles are dropped')
+})
+
+// ---------------------------------------------------------------------------
+// Volatile configuration protocol
+//
+// A schemastery `.volatile()` field resolves to a frozen `{ get() }` reference
+// (vendor/cosmokit/src/volatile.ts:39-45), NOT to a plain value, and the
+// reference is updated in place when the user saves the settings page. Reading
+// `config.rules` once at activation pinned the policy to boot-time state and
+// threw on the shell path; these tests lock the live-read behaviour in.
+// ---------------------------------------------------------------------------
+
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/**
+ * Build the exact reference shape schemastery hands a plugin.
+ * @param {unknown} initial - the starting snapshot.
+ * @returns {object} a frozen volatile reference.
+ */
+function ref(initial) {
+  let current = initial
+  return Object.freeze({ get: () => current, [VOLATILE_WRITE]: value => { current = value } })
+}
+
+test('unwrap reads a volatile reference and passes plain values through', () => {
+  assert.equal(unwrap(ref('scan')), 'scan')
+  assert.equal(unwrap(true), true)
+  assert.deepEqual(unwrap(ref([1, 2])), [1, 2])
+  assert.equal(unwrap(undefined), undefined)
+})
+
+test('wrapped config fields still produce a working policy', async () => {
+  const ctx = fakeCtx()
+  apply(ctx, {
+    enabled: ref(true),
+    rules: ref(RULES),
+    defaultAccess: ref('allow'),
+    selfProtection: ref(false),
+  })
+  const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(decision.kind, 'deny', 'a wrapped rule list must not be silently dropped')
+  // The shell path is where treating the reference as an array used to throw.
+  assert.match(ctx.guards[0]({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } }), /pg-secrets/)
+})
+
+test('a live config change is picked up without re-activation', async () => {
+  const rules = ref([])
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: ref(true), rules, defaultAccess: ref('allow'), selfProtection: ref(false) })
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+  assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: target } })).kind, 'allow')
+  // Exactly what a settings save does: replace the snapshot behind the reference.
+  rules[VOLATILE_WRITE](RULES)
+  assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: target } })).kind, 'deny')
+})
+
+test('defaultAccess other than allow applies to paths no rule matched', async () => {
+  const defaultDeny = fakeCtx()
+  apply(defaultDeny, { enabled: true, rules: [], defaultAccess: 'none', selfProtection: false })
+  const denied = await preExecute(defaultDeny, { name: 'read', arguments: { file_path: join(tmpdir(), 'anything.txt') } })
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /defaultAccess/)
+
+  const defaultAllow = fakeCtx()
+  apply(defaultAllow, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  assert.equal((await preExecute(defaultAllow, { name: 'read', arguments: { file_path: join(tmpdir(), 'anything.txt') } })).kind, 'allow')
+})
+
+// Regression: the first live activation read `config.rules` as a plain array,
+// threw inside the guard, and every shell call in the running Harness failed
+// with a stack trace. A security control must fail CLOSED and say so instead.
+test('an internal failure fails closed instead of throwing', async () => {
+  let reads = 0
+  // Succeeds once (activation), then breaks on the first decision.
+  const flaky = Object.freeze({
+    get: () => {
+      reads += 1
+      if (reads > 1) throw new Error('boom')
+      return []
+    },
+    [VOLATILE_WRITE]: () => {},
+  })
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: ref(true), rules: flaky, defaultAccess: ref('allow'), selfProtection: ref(false) })
+
+  const guardResult = ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
+  assert.equal(typeof guardResult, 'string', 'the guard must return a reason, never throw')
+  assert.match(guardResult, /内部出错/)
+  assert.ok(ctx.logs.some(([level]) => level === 'error'), 'the failure must be logged at error level')
+
+  const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
+  assert.equal(decision.kind, 'deny')
+  assert.match(decision.reason, /内部出错/)
 })

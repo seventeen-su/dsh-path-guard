@@ -9,8 +9,8 @@
  * Design constraints this file honours:
  *
  * 1. **No service takeover, no row override.** The plugin only inserts its own
- *    row and attaches to four existing extension points. Unloading it restores
- *    the previous behaviour exactly.
+ *    row and attaches to existing extension points. Unloading it restores the
+ *    previous behaviour exactly.
  * 2. **`tools/pre-execute` is the authority on paths, not `ctx.tools.guard()`.**
  *    `ToolGuard` is synchronous by type (packages/core/tools/src/index.ts:731)
  *    while `FileSystem.resolve` returns a Promise, and only a resolved path is
@@ -19,9 +19,14 @@
  *    into `~/.ssh` defeats any purely lexical check.
  * 3. **The guard handles only what is unambiguous without I/O** — surfaces the
  *    plugin refuses by name, and `plugin_manager` actions aimed at itself.
- * 4. **Result redaction rewrites the structured `value`, not rendered text**,
- *    and uses `{ prepend: true }` because a prepended listener is outermost and
- *    therefore has the last word (vendor/cordis/src/events.ts:255).
+ * 4. **Result redaction rewrites the structured `value`, not rendered text.**
+ *    See the ordering note at the post-execute registration.
+ * 5. **Configuration is read through the volatile protocol on every decision.**
+ *    A schemastery `.volatile()` field resolves to a frozen `{ get() }`
+ *    reference, not a plain value (vendor/cosmokit/src/volatile.ts:39-45), and
+ *    that reference is updated in place when the user saves the settings page.
+ *    Capturing `config.rules` once at activation would therefore pin the policy
+ *    to whatever existed at boot, and treating it as an array throws.
  *
  * @module dsh-path-guard
  */
@@ -41,6 +46,7 @@ import { PATH_TOOLS, SHELL_TOOLS, collectPaths, isExoticTool, opForCommand } fro
 import {
   denialText,
   exoticDenialText,
+  internalErrorText,
   redactionBlockedText,
   selfDenialText,
   shellDenialText,
@@ -54,6 +60,9 @@ export const name = 'path-guard'
 export const inject = ['tools', 'fs']
 
 export { Config }
+
+/** The cross-copy volatile marker (vendor/cosmokit/src/volatile.ts:3,52-54). */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 
 /** This bundle's package name, used to recognise self-targeting actions. */
 const SELF_PACKAGE = 'dsh-path-guard'
@@ -94,6 +103,22 @@ const DEFAULTS = {
   selfProtection: true,
 }
 
+/** Stable empty rule list, so the compiled-policy cache key keeps its identity. */
+const NO_RULES = Object.freeze([])
+
+/**
+ * Read a schemastery volatile reference, which is a frozen `{ get() }` object.
+ * Plain values pass through, so tests and direct construction behave the same.
+ * @param {unknown} value - a resolved config field or a plain value.
+ * @returns {unknown} the current snapshot.
+ */
+export function unwrap(value) {
+  if (value !== null && typeof value === 'object' && VOLATILE_WRITE in value && typeof value.get === 'function') {
+    return value.get()
+  }
+  return value
+}
+
 /**
  * Keep the stricter of two decisions, treating `undefined` as "no opinion".
  * @param {{access: string} | undefined} a - first decision.
@@ -120,62 +145,96 @@ function permits(decision, required) {
 /**
  * Register the policy enforcement points.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
- * @param {Partial<typeof DEFAULTS>} config - the row config with schema defaults applied.
+ * @param {Record<string, unknown>} config - the row config, volatile fields still wrapped.
  */
 export function apply(ctx, config) {
-  const cfg = { ...DEFAULTS, ...(config ?? {}) }
+  const raw = config !== null && typeof config === 'object' ? config : {}
   const home = os.homedir()
   const windows = process.platform === 'win32'
   const profileDir = process.env.DSH_PROFILE_DIR
 
-  /** @type {Array<object>} */
-  let rules = []
-  /** @type {ReturnType<typeof buildNeedles>} */
-  let needles = []
-
   /**
-   * Compile the configured rules, appending the implicit self-protection rules.
-   * Self-protection is expressed as ordinary `read`-level rules so it flows
-   * through the same matcher, the same denial text and the same audit trail.
+   * Read one config field through the volatile protocol, falling back to the
+   * schema default. Called per decision, never captured at activation.
+   * @param {keyof typeof DEFAULTS} key - the field name.
+   * @returns {unknown} the current value.
    */
-  const rebuild = () => {
-    const configured = Array.isArray(cfg.rules) ? cfg.rules : []
-    const extra = []
-    if (cfg.selfProtection && typeof profileDir === 'string' && profileDir !== '') {
-      for (const file of PROFILE_FILES) {
-        extra.push({ path: join(profileDir, file), access: 'read', note: 'dsh-path-guard self-protection' })
-      }
-    }
-    const result = compile({ rules: [...configured, ...extra], home, windows })
-    rules = result.rules
-    needles = buildNeedles([...configured, ...extra], { home, windows })
-    if (result.invalid.length > 0) {
-      for (const bad of result.invalid) {
-        ctx.logger.warn('path-guard: ignoring rule #%d (%s): %s', bad.index, bad.path ?? '', bad.reason)
-      }
-    }
-    ctx.logger.info(
-      'path-guard: active with %d rule(s)%s',
-      rules.length,
-      cfg.enabled ? '' : ' (disabled by config)',
-    )
+  const read = (key) => {
+    const value = unwrap(raw[key])
+    return value === undefined || value === null ? DEFAULTS[key] : value
   }
-  rebuild()
+
+  /** @returns {Array<object>} the configured rules, always an array. */
+  const rulesOf = () => {
+    const value = read('rules')
+    return Array.isArray(value) ? value : []
+  }
+
+  /** Implicit rules that keep the AI from editing the composition carrying this policy. */
+  const selfRules = typeof profileDir === 'string' && profileDir !== ''
+    ? Object.freeze(PROFILE_FILES.map(file => Object.freeze({
+      id: 'self-protection',
+      path: join(profileDir, file),
+      access: 'read',
+      note: 'dsh-path-guard self-protection',
+    })))
+    : NO_RULES
+
+  let cachedRules = null
+  let cachedExtra = null
+  let cachedPolicy = null
+  let warnedInvalid = ''
 
   /**
-   * Match one already-absolute path against the compiled policy.
+   * The compiled policy, recomputed only when the volatile rule snapshot changes
+   * identity — `get()` returns the same frozen snapshot until a save replaces it.
+   * @returns {{rules: Array<object>, isEmpty: boolean, invalid: Array<object>}} the compiled policy.
+   */
+  const policy = () => {
+    const configured = rulesOf()
+    const extra = read('selfProtection') === true ? selfRules : NO_RULES
+    if (cachedPolicy === null || cachedRules !== configured || cachedExtra !== extra) {
+      cachedPolicy = compile({ rules: [...configured, ...extra], home, windows })
+      cachedRules = configured
+      cachedExtra = extra
+      const invalid = cachedPolicy.invalid.map(bad => `${bad.index}:${bad.path ?? ''}`).join(',')
+      if (cachedPolicy.invalid.length > 0 && invalid !== warnedInvalid) {
+        warnedInvalid = invalid
+        for (const bad of cachedPolicy.invalid) {
+          ctx.logger.warn('path-guard: ignoring rule #%d (%s): %s', bad.index, bad.path ?? '', bad.reason)
+        }
+      }
+    }
+    return cachedPolicy
+  }
+
+  ctx.logger.info(
+    'path-guard: armed (%d rule(s), defaultAccess=%s, shell=%s, exoticTools=%s)',
+    policy().rules.length,
+    String(read('defaultAccess')),
+    String(read('shell')),
+    String(read('exoticTools')),
+  )
+
+  /**
+   * Match one already-absolute path against the live policy, applying
+   * `defaultAccess` when nothing matches.
    * @param {string} absolutePath - a resolved or lexically absolute path.
    * @param {string | undefined} workspace - the session workspace, for `${workspace}` rules.
    * @returns {{access: string, ruleId?: string, pattern?: string} | undefined} the decision.
    */
   const decideAbsolute = (absolutePath, workspace) => {
     if (typeof absolutePath !== 'string' || absolutePath === '') return undefined
-    return match(rules, absolutePath, workspace === undefined ? {} : { workspace })
+    const opts = workspace === undefined ? {} : { workspace }
+    const hit = match(policy().rules, absolutePath, opts)
+    if (hit !== undefined) return hit
+    const fallback = read('defaultAccess')
+    return fallback === 'allow' ? undefined : { access: String(fallback), ruleId: 'defaultAccess' }
   }
 
   /**
-   * Decide a raw, model-supplied path. The lexical answer is computed first so
-   * a path that cannot be resolved still gets a verdict, then refined by the
+   * Decide a raw, model-supplied path. The lexical answer is computed first so a
+   * path that cannot be resolved still gets a verdict, then refined by the
    * canonical path from `ctx.fs.resolve` — which is what defeats symlinks.
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
    * @param {string} rawPath - the argument as the model wrote it.
@@ -266,14 +325,21 @@ export function apply(ctx, config) {
    * @returns {string | undefined} a denial reason, or undefined to allow.
    */
   const evaluateShell = (exec) => {
-    if (cfg.shell === 'off') return undefined
+    const mode = read('shell')
+    if (mode === 'off') return undefined
     if (!SHELL_TOOLS.has(exec.name)) return undefined
-    if (cfg.shell === 'deny') {
-      return shellDenialText({ toolName: exec.name, needle: '(shell 已被整体禁用)', rulePath: undefined, access: 'none' })
+    if (mode === 'deny') {
+      return shellDenialText({ toolName: exec.name, needle: 'shell 已被整体禁用（shell: deny）', access: 'none' })
     }
     const workspace = exec.agent?.session.header.cwd
-    const localNeedles = buildNeedles(cfg.rules, { home, ...(workspace === undefined ? {} : { workspace }), windows })
-    const hit = scanCommand(commandOf(exec.arguments), localNeedles, windows)
+    const configured = rulesOf()
+    const extra = read('selfProtection') === true ? selfRules : NO_RULES
+    const needles = buildNeedles([...configured, ...extra], {
+      home,
+      windows,
+      ...(workspace === undefined ? {} : { workspace }),
+    })
+    const hit = scanCommand(commandOf(exec.arguments), needles, windows)
     if (hit === undefined) return undefined
     return shellDenialText({
       toolName: exec.name,
@@ -281,20 +347,6 @@ export function apply(ctx, config) {
       rulePath: hit.pattern,
       access: hit.access,
     })
-  }
-
-  /**
-   * The synchronous guard: everything decidable without I/O.
-   * @param {Readonly<import('@deepseek-ai/dsh-tools').ToolExecution>} exec - the running call.
-   * @returns {string | undefined} a denial reason, or undefined to leave the call alone.
-   */
-  const guardVerdict = (exec) => {
-    if (!cfg.enabled) return undefined
-    if (cfg.exoticTools === 'deny' && isExoticTool(exec.name)) {
-      return exoticDenialText({ toolName: exec.name })
-    }
-    if (cfg.selfProtection && exec.name === 'plugin_manager') return selfTargetVerdict(exec.arguments)
-    return evaluateShell(exec)
   }
 
   /**
@@ -314,23 +366,46 @@ export function apply(ctx, config) {
   }
 
   // ---- L1: the authority on paths -----------------------------------------
+  //
+  // Every registration below is wrapped: an exception raised here becomes a tool
+  // failure, so an internal bug would take the tool surface down with a stack
+  // trace the model cannot act on. Failing closed with an actionable message is
+  // the only acceptable outcome for a security control (see `internalErrorText`).
   ctx.on('tools/pre-execute', async (exec, next) => {
-    if (!cfg.enabled) return next()
-    const reason = await evaluatePaths(exec)
-    if (reason !== undefined) {
-      ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
-      return { kind: 'deny', reason }
+    try {
+      if (read('enabled') !== true) return next()
+      const reason = await evaluatePaths(exec)
+      if (reason !== undefined) {
+        ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
+        return { kind: 'deny', reason }
+      }
+      return next()
+    } catch (error) {
+      ctx.logger.error('path-guard: internal error in tools/pre-execute: %s', error?.stack ?? String(error))
+      return { kind: 'deny', reason: internalErrorText('tools/pre-execute') }
     }
-    return next()
   })
 
   // ---- L2/L5/L6: the synchronous guard ------------------------------------
   ctx.tools.guard((exec) => {
-    const reason = guardVerdict(exec)
-    if (reason !== undefined) {
-      ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
+    try {
+      if (read('enabled') !== true) return undefined
+      let reason
+      if (read('exoticTools') === 'deny' && isExoticTool(exec.name)) {
+        reason = exoticDenialText({ toolName: exec.name })
+      } else if (read('selfProtection') === true && exec.name === 'plugin_manager') {
+        reason = selfTargetVerdict(exec.arguments)
+      } else {
+        reason = evaluateShell(exec)
+      }
+      if (reason !== undefined) {
+        ctx.logger.warn('path-guard: denied %s — %s', exec.name, reason.split('\n')[0])
+      }
+      return reason
+    } catch (error) {
+      ctx.logger.error('path-guard: internal error in tools.guard: %s', error?.stack ?? String(error))
+      return internalErrorText('ctx.tools.guard()')
     }
-    return reason
   })
 
   // ---- L4: structured result redaction ------------------------------------
@@ -357,30 +432,35 @@ export function apply(ctx, config) {
   //
   // Everything that needs no redaction is passed straight through with `next()`.
   ctx.on('tools/post-execute', async (exec, result, next) => {
-    if (!cfg.enabled || !cfg.searchRedaction) return next()
-    const kind = exec.name
-    if (kind !== 'glob' && kind !== 'grep') return next()
-    if (result.isError === true) return next()
+    try {
+      if (read('enabled') !== true || read('searchRedaction') !== true) return next()
+      const kind = exec.name
+      if (kind !== 'glob' && kind !== 'grep') return next()
+      if (result.isError === true) return next()
 
-    const workspace = exec.agent?.session.header.cwd
-    const cwd = workspace ?? process.cwd()
-    const decide = absolutePath => decideAbsolute(absolutePath, workspace)?.access ?? 'allow'
+      const workspace = exec.agent?.session.header.cwd
+      const cwd = workspace ?? process.cwd()
+      const decide = absolutePath => decideAbsolute(absolutePath, workspace)?.access ?? 'allow'
 
-    const recognized = kind === 'glob' ? isRecognizedGlobValue(result.value) : isRecognizedGrepValue(result.value)
-    if (!recognized) {
-      // Structure drift: we cannot prove the result is clean. Refuse it only
-      // when there is something to protect at all, so an empty policy stays inert.
-      if (rules.length === 0) return next()
-      ctx.logger.warn('path-guard: withheld an unrecognized %s result (fail-closed)', kind)
-      return { kind: 'block', feedback: [{ type: 'text', text: redactionBlockedText(kind) }] }
+      const recognized = kind === 'glob' ? isRecognizedGlobValue(result.value) : isRecognizedGrepValue(result.value)
+      if (!recognized) {
+        // Structure drift: we cannot prove the result is clean. Refuse it only
+        // when there is something to protect at all, so an empty policy stays inert.
+        if (policy().rules.length === 0) return next()
+        ctx.logger.warn('path-guard: withheld an unrecognized %s result (fail-closed)', kind)
+        return { kind: 'block', feedback: [{ type: 'text', text: redactionBlockedText(kind) }] }
+      }
+
+      const redacted = kind === 'glob'
+        ? redactGlobValue(result.value, { cwd, decide })
+        : redactGrepValue(result.value, { cwd, decide })
+      if (!redacted.changed) return next()
+
+      ctx.logger.info('path-guard: redacted %s results under a protected path', kind)
+      return { kind: 'accept', value: redacted.value }
+    } catch (error) {
+      ctx.logger.error('path-guard: internal error in tools/post-execute: %s', error?.stack ?? String(error))
+      return { kind: 'block', feedback: [{ type: 'text', text: internalErrorText('tools/post-execute') }] }
     }
-
-    const redacted = kind === 'glob'
-      ? redactGlobValue(result.value, { cwd, decide })
-      : redactGrepValue(result.value, { cwd, decide })
-    if (!redacted.changed) return next()
-
-    ctx.logger.info('path-guard: redacted %s results under a protected path', kind)
-    return { kind: 'accept', value: redacted.value }
   }, { prepend: true })
 }
