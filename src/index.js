@@ -51,7 +51,7 @@ import {
   selfDenialText,
   shellDenialText,
 } from './deny.js'
-import { buildNeedles, commandOf, scanCommand } from './scan.js'
+import { buildNeedles, commandOf, redactTextBlocks, scanCommand } from './scan.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'path-guard'
@@ -172,11 +172,56 @@ export function apply(ctx, config) {
     return value === undefined || value === null ? DEFAULTS[key] : value
   }
 
-  /** @returns {Array<object>} the configured rules, always an array. */
+  /**
+   * The configured rule list.
+   *
+   * A `rules` value that is present but not an array is configuration-shape
+   * drift, NOT "no rules". Folding it to `[]` would silently turn the policy off
+   * (fail-OPEN) while the plugin still reports itself armed, so it is raised
+   * instead and the interceptors' catch turns it into a loud refusal.
+   * @returns {Array<object>} the configured rules.
+   * @throws {TypeError} when the value is present and not an array.
+   */
   const rulesOf = () => {
     const value = read('rules')
-    return Array.isArray(value) ? value : []
+    if (value === undefined || value === null) return []
+    if (!Array.isArray(value)) {
+      throw new TypeError(`path-guard: config.rules must be an array, received ${typeof value}`)
+    }
+    return value
   }
+
+  /** Implicit rules that keep the AI from editing the composition carrying this policy. */
+  const selfRulesFor = () => (read('selfProtection') === true ? selfRules : NO_RULES)
+
+  /**
+   * Rules that generate shell-scan needles.
+   *
+   * `write`-level rules are skipped: the policy already grants full access
+   * there, so mentioning such a path in a command is not a violation — refusing
+   * `cd D:/proj && npm test` would contradict the user's own `write` rule and
+   * make the plugin unusable for the workspace it is meant to allow.
+   */
+  const scanRules = () => [
+    ...rulesOf().filter(rule => rule === null || typeof rule !== 'object' || rule.access !== 'write'),
+    ...selfRulesFor(),
+  ]
+
+  /**
+   * Build scan needles for the current rules and the calling session.
+   * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
+   * @returns {ReturnType<typeof buildNeedles>} the needles, longest first.
+   */
+  const shellNeedles = (exec) => {
+    const workspace = exec.agent?.session.header.cwd
+    return buildNeedles(scanRules(), { home, windows, ...(workspace === undefined ? {} : { workspace }) })
+  }
+
+  /** Whether this plugin is the component responsible for judging a tool call. */
+  const governs = (toolName) => PATH_TOOLS[toolName] !== undefined
+    || SHELL_TOOLS.has(toolName)
+    || isExoticTool(toolName)
+    || toolName === 'plugin_manager'
 
   /** Implicit rules that keep the AI from editing the composition carrying this policy. */
   const selfRules = typeof profileDir === 'string' && profileDir !== ''
@@ -200,7 +245,7 @@ export function apply(ctx, config) {
    */
   const policy = () => {
     const configured = rulesOf()
-    const extra = read('selfProtection') === true ? selfRules : NO_RULES
+    const extra = selfRulesFor()
     if (cachedPolicy === null || cachedRules !== configured || cachedExtra !== extra) {
       cachedPolicy = compile({ rules: [...configured, ...extra], home, windows })
       cachedRules = configured
@@ -216,13 +261,19 @@ export function apply(ctx, config) {
     return cachedPolicy
   }
 
-  ctx.logger.info(
-    'path-guard: armed (%d rule(s), defaultAccess=%s, shell=%s, exoticTools=%s)',
-    policy().rules.length,
-    String(read('defaultAccess')),
-    String(read('shell')),
-    String(read('exoticTools')),
-  )
+  try {
+    ctx.logger.info(
+      'path-guard: armed (%d rule(s), defaultAccess=%s, shell=%s, exoticTools=%s)',
+      policy().rules.length,
+      String(read('defaultAccess')),
+      String(read('shell')),
+      String(read('exoticTools')),
+    )
+  } catch (error) {
+    // A malformed configuration must be loud but must not stop activation:
+    // deactivating the plugin silently would remove the protection entirely.
+    ctx.logger.error('path-guard: configuration is unusable: %s', String(error))
+  }
 
   /**
    * Match one already-absolute path against the live policy, applying
@@ -276,7 +327,13 @@ export function apply(ctx, config) {
       } catch (error) {
         // An unresolvable path keeps the lexical verdict; providing one for
         // paths that do not resolve is the whole reason the lexical pass exists.
-        ctx.logger.debug?.('path-guard: resolve failed for %s: %s', rawPath, String(error))
+        // For the search tools this is more serious: they never call `ctx.fs`
+        // themselves (they hand the raw path to ripgrep), so when resolution
+        // fails the lexical pass is the ONLY thing standing between the model
+        // and the path — worth more than a debug line.
+        const search = exec.name === 'glob' || exec.name === 'grep'
+        const log = search ? ctx.logger.warn.bind(ctx.logger) : ctx.logger.debug?.bind(ctx.logger)
+        log?.('path-guard: resolve failed for %s (%s): %s', rawPath, exec.name, String(error))
       }
     }
     return { decision, shown }
@@ -339,14 +396,20 @@ export function apply(ctx, config) {
     if (mode === 'deny') {
       return shellDenialText({ toolName: exec.name, needle: 'shell 已被整体禁用（shell: deny）', access: 'none' })
     }
-    const workspace = exec.agent?.session.header.cwd
-    const configured = rulesOf()
-    const extra = read('selfProtection') === true ? selfRules : NO_RULES
-    const needles = buildNeedles([...configured, ...extra], {
-      home,
-      windows,
-      ...(workspace === undefined ? {} : { workspace }),
-    })
+    const needles = shellNeedles(exec)
+    if (needles.length === 0) {
+      // No needle at all must not read as "nothing is dangerous". With
+      // `defaultAccess` set to anything but allow the user asked for deny by
+      // default, and the shell is the one channel where "nothing matched" is
+      // indistinguishable from "not looked for".
+      const fallback = read('defaultAccess')
+      if (fallback === 'allow') return undefined
+      return shellDenialText({
+        toolName: exec.name,
+        needle: 'defaultAccess 不是 allow，但没有任何可用的路径规则供扫描',
+        access: String(fallback),
+      })
+    }
     const hit = scanCommand(commandOf(exec.arguments), needles, windows)
     if (hit === undefined) return undefined
     return shellDenialText({
@@ -388,6 +451,11 @@ export function apply(ctx, config) {
       return next()
     } catch (error) {
       ctx.logger.error('path-guard: internal error in tools/pre-execute: %s', error?.stack ?? String(error))
+      // Fail closed ONLY for calls this plugin is responsible for judging. A bug
+      // here must not take away the model's unrelated tools — above all the
+      // human-escalation ones (`ask_user_question`), which are how a stuck model
+      // reaches the user.
+      if (!governs(exec.name)) return next()
       return { kind: 'deny', reason: internalErrorText('tools/pre-execute') }
     }
   })
@@ -410,6 +478,7 @@ export function apply(ctx, config) {
       return reason
     } catch (error) {
       ctx.logger.error('path-guard: internal error in tools.guard: %s', error?.stack ?? String(error))
+      if (!governs(exec.name)) return undefined
       return internalErrorText('ctx.tools.guard()')
     }
   })
@@ -439,10 +508,27 @@ export function apply(ctx, config) {
   // Everything that needs no redaction is passed straight through with `next()`.
   ctx.on('tools/post-execute', async (exec, result, next) => {
     try {
-      if (read('enabled') !== true || read('searchRedaction') !== true) return next()
+      if (read('enabled') !== true) return next()
+      if (result.isError === true) return next()
+
+      // Shell output. The same substring test as the command scan, so it
+      // inherits the same limit: a command that builds the protected path
+      // without ever writing it as a literal produces output this cannot
+      // recognise either. Withholding the whole block is deliberate — a partial
+      // redaction of arbitrary command output would be guesswork.
+      if (SHELL_TOOLS.has(exec.name)) {
+        if (read('shell') !== 'scan') return next()
+        const needles = shellNeedles(exec)
+        if (needles.length === 0) return next()
+        const filtered = redactTextBlocks(result.content, needles, windows)
+        if (!filtered.changed) return next()
+        ctx.logger.info('path-guard: withheld a %s output block mentioning a protected path', exec.name)
+        return { kind: 'accept', content: filtered.content }
+      }
+
+      if (read('searchRedaction') !== true) return next()
       const kind = exec.name
       if (kind !== 'glob' && kind !== 'grep') return next()
-      if (result.isError === true) return next()
 
       const workspace = exec.agent?.session.header.cwd
       const cwd = workspace ?? process.cwd()
@@ -451,8 +537,11 @@ export function apply(ctx, config) {
       const recognized = kind === 'glob' ? isRecognizedGlobValue(result.value) : isRecognizedGrepValue(result.value)
       if (!recognized) {
         // Structure drift: we cannot prove the result is clean. Refuse it only
-        // when there is something to protect at all, so an empty policy stays inert.
-        if (policy().rules.length === 0) return next()
+        // when a user rule actually protects something — the implicit
+        // self-protection rules are `read`-level (the AI may read the profile
+        // composition by design), so they never justify blocking a search.
+        const protects = rulesOf().some(rule => rule !== null && typeof rule === 'object' && rule.access !== 'write')
+        if (!protects) return next()
         ctx.logger.warn('path-guard: withheld an unrecognized %s result (fail-closed)', kind)
         return { kind: 'block', feedback: [{ type: 'text', text: redactionBlockedText(kind) }] }
       }

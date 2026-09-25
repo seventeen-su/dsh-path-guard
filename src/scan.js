@@ -95,3 +95,34 @@ export function commandOf(args) {
   }
   return undefined
 }
+
+/** What a withheld shell output block is replaced with. */
+const WITHHELD = '[dsh-path-guard] 该段输出提到了受保护路径，已整体扣留。'
+  + '（shell 输出无法被逐行判定，因此宁可整段不给）'
+
+/**
+ * Withhold output blocks that mention a protected path.
+ *
+ * Only `text` blocks are inspected; anything else is passed through untouched.
+ * A matching block is replaced wholesale rather than edited: command output has
+ * no structure the plugin can rely on, so a partial redaction would be
+ * guesswork, and a guess that keeps one line of a private key is worthless.
+ *
+ * @param {unknown} content - the tool result's content blocks.
+ * @param {Array<{needle: string, pattern: string, access: string}>} needles - from {@link buildNeedles}.
+ * @param {boolean} windows - compare case-insensitively.
+ * @returns {{changed: boolean, content: unknown}} the rewritten blocks, or the input when nothing matched.
+ */
+export function redactTextBlocks(content, needles, windows) {
+  if (!Array.isArray(content) || needles.length === 0) return { changed: false, content }
+  let changed = false
+  const next = content.map((block) => {
+    if (block === null || typeof block !== 'object') return block
+    if (block.type !== 'text' || typeof block.text !== 'string') return block
+    const hit = scanCommand(block.text, needles, windows)
+    if (hit === undefined) return block
+    changed = true
+    return { ...block, text: WITHHELD }
+  })
+  return changed ? { changed: true, content: next } : { changed: false, content }
+}

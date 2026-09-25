@@ -104,9 +104,16 @@
 | # | 调用 | 期望 |
 |---|---|---|
 | 19 | `pwsh` `Get-Content 'D:\dsh-path-guard-fixture\hidden\secret.txt'` | **被拒绝**（命令文本里出现了受保护路径） |
-| 20 | `pwsh` `Get-ChildItem D:\dsh-path-guard-fixture` | **成功**（未提到受保护路径） |
+| 19b | `pwsh` `Get-ChildItem D:\dsh-path-guard-fixture` | **成功**（未提到受保护路径） |
+| 19c | `pwsh` `Get-Content (Join-Path 'D:\dsh-path-guard-fixture' 'hidden\secret.txt')` | **会成功**——这是**已知限制，不是缺陷**。命令里没有连续的字面路径，文本扫描抓不到，随后也没有可匹配的输出。要真正堵住只能把 `shell` 设为 `deny` |
+| 19d | 把 `shell` 改成 `deny`，重试 19b | 也被拒绝（确认「宁可不可用也不漏」的档位真的接通） |
 
-> 把 `shell` 改成 `deny` 再试第 20 条，应当也被拒绝——这是「宁可不可用也不漏」的档位。
+> 「扣留提到受保护路径的输出」是第二道网，只在命令绕过文本扫描、但输出里仍出现**完整字面路径**时才触发。单元测试覆盖了它；
+> 手工构造这种情形需要刻意设计，不建议写进验收清单。
+>
+> 另外两条 shell 语义（都有单测覆盖）：
+> - `selfProtection` 生成的规则使用 `read` 档 ⇒ shell 里引用 profile 组合文件会被拒；
+> - **`write` 档的规则不参与 shell 扫描**——策略本来就完全放行该路径，`cd D:/项目 && npm test` 不该被拒。
 
 ### 自我保护
 
@@ -122,10 +129,10 @@
 
 | # | 调用 | 期望 |
 |---|---|---|
-| 24 | 任何 `mcp__*` 工具、`run_code`、`subagent_codex` | **被拒绝**（默认 `exoticTools: deny`） |
-| 25 | `subagent`（同进程子代理） | **正常可用**，子代理的工具调用同样受规则约束——让它在子任务里 `read` 第 1 条的路径，应当同样被拒绝 |
-
-> 第 25 条是「不影响你正常用 Agent Teams」的验收。
+| 23a | 任何 `mcp__*` 工具 | **被拒绝**（默认 `exoticTools: deny`） |
+| 23b | `workflow`（脚本编排） | **被拒绝**。脚本在 `node:vm` 里跑且能逃逸到真正的 `process`，`danger-full-access` 下不受任何围栏约束，属插件层无法观察的通道 |
+| 23c | `subagent`（同进程子代理） | **正常可用**，子代理的工具调用同样受规则约束——让它在子任务里 `read` 第 1 条的路径，应当同样被拒绝 |
+| 23d | `todo_write` / `ask_user_question` | **始终可用**。插件内部即便出错也不会连这些工具一起拒（fail-closed 只覆盖它负责判定的调用） |
 
 ## 3. 回归
 

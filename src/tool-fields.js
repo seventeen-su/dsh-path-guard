@@ -42,19 +42,35 @@ export const PATH_TOOLS = {
 /**
  * Shell-shaped tools. Their command text is opaque: a shell string is
  * Turing-complete, so the plugin scans it for protected paths instead of
- * parsing it, and filters the output. This is explicitly best-effort.
+ * parsing it, and (best effort) withholds output blocks that mention one.
+ *
+ * This is NOT a boundary. Any spelling that does not contain the protected
+ * path as a literal substring — `"$(echo ~)/.ssh/id_rsa"`,
+ * `Join-Path $HOME '.ssh/id_rsa'`, a glob like `~/.ss?/id_rsa`, or a one-liner
+ * that builds the path inside another interpreter — passes the scan, and then
+ * the output filter has nothing to match on either. `shell: deny` is the only
+ * setting that actually closes this channel.
  */
 export const SHELL_TOOLS = new Set(['bash', 'pwsh', 'terminal_open', 'terminal_send'])
 
 /**
  * Tools that reach the filesystem through a process or loop this plugin cannot
- * observe at all. `run_code` is a real Node/Python process
- * (packages/ptc-runtime/ptc-runtime-node/src/index.ts:68), MCP tools have
- * server-supplied schemas, and the codex/claude-code subagents run their own
- * agent loop in a child process.
+ * observe at all.
+ *
+ * - `run_code` is a real Node/Python process
+ *   (packages/ptc-runtime/ptc-runtime-node/src/index.ts:68).
+ * - `workflow` runs its script in a `node:vm` context that DSH's own test
+ *   escapes on purpose: `globalThis.constructor.constructor('return process')()`
+ *   yields the real `process`, and under `danger-full-access` the spawned
+ *   runtime is not confined (packages/workflow/workflow-ptc/tests/built-runtime.e2e.ts:58,
+ *   packages/ptc-runtime/ptc-runtime-node/src/index.ts:224).
+ * - MCP tools carry server-supplied schemas.
+ * - The codex/claude-code/acp subagents run their own agent loop in a child process.
  */
 export const EXOTIC_TOOLS = new Set([
   'run_code',
+  'workflow',
+  'ralph',
   'subagent_codex',
   'subagent_claude_code',
   'subagent_acp',

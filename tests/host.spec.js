@@ -429,3 +429,104 @@ test('an internal failure fails closed instead of throwing', async () => {
   assert.equal(decision.kind, 'deny')
   assert.match(decision.reason, /内部出错/)
 })
+
+// ---------------------------------------------------------------------------
+// Regressions for the adversarial verification findings (reports/verification.md)
+// ---------------------------------------------------------------------------
+
+test('V-2: workflow is treated as unfenceable, not silently ignored', () => {
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', exoticTools: 'deny', selfProtection: false })
+  // A workflow script runs in a node:vm context that reaches the real process
+  // and spawns an unconfined runtime under danger-full-access, so there is no
+  // argument to inspect.
+  assert.match(ctx.guards[0]({ name: 'workflow', arguments: { script: 'x' } }), /访问被拒绝/)
+  assert.match(ctx.guards[0]({ name: 'ralph', arguments: {} }), /访问被拒绝/)
+  assert.equal(isExoticTool('workflow'), true)
+  // In-process delegation stays usable: the global guard covers those children.
+  assert.equal(ctx.guards[0]({ name: 'subagent', arguments: { prompt: 'x' } }), undefined)
+  assert.equal(ctx.guards[0]({ name: 'subagent_fork', arguments: { prompt: 'x' } }), undefined)
+})
+
+test('V-1: shell output blocks mentioning a protected path are withheld', async () => {
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'scan', selfProtection: false })
+  const handler = ctx.listeners.get('tools/post-execute')[0]
+  const passthrough = { kind: 'accept' }
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+
+  const leaked = await handler(
+    { name: 'pwsh', arguments: {} },
+    { isError: false, content: [{ type: 'text', text: `-----BEGIN KEY-----\n${target}\n` }] },
+    async () => passthrough,
+  )
+  assert.equal(leaked.kind, 'accept')
+  assert.ok(!JSON.stringify(leaked.content).includes('BEGIN KEY'), 'the block must not survive')
+
+  const clean = await handler(
+    { name: 'pwsh', arguments: {} },
+    { isError: false, content: [{ type: 'text', text: 'nothing interesting here' }] },
+    async () => passthrough,
+  )
+  assert.equal(clean, passthrough, 'unrelated output passes through untouched')
+})
+
+test('V-3: defaultAccess != allow with no rules refuses the shell instead of opening it', () => {
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'none', shell: 'scan', selfProtection: false })
+  // No rule can produce a needle, so "nothing matched" must not read as "safe".
+  assert.match(ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), /访问被拒绝/)
+
+  const lax = fakeCtx()
+  apply(lax, { enabled: true, rules: [], defaultAccess: 'allow', shell: 'scan', selfProtection: false })
+  assert.equal(lax.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), undefined)
+})
+
+test('V-4: shell scanning skips write-level rules but keeps the stricter ones', () => {
+  const project = join(tmpdir(), 'pg-proj')
+  const ctx = fakeCtx()
+  apply(ctx, {
+    enabled: true,
+    defaultAccess: 'allow',
+    shell: 'scan',
+    selfProtection: false,
+    rules: [
+      { path: project, access: 'write', note: '' },
+      { path: join(HOME, '.ssh'), access: 'list', note: '' },
+    ],
+  })
+  const guard = ctx.guards[0]
+  // `write` already grants everything, so mentioning the path is not a violation.
+  assert.equal(guard({ name: 'pwsh', arguments: { command: `cd '${project}'; npm test` } }), undefined)
+  // `list` still refuses: the shell cannot be judged per-path, and it would leak content.
+  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(HOME, '.ssh', 'id_rsa')}'` } }), /访问被拒绝/)
+})
+
+test('V-7: a malformed rule list fails closed instead of silently disabling the policy', async () => {
+  const ctx = fakeCtx()
+  const broken = Object.freeze({ get: () => 'not-an-array', [VOLATILE_WRITE]: () => {} })
+  apply(ctx, { enabled: ref(true), rules: broken, defaultAccess: ref('allow'), selfProtection: ref(false) })
+  const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
+  assert.equal(decision.kind, 'deny')
+  assert.match(decision.reason, /内部出错/)
+})
+
+test('V-10: an internal failure does not take away tools this plugin does not govern', async () => {
+  let reads = 0
+  const flaky = Object.freeze({
+    get: () => {
+      reads += 1
+      if (reads > 1) throw new Error('boom')
+      return []
+    },
+    [VOLATILE_WRITE]: () => {},
+  })
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: ref(true), rules: flaky, defaultAccess: ref('allow'), selfProtection: ref(false) })
+  // Human-escalation and bookkeeping tools must survive a plugin bug.
+  assert.equal((await preExecute(ctx, { name: 'ask_user_question', arguments: {} })).kind, 'allow')
+  assert.equal((await preExecute(ctx, { name: 'todo_write', arguments: {} })).kind, 'allow')
+  assert.equal(ctx.guards[0]({ name: 'todo_write', arguments: {} }), undefined)
+  // Governed calls still fail closed.
+  assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: 'x' } })).kind, 'deny')
+})
