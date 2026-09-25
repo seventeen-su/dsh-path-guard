@@ -54,7 +54,8 @@ function fakeCtx(options = {}) {
       debug: (...args) => logs.push(['debug', ...args]),
     },
     get(name) {
-      return name === 'desktopNotify' ? service : undefined
+      if (name === 'desktopNotify') return service
+      return options.services === undefined ? undefined : options.services[name]
     },
     tools: { guard: fn => { guards.push(fn); return () => {} } },
     on(event, handler) {
@@ -270,6 +271,46 @@ test('self-protection makes the profile composition readable but not writable', 
   } finally {
     if (previous === undefined) delete process.env.DSH_PROFILE_DIR
     else process.env.DSH_PROFILE_DIR = previous
+  }
+})
+
+// Regression for a real deployment failure: `DSH_PROFILE_DIR` is contributed by
+// dsh-shell-env to each shell EXECUTION (shell-env/src/index.ts:158-167), not to
+// the Host's own environment. The env-only lookup therefore left self-protection
+// silently inert in the live profile — the model could read AND rewrite the very
+// patch that carries the policy.
+test('self-protection resolves the profile from profileContext, not just the environment', async () => {
+  const previous = process.env.DSH_PROFILE_DIR
+  delete process.env.DSH_PROFILE_DIR
+  try {
+    const patch = join(tmpdir(), 'pg-profile2', 'cordis.patch.yml')
+    const ctx = fakeCtx({ services: { profileContext: { patchPath: patch } } })
+    apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+    assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: patch } })).kind, 'allow')
+    assert.equal((await preExecute(ctx, { name: 'write', arguments: { file_path: patch, content: '' } })).kind, 'deny')
+    // The shell scan must see it too: glob/pwsh never call ctx.fs, so a lexical
+    // needle is all that stands between the model and the profile patch.
+    assert.match(
+      ctx.guards[0]({ name: 'pwsh', arguments: { command: `Get-Content '${patch}'` } }),
+      /访问被拒绝/,
+    )
+  } finally {
+    if (previous !== undefined) process.env.DSH_PROFILE_DIR = previous
+  }
+})
+
+test('an unresolvable profile path is reported loudly instead of failing silently', () => {
+  const previous = process.env.DSH_PROFILE_DIR
+  delete process.env.DSH_PROFILE_DIR
+  try {
+    const ctx = fakeCtx()
+    apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+    assert.ok(
+      ctx.logs.some(([level, message]) => level === 'error' && String(message).includes('NOT protected')),
+      'self-protection that cannot arm itself must say so',
+    )
+  } finally {
+    if (previous !== undefined) process.env.DSH_PROFILE_DIR = previous
   }
 })
 

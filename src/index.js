@@ -32,7 +32,7 @@
  */
 
 import os from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { Config } from './config.js'
 import { capabilities, compile, expandPath, match } from './policy.js'
@@ -90,6 +90,15 @@ const COMPOSITION_CHANGING_ACTIONS = new Set([
 
 /** Profile composition files the AI may read but must not rewrite. */
 const PROFILE_FILES = ['cordis.patch.yml', 'cordis.yml', 'package.json']
+
+/**
+ * Read a non-empty string, else undefined.
+ * @param {unknown} value - candidate.
+ * @returns {string | undefined} the string when usable.
+ */
+function nonEmpty(value) {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
 
 /** Capability ordering; a lower rank is stricter. */
 const RANK = { none: 0, list: 1, read: 2, write: 3 }
@@ -161,7 +170,6 @@ export function apply(ctx, config) {
   const raw = config !== null && typeof config === 'object' ? config : {}
   const home = os.homedir()
   const windows = process.platform === 'win32'
-  const profileDir = process.env.DSH_PROFILE_DIR
 
   /**
    * Read one config field through the volatile protocol, falling back to the
@@ -193,9 +201,6 @@ export function apply(ctx, config) {
     return value
   }
 
-  /** Implicit rules that keep the AI from editing the composition carrying this policy. */
-  const selfRulesFor = () => (read('selfProtection') === true ? selfRules : NO_RULES)
-
   /**
    * Rules that generate shell-scan needles.
    *
@@ -225,15 +230,72 @@ export function apply(ctx, config) {
     || isExoticTool(toolName)
     || toolName === 'plugin_manager'
 
+  /**
+   * Absolute paths of the profile composition that carries this plugin's rules.
+   *
+   * `process.env.DSH_PROFILE_DIR` is NOT a reliable source here, and relying on
+   * it left self-protection SILENTLY inert in a real deployment: that variable
+   * is contributed by `@deepseek-ai/dsh-shell-env` to each shell EXECUTION
+   * (packages/shell/shell-env/src/index.ts:158-167), not to the Host process's
+   * own environment. With no self-rules the guard had no needles at all, so the
+   * model could read and rewrite the very patch that carries the policy.
+   *
+   * The authoritative source is the live `profileContext` the profile booted
+   * from, with the config editor's document as the second choice and the
+   * environment variable as a last resort.
+   * @returns {readonly string[]} absolute paths, or `NO_RULES` when unresolvable.
+   */
+  const resolveSelfPaths = () => {
+    const lookup = (name, field) => {
+      try {
+        return nonEmpty(ctx.get?.(name)?.[field])
+      } catch {
+        return undefined
+      }
+    }
+    const patch = lookup('profileContext', 'patchPath') ?? lookup('configEditor', 'documentPath')
+    if (patch !== undefined) {
+      const dir = dirname(patch)
+      // The patch itself first: it is the exact file carrying the rules.
+      return Object.freeze([patch, join(dir, 'cordis.yml'), join(dir, 'package.json')])
+    }
+    const dir = nonEmpty(process.env.DSH_PROFILE_DIR)
+    return dir === undefined
+      ? NO_RULES
+      : Object.freeze(PROFILE_FILES.map(file => join(dir, file)))
+  }
+
+  let selfRulePaths = null
+  let selfRules = NO_RULES
+  let warnedNoProfile = false
+
   /** Implicit rules that keep the AI from editing the composition carrying this policy. */
-  const selfRules = typeof profileDir === 'string' && profileDir !== ''
-    ? Object.freeze(PROFILE_FILES.map(file => Object.freeze({
-      id: 'self-protection',
-      path: join(profileDir, file),
-      access: 'read',
-      note: 'dsh-path-guard self-protection',
-    })))
-    : NO_RULES
+  const selfRulesFor = () => {
+    if (read('selfProtection') !== true) return NO_RULES
+    const paths = resolveSelfPaths()
+    if (paths === NO_RULES || paths.length === 0) {
+      // Never fail silently again: an unarmed self-protection must be visible.
+      if (!warnedNoProfile) {
+        warnedNoProfile = true
+        ctx.logger.error(
+          'path-guard: selfProtection is ON but the profile path could not be resolved'
+          + ' (no profileContext/configEditor service and no DSH_PROFILE_DIR);'
+          + ' the profile composition is NOT protected',
+        )
+      }
+      return NO_RULES
+    }
+    if (selfRulePaths !== paths[0]) {
+      selfRulePaths = paths[0]
+      selfRules = Object.freeze(paths.map(path => Object.freeze({
+        id: 'self-protection',
+        path,
+        access: 'read',
+        note: 'dsh-path-guard self-protection',
+      })))
+    }
+    return selfRules
+  }
 
   let cachedRules = null
   let cachedExtra = null
