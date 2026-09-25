@@ -199,14 +199,28 @@ test('guard refuses exotic tools by default, and allows them when configured', (
   assert.equal(lax.guards[0]({ name: 'run_code', arguments: {} }), undefined)
 })
 
-test('guard keeps plugin_manager usable except against this plugin itself', () => {
+test('guard keeps plugin_manager readable and makes it read-only under self-protection', () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
   const guard = ctx.guards[0]
+  // Reading stays available: the model can still see what is installed.
   assert.equal(guard({ name: 'plugin_manager', arguments: { action: 'list_plugins' } }), undefined)
-  assert.equal(guard({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'some-other-plugin' } }), undefined)
+  assert.equal(guard({ name: 'plugin_manager', arguments: { action: 'list_bundles' } }), undefined)
+  assert.equal(guard({ name: 'plugin_manager', arguments: { action: 'list_version_exemptions' } }), undefined)
+  // Every composition-changing action is refused.
   assert.match(guard({ name: 'plugin_manager', arguments: { action: 'set_plugin', target: 'path-guard', enabled: false } }), /自我保护/)
   assert.match(guard({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'dsh-path-guard' } }), /自我保护/)
+  // Regression: matching the target string was bypassable by copying the
+  // package elsewhere and installing that path. A path with no mention of this
+  // plugin must be refused too.
+  assert.match(guard({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'D:/tmp/copy' } }), /自我保护/)
+  assert.match(guard({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'https://example.invalid/x.git' } }), /自我保护/)
+  assert.match(guard({ name: 'plugin_manager', arguments: { action: 'set_bundle', target: 'some-other-plugin', enabled: false } }), /自我保护/)
+
+  // Turning self-protection off restores normal management.
+  const open = fakeCtx()
+  apply(open, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  assert.equal(open.guards[0]({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'some-other-plugin' } }), undefined)
 })
 
 test('guard scans shell command text for protected paths', () => {

@@ -64,18 +64,26 @@ export { Config }
 /** The cross-copy volatile marker (vendor/cosmokit/src/volatile.ts:3,52-54). */
 const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 
-/** This bundle's package name, used to recognise self-targeting actions. */
-const SELF_PACKAGE = 'dsh-path-guard'
-
 /** This bundle's row id in the profile patch, also its settings namespace. */
 const SELF_ROW_ID = 'path-guard'
 
-/** `plugin_manager` actions that can disable, replace or remove this plugin. */
-const SELF_TARGETING_ACTIONS = new Set([
+/**
+ * `plugin_manager` actions that change the profile composition.
+ *
+ * Self-protection refuses ALL of them, not just the ones naming this plugin.
+ * The earlier "deny only self-targeting targets" rule matched the `target`
+ * string against this bundle's names, which is bypassable: the model can copy
+ * this package elsewhere and `install_bundle` that path — the target contains
+ * neither name, yet the copy declares the same row id and overrides the row.
+ * A `target` string is not a safe identity for "which row does this affect", so
+ * the only sound rule is to keep the tool read-only while protection is on.
+ * Turning `selfProtection` off restores full management.
+ */
+const COMPOSITION_CHANGING_ACTIONS = new Set([
   'set_plugin',
   'set_bundle',
-  'remove_bundle',
   'install_bundle',
+  'remove_bundle',
   'set_version_exemption',
 ])
 
@@ -350,19 +358,17 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Refuse `plugin_manager` actions that would disable or replace this plugin.
-   * Listing actions stay allowed on purpose: the model keeps its ability to see
-   * what is installed.
+   * Refuse every composition-changing `plugin_manager` action while
+   * self-protection is on. Listing actions stay allowed, so the model keeps its
+   * ability to see what is installed.
    * @param {unknown} args - the `plugin_manager` arguments.
    * @returns {string | undefined} a denial reason, or undefined to allow.
    */
   const selfTargetVerdict = (args) => {
     if (args === null || typeof args !== 'object') return undefined
     const action = args.action
-    if (typeof action !== 'string' || !SELF_TARGETING_ACTIONS.has(action)) return undefined
-    const target = typeof args.target === 'string' ? args.target : ''
-    if (!target.includes(SELF_PACKAGE) && !target.includes(SELF_ROW_ID)) return undefined
-    return selfDenialText({ action, target })
+    if (typeof action !== 'string' || !COMPOSITION_CHANGING_ACTIONS.has(action)) return undefined
+    return selfDenialText({ action, target: typeof args.target === 'string' ? args.target : '(未指定)' })
   }
 
   // ---- L1: the authority on paths -----------------------------------------

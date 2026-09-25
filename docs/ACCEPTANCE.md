@@ -113,8 +113,10 @@
 | # | 调用 | 期望 |
 |---|---|---|
 | 21 | `plugin_manager` `action: list_plugins` | **成功**（保留可观测性） |
-| 22 | `plugin_manager` `action: set_plugin, target: path-guard, enabled: false` | **被拒绝**，文案说明这是自我保护 |
-| 23 | `write` `C:\Users\<你>\.dsh\profiles\web\cordis.patch.yml` | **被拒绝**（可读不可写） |
+| 22a | `plugin_manager` `action: set_plugin, target: path-guard, enabled: false` | **被拒绝**，文案说明自我保护开启时 plugin_manager 只读 |
+| 22b | `plugin_manager` `action: install_bundle, target: D:\tmp\whatever` | **也被拒绝**。这条是关键：早期实现按 target 字符串匹配本插件名，模型把插件复制到别的路径再安装就能绕过；现在一律拒绝 |
+| 22c | `write` `C:\Users\<你>\.dsh\profiles\web\cordis.patch.yml` | **被拒绝**（可读不可写） |
+| 22d | 把 `selfProtection` 关掉后重试 22a | 成功（确认开关真的接通） |
 
 ### 不可拦通道
 

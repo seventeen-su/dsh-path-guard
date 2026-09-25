@@ -89,21 +89,26 @@ export function exoticDenialText({ toolName }) {
 }
 
 /**
- * The refusal for a `plugin_manager` action aimed at this plugin itself.
+ * The refusal for a `plugin_manager` action that would change the profile
+ * composition while self-protection is on.
  * @param {{action: string, target: string}} input - the attempted action.
  * @returns {string} the model-facing reason.
  */
 export function selfDenialText({ action, target }) {
   return [
-    '访问被拒绝：不允许通过 plugin_manager 修改或卸载当前生效的路径防护插件。',
+    '访问被拒绝：自我保护开启时，不允许修改 profile 的插件组合。',
     '',
     `- action：${action}`,
     `- target：${target}`,
     '',
-    '这是用户设定的自我保护：防护插件被停用后，本会话中所有路径限制都会立即失效。',
-    '读取类动作（list_plugins / list_bundles）不受限制。',
+    '原因是这类动作可能直接或间接停用 dsh-path-guard。`plugin_manager` 的参数里没有任何东西',
+    '能可靠地证明「这次改动不会影响防护插件」——例如把本插件复制到别的路径再安装，target 字符串里',
+    '不会出现它的名字，但副本会用同一个 row id 覆盖掉防护行。因此这里采取保守规则：',
+    '**自我保护开启时，plugin_manager 只读**。',
     '',
-    '如果确实需要改动，请向用户说明原因，由用户自己操作。',
+    '读取类动作（list_plugins / list_bundles / list_version_exemptions）不受限制，仍然可用。',
+    '如果确实需要让 AI 管理插件，请向用户说明用途，请他在「设置 → 路径守卫」里关闭自我保',
+    '护；也可以由用户自己在前端操作。',
   ].join('\n')
 }
 

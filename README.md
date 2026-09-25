@@ -54,7 +54,7 @@ target: D:\Program\dsh-path-guard
 | `searchRedaction` | `true` | 把 `glob`/`grep` 结果里落在受保护路径上的条目剔除 |
 | `shell` | `scan` | `scan` 扫描 shell 命令文本；`deny` 直接禁掉 shell；`off` 不处理（已知漏洞） |
 | `exoticTools` | `deny` | 拒绝插件层无法观察的通道（MCP 工具、`run_code`、外部子代理） |
-| `selfProtection` | `true` | 禁止 AI 改写本插件所在的 profile 组合文件，也禁止它用 `plugin_manager` 关掉本插件 |
+| `selfProtection` | `true` | 自我保护：禁止 AI 用文件工具改写 profile 组合文件，并让 `plugin_manager` 变为**只读**（列插件仍可用，任何增删改都拒绝）。关掉它 AI 才能管理插件。 |
 
 ## 能挡住什么、挡不住什么
 
