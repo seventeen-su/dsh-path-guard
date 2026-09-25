@@ -79,9 +79,11 @@ window.__ModuleLoader__.load({
       addRule: '添加规则',
       presets: '常用位置（点一下即添加）',
       presetSsh: '~/.ssh → 仅文件名',
+      presetExempt: '~/.ssh 里放行 README.md',
       presetAws: '~/.aws → 完全禁止',
       presetGnupg: '~/.gnupg → 完全禁止',
       presetDocker: '~/.docker → 完全禁止',
+      rulesExemptHint: '想给受保护目录里的某个文件开例外？再加一条更具体的规则就行——例如「~/.ssh → 仅文件名」再加「~/.ssh/README.md → 只读」，就只有那一个文件可读。',
       browse: '浏览…',
       browseTitle: '把选中的目录填入这一行',
       help: '怎么用？看四个例子',
@@ -151,9 +153,11 @@ window.__ModuleLoader__.load({
       addRule: 'Add rule',
       presets: 'Common locations (click to add)',
       presetSsh: '~/.ssh → names only',
+      presetExempt: 'Allow README.md inside ~/.ssh',
       presetAws: '~/.aws → blocked',
       presetGnupg: '~/.gnupg → blocked',
       presetDocker: '~/.docker → blocked',
+      rulesExemptHint: 'Need one file inside a protected directory to stay readable? Add a second, more specific rule — e.g. "~/.ssh → names only" plus "~/.ssh/README.md → read only" makes exactly that one file readable.',
       browse: 'Browse…',
       browseTitle: 'Put the chosen directory into this row',
       help: 'How do I use this? Four examples',
@@ -193,9 +197,20 @@ window.__ModuleLoader__.load({
      * access level is the conservative-but-usable default for each: SSH keeps
      * names visible so the agent can still tell a key exists, everything else
      * is hidden outright.
+     *
+     * `presetExempt` demonstrates the exemption mechanism and carries a
+     * `parent`: an exemption is not a special syntax, it is a SECOND, more
+     * specific rule, so clicking it adds both the protected directory and the
+     * one file allowed inside it.
      */
     const PRESETS = [
       { key: 'presetSsh', path: '~/.ssh', access: 'list' },
+      {
+        key: 'presetExempt',
+        path: '~/.ssh/README.md',
+        access: 'read',
+        parent: { path: '~/.ssh', access: 'list' },
+      },
       { key: 'presetAws', path: '~/.aws', access: 'none' },
       { key: 'presetGnupg', path: '~/.gnupg', access: 'none' },
       { key: 'presetDocker', path: '~/.docker', access: 'none' },
@@ -374,6 +389,22 @@ window.__ModuleLoader__.load({
         /** Append one rule to the draft, creating the draft if needed. */
         const appendRule = rule => setDraft([...rows, rule])
 
+        /**
+         * Append one preset. An exemption carries a `parent`, so clicking it adds
+         * the protected directory as well — and paths already present are not
+         * duplicated, so the chip is safe to click twice.
+         */
+        const appendPreset = preset => {
+          const next = [...rows]
+          const add = candidate => {
+            if (next.some(row => row.path === candidate.path)) return
+            next.push({ path: candidate.path, access: candidate.access, note: '' })
+          }
+          if (preset.parent !== undefined) add(preset.parent)
+          add(preset)
+          setDraft(next)
+        }
+
         /** Ask the Host's directory picker and put the result in one row. */
         const browseInto = index => async () => {
           if (!picker.available) return
@@ -437,7 +468,7 @@ window.__ModuleLoader__.load({
               type: 'button',
               style: STYLE.chip,
               disabled: busy || !writable,
-              onClick: () => appendRule({ path: preset.path, access: preset.access, note: '' }),
+              onClick: () => appendPreset(preset),
             }, label(preset.key)))),
             h('div', { style: { margin: '0 0 10px' } },
               h('button', {
@@ -500,6 +531,7 @@ window.__ModuleLoader__.load({
                     }, label('remove')))),
                 ))),
               ),
+            h('p', { style: STYLE.hint }, label('rulesExemptHint')),
             h('div', { style: STYLE.footer },
               h('button', {
                 type: 'button',
