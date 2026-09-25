@@ -7,3 +7,4 @@ Thumbs.db
 *.tsbuildinfo
 package-lock.json
 .dsh-profile-scratch/
+.omb/
