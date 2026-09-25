@@ -301,6 +301,10 @@ export function createNotifier(deps) {
     try {
       const method = service[methodName]
       if (typeof method !== 'function') {
+        // A service that exists but does not expose the method is a version
+        // mismatch, not an absent plugin: warn every time (this path is bounded by
+        // the number of interceptions, not by a loop) and remember nothing, so the
+        // window is not consumed by a notification that was never attempted.
         logWarn(`service is present but ${methodName}() is missing (${site})`)
         return { attempted: false, queued: false }
       }
