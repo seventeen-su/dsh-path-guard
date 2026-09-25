@@ -37,9 +37,14 @@ const NO_BYPASS = [
  * @returns {string} the model-facing reason.
  */
 export function denialText({ toolName, shownPath, access, required, ruleId, rulePath }) {
+  // `ruleId` is either a user-supplied id or the policy engine's synthesized
+  // `#<index>` for an anonymous rule; only add a marker when it needs one.
+  const id = ruleId === undefined || ruleId === ''
+    ? ''
+    : ` (${ruleId.startsWith('#') ? ruleId : `#${ruleId}`})`
   const rule = rulePath === undefined
     ? `默认档位 defaultAccess = ${access}`
-    : `${rulePath}${ruleId === undefined ? '' : ` (#${ruleId})`} → access: ${access}`
+    : `${rulePath}${id} → access: ${access}`
   return [
     '访问被拒绝：该路径由用户通过 dsh-path-guard 明确设置了访问限制。这不是系统错误，也不是权限不足。',
     '',
