@@ -1,10 +1,14 @@
 node_modules/
 dist/
-lib/
 *.log
 .DS_Store
 Thumbs.db
 *.tsbuildinfo
-package-lock.json
 .dsh-profile-scratch/
 .omb/
+
+# `lib/` is the BUILD OUTPUT and is intentionally COMMITTED: `plugin_manager`'s
+# install_bundle never runs a build, so DSH loads `exports["."] -> ./lib/index.js`
+# straight off disk. Ignoring it would ship a package whose entry point does not
+# exist on any machine but the author's.
+# (Removed `lib/` here on 2026-09-30; see docs/ARCHITECTURE.md §5.)
