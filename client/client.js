@@ -10,8 +10,9 @@
  * needs a client half of its own, exactly like the shipped companion packages
  * (`packages/client/ui-settings-agent-loop/src/client/index.ts`).
  *
- * This half registers one Settings page under `settings.section` and binds it
- * to the `path-guard` settings namespace, which IS the row id in
+ * This half registers the config page on the Plugins page (`plugins.row.config`
+ * and `plugins.bundle.config`, see `apply` below) and binds it to the
+ * `path-guard` settings namespace, which IS the row id in
  * `cordis.patch.yml` (packages/settings/settings/src/index.ts:315,382).
  *
  * Deliberate constraints:
@@ -23,7 +24,12 @@
  *   - only `react` is required, and it is a baseline external
  *     (packages/client/web/src/platform.ts:8-14) — no other Harness client
  *     package is imported, per the plugin authoring policy.
- *   - styling uses only `--dsw-alias-*` theme tokens.
+ *   - styling: every colour is a `--dsw-alias-*` theme token (so it follows the
+ *     light/dark switch); geometry comes from the host's own variables where one
+ *     exists (`--dsw-radius-*`, `--ds-font-family-code`, ui-theme/src/styles/base.css)
+ *     and otherwise from the numbers the shipped pages use, each one cited at the
+ *     property. No `font-family` is declared: this page inherits the host family
+ *     (base.css:7-8). See the comment above `CONTROL`/`STYLE`.
  */
 
 window.__ModuleLoader__.load({
@@ -203,124 +209,230 @@ window.__ModuleLoader__.load({
       { key: 'presetDocker', path: '~/.docker', access: 'none' },
     ]
 
+    /**
+     * Visual language copied from the shipped plugin and settings pages: every
+     * number below names the host file it was read from, so this page reads like
+     * the host instead of like a plugin's own invention.
+     *
+     * Fonts: `Theme.listTokens` exposes colours only, so there is no font token to
+     * ask the client service for — but the host shell already puts the standard
+     * stack on `body` (`packages/client/web/src/base.css:11-24`, rendering
+     * `--dsw-font-family` from ui-theme/src/styles/base.css:7-8) and re-applies
+     * `font-family: inherit` to button/input/select/textarea because UA sheets pin
+     * their own families (web/src/base.css:102-109). This page therefore declares
+     * NO family of its own and inherits the host's. The one place that needs the
+     * `inherit` written out is the help block: it is a `<pre>`, which the host's
+     * control list does not cover and a UA sheet would render in monospace.
+     * Code text uses `--ds-font-family-code` (TH:10-11): the stack the host's own
+     * composite code tokens resolve to (TT:160) and what shipped pages put on code
+     * (PM:652-654, INV:204).
+     *
+     * Sources below; paths relative to the DSH checkout.
+     *   PM  packages/client/ui-plugin-manager/src/client/PluginManagerPage.module.css
+     *   PS  packages/client/ui-settings-plugins/src/client/PluginsSettingsSection.module.css
+     *   SF  packages/client/ui-primitives/src/settings-form/fields.module.css
+     *   SG  packages/client/ui-primitives/src/settings-form/SettingsForm.module.css
+     *   BT  packages/client/ui-primitives/src/Button.module.css
+     *   CB  packages/client/ui-primitives/src/Checkbox.module.css
+     *   MS  packages/client/ui-settings-models/src/client/ModelsSection.module.css
+     *   INV packages/client/ui-settings-plugin-inventory/src/client/PluginInventorySettingsTab.module.css
+     *   TR  packages/client/ui-trajectory/src/client/TrajectoryTable.module.css
+     *   PL  packages/client/ui-primitives/src/Pill.module.css
+     *   TH  packages/client/ui-theme/src/styles/base.css
+     *   TT  packages/client/ui-theme/src/styles/gradient-shadow-text.css
+     *
+     * Sizes: the host's own scale is `--dsw-font-*` (TT:188-271) — 20/28, 14/22,
+     * 13/20, 12/18 — written here the way the host pages write it. Radii come from
+     * the one scale in TH:16-21, never from a literal.
+     */
+
+    /** Control surface shared by the settings-form text input and enum select (SF:107-117). */
+    const CONTROL = {
+      boxSizing: 'border-box',
+      height: '34px', // SF:108
+      padding: '0 12px', // SF:109
+      border: '0.5px solid var(--dsw-alias-border-l4, currentColor)', // SF:110
+      borderRadius: 'var(--dsw-radius-md, 12px)', // SF:111, TH:18
+      background: 'var(--dsw-alias-bg-layer-3, transparent)', // SF:112
+      color: 'var(--dsw-alias-label-primary, inherit)', // SF:116
+      fontFamily: 'inherit', // SF:113
+      fontSize: '13px', // SF:114
+      lineHeight: 1.5, // SF:115
+    }
+
+    /** The compact outlined action: Button `sm` size (BT:28-34) in its `outline` variant (BT:54-57). */
+    const SM_BUTTON = {
+      boxSizing: 'border-box',
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: '28px', // BT:29
+      padding: '0 10px', // BT:32
+      border: '0.5px solid var(--dsw-alias-border-l3, currentColor)', // BT:55
+      borderRadius: 'var(--dsw-radius-sm, 8px)', // BT:33, TH:17
+      background: 'none', // BT:56 paints nothing on the outline variant (written `none` as PM:546 does)
+      color: 'var(--dsw-alias-label-primary, inherit)', // BT:13
+      fontFamily: 'inherit',
+      fontSize: '12px', // BT:30
+      lineHeight: '18px', // BT:31
+    }
+
     const STYLE = {
+      // PM:3-16 `.page` already owns the page inset
+      // (`padding: 0 clamp(24px, 4vw, 48px) 48px`) and the page scroll; this
+      // section renders inside it, so it declares neither padding of its own nor a
+      // second scroll container — the old `padding: 20px 24px` double-inset the
+      // page and `height/overflow` nested a scroller inside PM's own.
       root: {
-        padding: '20px 24px',
-        color: 'var(--dsw-alias-label-primary, inherit)',
-        fontSize: '13px',
-        lineHeight: 1.6,
-        overflowY: 'auto',
-        height: '100%',
+        color: 'var(--dsw-alias-label-primary, inherit)', // PM:15
+        fontSize: '13px', // PM:78-79 `.status`; TT:230 --dsw-font-xs-13
+        lineHeight: '20px', // TT:233
       },
-      title: { margin: '0 0 4px', fontSize: '15px', fontWeight: 600 },
-      intro: { margin: '0 0 16px', color: 'var(--dsw-alias-label-secondary, inherit)' },
+      // Section head: title over lede, 4px apart — PM:53 `.pageIntro { margin: 4px 0 0 }`.
+      // PS:103-107 is the settings section drawn over these same plugin cards, so
+      // its title size sits below the host's own 20px/28px page title (PM:42-47)
+      // without competing with it.
+      title: { margin: '0 0 4px', fontSize: '15px', lineHeight: '22px', fontWeight: 600 },
+      intro: { margin: '0 0 12px', color: 'var(--dsw-alias-label-secondary, inherit)' }, // PM:56; PS:6 rhythm
+      status: { margin: 0, color: 'var(--dsw-alias-label-tertiary, inherit)' }, // PM:74-81 `.status`
+      statusWarn: { margin: 0, color: 'var(--dsw-alias-state-warn-primary, inherit)' }, // PM:83-88 `.failure` tone
       notice: {
-        margin: '0 0 16px',
-        padding: '8px 12px',
-        border: '1px solid var(--dsw-alias-border-l1, currentColor)',
-        borderRadius: '6px',
-        background: 'var(--dsw-alias-bg-layer-2, transparent)',
+        margin: '0 0 12px', // PS:6
+        padding: '8px 12px', // PM:1023 `.result`
+        border: '0.5px solid var(--dsw-alias-border-l3, currentColor)', // PM:926 `.subject`
+        borderRadius: 'var(--dsw-radius-md, 12px)', // PM:1024
+        background: 'var(--dsw-alias-bg-layer-2, transparent)', // PM:722
         color: 'var(--dsw-alias-label-secondary, inherit)',
+        fontSize: '12px', lineHeight: '18px', // TT:244 --dsw-font-xxs-12
       },
+      // One card per topic: the hairline inset panel the plugins page itself uses
+      // (PM:566-574 `.guide`, PM:920-929 `.subject`), not a heavy 1px frame.
       group: {
-        margin: '0 0 18px',
-        padding: '14px 16px',
-        border: '1px solid var(--dsw-alias-border-l1, currentColor)',
-        borderRadius: '8px',
-        background: 'var(--dsw-alias-bg-layer-1, transparent)',
+        margin: '0 0 12px', // PS:6
+        padding: '12px 14px', // PM:1040 `.approval`; INV:134 `.cardContent`
+        border: '0.5px solid var(--dsw-alias-border-l3, currentColor)', // PM:926
+        borderRadius: 'var(--dsw-radius-lg, 16px)', // PM:572; TH:19
+        background: 'var(--dsw-alias-bg-layer-1, transparent)', // PM:573
       },
-      groupTitle: { margin: '0 0 10px', fontSize: '13px', fontWeight: 600 },
-      row: { display: 'flex', alignItems: 'center', gap: '8px', margin: '0 0 8px' },
-      rowLabel: { minWidth: '190px', color: 'var(--dsw-alias-label-primary, inherit)' },
-      hint: { margin: '2px 0 10px', color: 'var(--dsw-alias-label-secondary, inherit)', fontSize: '12px' },
-      select: {
-        padding: '4px 6px',
-        borderRadius: '4px',
-        border: '1px solid var(--dsw-alias-border-l2, currentColor)',
-        background: 'var(--dsw-alias-bg-base, transparent)',
-        color: 'var(--dsw-alias-label-primary, inherit)',
-        fontSize: '12px',
-      },
-      input: {
-        width: '100%',
-        padding: '4px 6px',
-        borderRadius: '4px',
-        border: '1px solid var(--dsw-alias-border-l2, currentColor)',
-        background: 'var(--dsw-alias-bg-base, transparent)',
-        color: 'var(--dsw-alias-label-primary, inherit)',
-        fontSize: '12px',
-        fontFamily: 'inherit',
-        boxSizing: 'border-box',
-      },
-      table: { width: '100%', borderCollapse: 'collapse' },
+      groupTitle: { margin: '0 0 8px', fontSize: '14px', lineHeight: '22px', fontWeight: 500 }, // PM:108-113; PM:99
+      // A field is label / control / hint stacked (SF:3-8). The host's settings
+      // forms never run a label column, so the old `minWidth: 190px` row is gone.
+      // The hairline between two adjacent fields needs a `+` selector and lives in
+      // STATE_CSS (SF:10-12).
+      field: { display: 'flex', flexDirection: 'column', gap: '6px', margin: '0 0 12px' }, // SF:6 gap, SF:7 padding
+      fieldLabel: { fontSize: '13px', fontWeight: 500, lineHeight: 1.5, color: 'var(--dsw-alias-label-primary, inherit)' }, // SF:20-27
+      checkboxLabel: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px', lineHeight: '20px', color: 'var(--dsw-alias-label-primary, inherit)', cursor: 'pointer' }, // CB:1-9
+      checkbox: { flex: '0 0 auto', width: '16px', height: '16px', margin: 0, accentColor: 'var(--dsw-alias-brand-primary)' }, // CB:11-18
+      hint: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary, inherit)' }, // SF:140-145
+      // MS:589-594: an enum picker holds a handful of short options and sizes to
+      // them, so it does not read as a text field the user is expected to fill in.
+      select: { ...CONTROL, alignSelf: 'flex-start', maxWidth: '100%' },
+      input: { ...CONTROL, width: '100%' },
+      // The rules table copies the host's own table (TR:99-159): 12px/18px text
+      // (TT:244), a 30px header on the l2 hairline, body cells on l1.
+      table: { width: '100%', borderCollapse: 'collapse', margin: '0 0 12px', color: 'var(--dsw-alias-label-primary, inherit)', background: 'var(--dsw-alias-bg-layer-1, transparent)', fontSize: '12px', lineHeight: '18px' },
       th: {
-        textAlign: 'left',
-        padding: '4px 6px',
-        fontWeight: 500,
-        color: 'var(--dsw-alias-label-secondary, inherit)',
-        borderBottom: '1px solid var(--dsw-alias-border-l1, currentColor)',
+        boxSizing: 'border-box',
+        height: '30px', // TR:132
+        padding: '0 8px', // TR:133
+        borderBottom: '0.5px solid var(--dsw-alias-border-l2, currentColor)', // TR:135
+        color: 'var(--dsw-alias-label-tertiary, inherit)', // TR:136
+        fontWeight: 500, // TR:139
+        textAlign: 'left', // TR:140
       },
-      td: { padding: '4px 6px', verticalAlign: 'middle' },
-      button: {
-        padding: '4px 10px',
-        borderRadius: '4px',
-        border: '1px solid var(--dsw-alias-border-l2, currentColor)',
-        background: 'var(--dsw-alias-bg-layer-2, transparent)',
-        color: 'var(--dsw-alias-label-primary, inherit)',
-        cursor: 'pointer',
-        fontSize: '12px',
-        fontFamily: 'inherit',
-      },
+      // TR:151-159 keeps a 30px cell height too; the 34px controls in these cells
+      // set their own, so only the 8px inset is copied.
+      td: { boxSizing: 'border-box', padding: '4px 8px', verticalAlign: 'middle' },
+      button: SM_BUTTON,
+      // BT:36-39: the primary variant fills with the brand tone and writes its
+      // label in the foreground tone. Same painted pair as before, token-only.
       primary: {
-        padding: '4px 12px',
-        borderRadius: '4px',
-        border: '1px solid var(--dsw-alias-brand-primary, currentColor)',
-        background: 'var(--dsw-alias-brand-primary, transparent)',
-        color: 'var(--dsw-alias-bg-base, #fff)',
-        cursor: 'pointer',
-        fontSize: '12px',
-        fontFamily: 'inherit',
-      },
-      error: { color: 'var(--dsw-alias-state-error-primary, inherit)' },
-      ok: { color: 'var(--dsw-alias-state-success-primary, inherit)' },
-      warn: { color: 'var(--dsw-alias-state-warn-primary, inherit)' },
-      mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
-      presets: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '0 0 10px' },
-      chip: {
-        padding: '3px 9px',
-        borderRadius: '999px',
-        border: '1px solid var(--dsw-alias-border-l2, currentColor)',
-        background: 'var(--dsw-alias-bg-layer-2, transparent)',
-        color: 'var(--dsw-alias-label-primary, inherit)',
-        cursor: 'pointer',
-        fontSize: '11px',
-        fontFamily: 'inherit',
-      },
-      link: {
-        padding: 0,
+        ...SM_BUTTON,
         border: 'none',
-        background: 'none',
-        color: 'var(--dsw-alias-brand-primary, currentColor)',
-        cursor: 'pointer',
-        fontSize: '12px',
-        fontFamily: 'inherit',
-        textDecoration: 'underline',
+        background: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary))',
+        color: 'var(--dsw-alias-label-primary-foreground, var(--dsw-alias-bg-layer-3))',
       },
-      help: {
+      error: { margin: '0 0 12px', fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-state-error-primary, inherit)' }, // SG:23-30
+      ok: { margin: '0 0 12px', fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-state-success-primary, inherit)' }, // SG:23-30
+      warn: { color: 'var(--dsw-alias-state-warn-primary, inherit)' },
+      // Code text keeps the host's code stack instead of an invented macOS one
+      // (TH:10-11). Deliberately no literal tail: if the theme variable were ever
+      // absent the declaration drops and the text inherits the host family — the
+      // same result the host's own `font: inherit` rules give.
+      mono: { fontFamily: 'var(--ds-font-family-code)' },
+      presets: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '0 0 10px' }, // PM:1070-1075 `.approvalList`; PS:78
+      chip: { ...SM_BUTTON, borderRadius: '999px', padding: '0 12px' }, // PL:8 pill; BT:29-32 for the box
+      helpToggle: { margin: '0 0 10px' }, // PS:78 `.cards { gap: 10px }`
+      link: { // INV:383-391 `.jumpLink`
+        border: 'none',
+        padding: 0,
+        background: 'none',
+        color: 'var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary))',
+        fontFamily: 'inherit',
+        fontSize: '12px',
+        lineHeight: 1.5,
+      },
+      help: { // PM:566-581 `.guide` + `.guideHint`; text metrics from SF:67-72
         margin: '6px 0 0',
-        padding: '8px 10px',
-        border: '1px solid var(--dsw-alias-border-l1, currentColor)',
-        borderRadius: '6px',
-        background: 'var(--dsw-alias-bg-layer-2, transparent)',
+        padding: '8px 14px',
+        border: '0.5px solid var(--dsw-alias-border-l4, currentColor)',
+        borderRadius: 'var(--dsw-radius-lg, 16px)',
+        background: 'var(--dsw-alias-bg-layer-1, transparent)',
         color: 'var(--dsw-alias-label-secondary, inherit)',
         fontSize: '12px',
+        lineHeight: 1.6,
         whiteSpace: 'pre-wrap',
         fontFamily: 'inherit',
-        lineHeight: 1.7,
       },
-      actions: { display: 'flex', gap: '4px', flexWrap: 'wrap' },
-      footer: { display: 'flex', alignItems: 'center', gap: '10px', marginTop: '6px' },
+      actions: { display: 'flex', gap: '4px', flexWrap: 'wrap' }, // PM:544 `.guideToggle { gap: 4px }`
+      footer: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '16px' }, // SG:16-21
     }
+
+    /**
+     * The states React inline styles cannot express: `::placeholder` (no inline
+     * counterpart at all), the hover fill, disabled affordance, the pointer cursor,
+     * and the hairline between two adjacent fields (SF:10-12, which needs a `+`
+     * selector). Every rule is scoped to this page root's own attribute, so none of
+     * them can reach host UI, and the sheet is injected once from `apply` so it
+     * leaves with the plugin.
+     *
+     * `!important` appears only on the hover fills: a state must beat the element's
+     * own inline background, which carries the base state. If this sheet were ever
+     * missing, the page still renders exactly its inline styling and loses only the
+     * hover fills.
+     */
+    const STATE_CSS = `
+[data-path-guard] input::placeholder { color: var(--dsw-alias-label-dimmed, var(--dsw-alias-label-tertiary)); } /* MS:601-603 */
+[data-path-guard] button, [data-path-guard] select { cursor: pointer; } /* MS:593 */
+[data-path-guard] button:disabled { opacity: 0.4; cursor: default; } /* BT:18-21 */
+[data-path-guard] input:disabled, [data-path-guard] select:disabled { opacity: 0.6; cursor: default; } /* MS:605-608 */
+[data-path-guard] button:not([data-pg-primary]):not([data-pg-link]):not(:disabled):hover { background: var(--dsw-alias-interactive-bg-hover) !important; } /* BT:45-47 */
+[data-path-guard] button[data-pg-primary]:not(:disabled):hover { background: var(--dsw-alias-button-primary-hover, var(--dsw-alias-brand-primary)) !important; } /* BT:41-43 */
+[data-path-guard] button[data-pg-link]:hover { color: var(--dsw-alias-label-primary); } /* PM:554-556 */
+[data-path-guard] .dsh-path-guard-field + .dsh-path-guard-field { border-top: 0.5px solid var(--dsw-alias-border-l2); padding-top: 12px; } /* SF:10-12 */
+`
+
+    /** Class on each field wrapper, so STATE_CSS can separate two adjacent fields. */
+    const FIELD_CLASS = 'dsh-path-guard-field'
+
+    /** Id of the injected state stylesheet: one copy per document. */
+    const STATE_STYLE_ID = 'dsh-path-guard-state-styles'
+
+    /**
+     * Put STATE_CSS in the page.
+     * @returns {() => void} removal, for the plugin's own effect cleanup.
+     */
+    function installStateStyles() {
+      if (typeof document === 'undefined' || document.getElementById(STATE_STYLE_ID) !== null) return () => {}
+      const element = document.createElement('style')
+      element.id = STATE_STYLE_ID
+      element.textContent = STATE_CSS
+      document.head.appendChild(element)
+      return () => element.remove()
+    }
+
+    /** Every root this section renders under, carrying the stylesheet's scope attribute. */
+    const ROOT_ATTR = { 'data-path-guard': '' }
 
     /**
      * Build the settings section component around one bound config form.
@@ -342,10 +454,10 @@ window.__ModuleLoader__.load({
         const [helpOpen, setHelpOpen] = React.useState(false)
 
         if (snapshot.status === 'loading') {
-          return h('section', { style: STYLE.root, 'aria-busy': true }, h('p', null, label('statusLoading')))
+          return h('section', { ...ROOT_ATTR, style: STYLE.root, 'aria-busy': true }, h('p', { style: STYLE.status }, label('statusLoading')))
         }
         if (snapshot.status === 'unavailable') {
-          return h('section', { style: STYLE.root }, h('p', { style: STYLE.warn }, label('statusUnavailable')))
+          return h('section', { ...ROOT_ATTR, style: STYLE.root }, h('p', { style: STYLE.statusWarn }, label('statusUnavailable')))
         }
 
         const value = snapshot.value !== null && typeof snapshot.value === 'object' ? snapshot.value : {}
@@ -393,36 +505,34 @@ window.__ModuleLoader__.load({
           }
         }
 
-        const scalar = (field, key, options) => h('div', { key: field },
-          h('div', { style: STYLE.row },
-            h('label', { style: STYLE.rowLabel, htmlFor: `pg-${field}` }, label(key)),
-            h('select', {
-              id: `pg-${field}`,
-              style: STYLE.select,
-              value: String(value[field]),
+        // One settings-form field: label over control over hint (SF:3-8).
+        const scalar = (field, key, options) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+          h('label', { style: STYLE.fieldLabel, htmlFor: `pg-${field}` }, label(key)),
+          h('select', {
+            id: `pg-${field}`,
+            style: STYLE.select,
+            value: String(value[field]),
+            disabled: busy || !writable,
+            onChange: event => void write(field, event.target.value, 'saved'),
+          }, options.map(option => h('option', { key: option.value, value: option.value }, option.label))),
+          h('p', { style: STYLE.hint }, label(`${key}Hint`)),
+        )
+
+        const checkbox = (field, key) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+          h('label', { style: STYLE.checkboxLabel },
+            h('input', {
+              type: 'checkbox',
+              style: STYLE.checkbox,
+              checked: value[field] !== false,
               disabled: busy || !writable,
-              onChange: event => void write(field, event.target.value, 'saved'),
-            }, options.map(option => h('option', { key: option.value, value: option.value }, option.label))),
+              onChange: event => void write(field, event.target.checked, 'saved'),
+            }),
+            label(key),
           ),
           h('p', { style: STYLE.hint }, label(`${key}Hint`)),
         )
 
-        const checkbox = (field, key) => h('div', { key: field },
-          h('div', { style: STYLE.row },
-            h('label', { style: { ...STYLE.rowLabel, display: 'flex', alignItems: 'center', gap: '6px' } },
-              h('input', {
-                type: 'checkbox',
-                checked: value[field] !== false,
-                disabled: busy || !writable,
-                onChange: event => void write(field, event.target.checked, 'saved'),
-              }),
-              label(key),
-            ),
-          ),
-          h('p', { style: STYLE.hint }, label(`${key}Hint`)),
-        )
-
-        return h('section', { style: STYLE.root, 'aria-label': label('title') },
+        return h('section', { ...ROOT_ATTR, style: STYLE.root, 'aria-label': label('title') },
           h('h2', { style: STYLE.title }, label('title')),
           h('p', { style: STYLE.intro }, label('intro')),
           !writable ? h('p', { style: STYLE.notice }, label('statusReadonly')) : null,
@@ -447,10 +557,11 @@ window.__ModuleLoader__.load({
               disabled: busy || !writable,
               onClick: () => appendPreset(preset),
             }, label(preset.key)))),
-            h('div', { style: { margin: '0 0 10px' } },
+            h('div', { style: STYLE.helpToggle },
               h('button', {
                 type: 'button',
                 style: STYLE.link,
+                'data-pg-link': '',
                 onClick: () => setHelpOpen(!helpOpen),
               }, label(helpOpen ? 'helpHide' : 'help')),
               helpOpen
@@ -520,6 +631,7 @@ window.__ModuleLoader__.load({
               draft === null ? null : h('button', {
                 type: 'button',
                 style: STYLE.primary,
+                'data-pg-primary': '',
                 disabled: busy,
                 onClick: async () => {
                   await write('rules', rows, 'saved')
@@ -577,6 +689,10 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(L10N, { zh, en }), 'path-guard: locale')
         const t = ctx.locale.bind(L10N)
+
+        // The hover, placeholder, disabled and field-separator rules React inline
+        // styles cannot express (STATE_CSS above); it leaves with the plugin.
+        ctx.effect(() => installStateStyles(), 'path-guard: state styles')
 
         // The Host's directory picker is an optional Remote: a deployment
         // without `@deepseek-ai/dsh-directory-picker-auto` simply gets no
