@@ -53,12 +53,18 @@ DSH 自己的做法（`packages/fs/fs-sandbox/src/index.ts:122-144`）：在真�
 
 **计划**：
 1. `fs/write-intent` / `fs/edit-intent` 是 waterfall 且携带**已解析**的 `FsTarget`，可 `throw` 否决——
-   把它们接成**权威写否决层**（`src/fs-guard.js`）。这两个事件只在 `write`/`edit` 工具上派发，
-   `str_replace_editor` 不走它们，因此仍需 pre-execute 兜底。
+   把它们接成**权威写否决层**（`src/fs-guard.js`，已完成）。覆盖范围**比初稿写的大**：
+   `str_replace_editor` 也派发这两个事件（`tool-str-replace-editor/src/index.ts:254/289/342`），
+   并不像本文件初稿说的那样"不走它们"。
+   **注册顺序是硬约束**：`fs-observation-policy` 刻意不调用 `next()` 以占据唯一决策槽
+   （`packages/fs/fs-observation-policy/src/index.ts:119,122`），而 waterfall 按注册序执行、
+   不调 `next()` 即截断整条链（`vendor/cordis/src/events.ts:234-243`）。所以本层必须
+   **`{ prepend: true }` 注册在最外层**，否则永不执行 = 静默 fail-open。
 2. 评估**接管 `ctx.fs`**（`SandboxedFileSystem` 子类）作为最终权威层，用
    `ctx.agents.currentInitiator()` 区分 AI 与用户，避免连 GUI 一起挡。
-   这是唯一能覆盖读侧 TOCTOU 的做法，代价是接管一个上游 row。
-3. 明确分层语义：**pre-execute = 上层快速策略检查**；`fs-intent` / `ctx.fs` = 最终权威。
+   读侧**没有对应的 intent 事件**，所以这是唯一能覆盖读侧 TOCTOU 的做法，代价是接管一个上游 row
+   （用户此前否决过服务接管，待重新确认）。
+3. 明确分层语义：**pre-execute = 上层快速策略检查**；`fs-intent` = 写侧最终权威；`ctx.fs` = 读侧最终权威（若接管）。
 
 ### 2.2 `PATH_TOOLS` 是静态工具名单 → 天然 fail-open
 

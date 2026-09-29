@@ -62,6 +62,7 @@ import {
 } from './deny.js'
 import { buildNeedles, commandOf, redactTextBlocks, scanCommand, unscannablePatterns } from './scan.js'
 import { createNotifier } from './notify.js'
+import { createFsGuard } from './fs-guard.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'path-guard'
@@ -777,6 +778,54 @@ export function apply(ctx, config) {
       return internalErrorText('ctx.tools.guard()')
     }
   })
+
+  // ---- L3: the AUTHORITATIVE write veto -----------------------------------
+  //
+  // `tools/pre-execute` cannot be the final authority on writes: the FsTarget it
+  // resolves is NOT the one the tool later uses, so a symlink swapped in between
+  // defeats it. These two waterfall events carry the target the mutation will
+  // actually use (packages/fs/fs/src/index.ts:59,67) and a listener may throw to
+  // veto. Three constraints come straight from the source:
+  //   - `fs-observation-policy` deliberately does NOT call `next()` so it owns
+  //     the single decision slot (packages/fs/fs-observation-policy/src/index.ts:119,122),
+  //     and a waterfall listener that skips `next()` truncates the whole chain
+  //     (vendor/cordis/src/events.ts:234-243). This MUST therefore be registered
+  //     outermost via `prepend`, or it would never run — a silent fail-open.
+  //   - These events are dispatched by the write/edit tools (and by
+  //     `str_replace_editor`), so an actor here is always a tool call; the GUI
+  //     writes through `ctx.fs` directly and never reaches them.
+  //   - `decideAbsolute` returns `undefined` for "no rule matched AND
+  //     defaultAccess is allow". That is an ALLOW, not an unknown: passing it
+  //     through unwrapped would fail closed on every unprotected path.
+  /**
+   * `@deepseek-ai/dsh-fs` is not resolvable from a profile-installed bundle, so
+   * this mirrors `FsError`'s contract (`message` + `code`); the tool layer keys
+   * its rendering off `code`.
+   */
+  class PathGuardFsError extends Error {
+    constructor(message, code, options) {
+      super(message, options)
+      this.name = 'FsError'
+      this.code = code
+    }
+  }
+
+  const fsGuard = createFsGuard({
+    FsError: PathGuardFsError,
+    actorIsAgent: actor => actor !== null && typeof actor === 'object',
+    decide: (_targetKey, displayPath) => {
+      const decision = decideAbsolute(displayPath, undefined)
+      if (decision === undefined) return { access: 'allow' }
+      return {
+        access: decision.access,
+        ...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
+        ...(decision.pattern === undefined ? {} : { pattern: decision.pattern }),
+      }
+    },
+    logger: ctx.logger,
+  })
+  ctx.on('fs/write-intent', fsGuard.writeIntent, { prepend: true })
+  ctx.on('fs/edit-intent', fsGuard.editIntent, { prepend: true })
 
   // ---- L4: structured result redaction ------------------------------------
   //
