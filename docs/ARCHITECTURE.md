@@ -78,6 +78,27 @@ DSH 的工具系统是开放注册的（第三方工具、MCP、动态注册）�
 - 让 `read` / `grep` / `lsp` / MCP `filesystem.read_file` / workflow / terminal
   都能投影到同一个授权模型。
 
+### 2.2.1 已落地：`src/resource.js`（task-5）
+
+导出 `CAPABILITY` / `KNOWN_TOOLS` / `OPAQUE_TOOLS` / `resolveResources(toolName,args)` /
+`isGoverned(toolName)` / `policyAccessFor(capability)`。41 项测试通过，`tool-fields.js` 暂未改动。
+
+**接线时不可违反的四条**（`resource-policy` 的实测边界，未接线 = 仍是旧的静态表语义）：
+
+1. `known:false && resources.length>0` ⇒ **必须拒绝**，并附上它给出的 `reason`
+   （「工具未建模但参数疑似路径」）。
+2. **不能只凭「参数名像路径」就拒绝**：名字腿偏宽，`{dir:'asc'}` 会被判成 LIST、
+   `{target:'all'}` 会被判成 WRITE。**必须要求取值形态也像路径**（或由用户在配置里明确开启严格模式），
+   否则会大面积误拦——这正是 0.1.x 阶段反复出现的「错误拦截」。
+3. **不透明工具（`opaque:true`）且 `resources` 为空、`reason` 为 undefined** ⇒ 路由到 scan 通道，
+   **不得直接放行**（那是 fail-open）。
+4. **内嵌路径识别不到**：`{content:'see C:/tmp/x'}` 这类只在字符串内部出现、非起始锚定的路径不报，
+   只有 `opaque` 通道能覆盖。这是已知的 fail-open 面，接线时必须写进 README 的「挡不住」表。
+
+**`present` 的能力投影 = `EXPORT → list`（裁决）**：`present` 只取 `lstat`/`stat`/`resolve` 元数据，
+不返回内容，所以模型得到的是「存在性 + 元数据」，`list` 档已足够；改成 `read` 会把「把文件呈现给
+有权查看它的用户」也拒掉，没有安全收益。
+
 ### 2.3 `selfProtection` 是启发式自防御，不是策略不变量
 
 现在做的是「阻止针对我自己的动作」+ 文本搜索 row id。已承认的绕过面：
