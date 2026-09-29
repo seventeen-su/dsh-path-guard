@@ -177,3 +177,40 @@
 - `bash`/`pwsh` 的混淆绕过（变量拼接、编码、外部程序）——见 README 的「挡不住」表。
 - 指令文件（`AGENTS.md`）与 skill 正文的内容——它们在 prompt 装配期读取，没有工具调用可拦。
 - 历史会话检索——已经进入日志的内容收不回来。
+
+## 6. 活体验收：TS 迁移 + 架构重构后（2026-09-30，重启后进行）
+
+适用配置：`~/.ssh → list`、`~/.ssh/README.md → write`、`defaultAccess: allow`、`exoticTools: deny`、
+`selfProtection: true`（默认）。基线：迁移到 TS 6.0.3、接入 `resource.ts` 与 `fs-guard.ts` 之后。
+
+| # | 探测 | 期望 | 实测 |
+|---|---|---|---|
+| 1 | 不含受保护路径的 `pwsh`（`node --version` / `git log`） | 放行 | ✅ 放行（无误伤） |
+| 2 | `read` profile 补丁（`read` 档：可读不可写） | 放行 | ✅ 读到全文 78 行 |
+| 3 | `pwsh` 命令含受保护路径字面量 | 拒绝 | ✅ 拒绝，命中 `~/.ssh → list` |
+| 4 | `workflow`，脚本不含受保护路径 | **放行** | ✅ 运行成功并返回结果 |
+| 5 | `read` 受豁免文件（`~/.ssh/README.md`，`write` 档） | 放行 | ✅ 读到全文 82 行 |
+| 6 | `write` 受保护目录下的新文件 | 拒绝 | ✅ 拒绝，规则 `~/.ssh (#0) → list` |
+| 7 | `write` 允许路径（`reports/*.txt`） | 成功 | ✅ 创建成功 |
+| 8 | `edit` 同一允许文件（走 `fs/edit-intent`） | 成功 | ✅ 修改成功 |
+| 9 | 客户端 `Slots.listSubTree('plugins.row.config')` | 有本插件占位且 `active` | ✅ `registrant: path-guard-client`、`key: dsh-path-guard#path-guard`、`active: true` |
+
+**第 4 条是「加载的是新代码还是旧代码」的判别器**：`workflow` 曾因 `exoticTools: deny` 被一刀切拒绝，
+重构后改为「扫描脚本文本」。它现在跑得通 ⇒ 重启后加载的是新构建的 `lib/index.js`，不是旧的 `src/index.js`。
+
+**第 9 条证明了此前无人能验证的环节**：客户端半页编译成经典脚本后**真的被装载并注册了**。
+（背景：`package.json` 的 `"type": "module"` 会让 tsc 给产物补 `export {};`，而加载器是 `<script src>`，
+解析期即失败；而 `node --check` 因按 ESM 解析会通过，不能作为验收手段。）
+
+### 仍未验证 / 无法构造的验证
+
+- **`fs/*-intent` 层的运行时执行无法用差分实验证明**。理由是构造性的，不是借口：该层是**兜底**，
+  只有当「`pre-execute` 检查到的目标 ≠ 之后真正写入的目标」时才会与上层结论不同，而那需要赢下一次
+  符号链接竞态；对任何外部可构造的输入，两层结论**必然一致**，因此无法隔离观测。
+  已有的间接证据：① 第 4 条证明新 `apply()` 已执行；② 第 7、8 条证明 `prepend` 注册的监听器
+  **没有破坏正常写入链**（若它排在最前却不调 `next()`，进程内所有写入都会失败）；③ Host 事件检查器确认
+  `mode: waterfall`、"the first listener that returns an intent owns the decision"、
+  `actor: object | undefined`（与适配器 `actor => actor !== null && typeof actor === 'object'` 一致）。
+  **剩余不确定性**：无法排除「该监听器排在 `fs-observation-policy` 之后因而从不执行」这一失效模式，
+  只能依赖 `prepend: true` 的源码事实与单元测试。
+- **浏览器内的实际渲染观感**（深/浅色、对比度、hover/focus）——第 9 条只证明注册发生，不证明好看。
