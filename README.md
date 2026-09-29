@@ -103,8 +103,12 @@ target: D:\Program\dsh-path-guard
 | 指令文件 / skill 正文 → 系统提示 | 走 `ctx.get('fs')`，**没有工具调用可拦**。放进 `AGENTS.md` 或 skill 目录的受保护内容挡不住 |
 | 历史会话检索 | 任何**曾被记录**的内容都能被检索回来。已经泄漏过一次的内容收不回来 |
 | 搜索超限的 spill 文件 | 结果超过内联上限时 DSH 会把完整结果落盘；本插件在需要脱敏时**不调用下游处理器**以避免写 spill，但这是依赖实现细节的缓解，不是结构性保证 |
+| **读侧的检查—使用窗口（TOCTOU）** | **已接受的边界**：写侧由 `fs/write-intent` / `fs/edit-intent` 在**真实目标**上否决，是权威层；但 DSH 对**读**没有对应的 intent 事件，所以读侧判定仍发生在 `tools/pre-execute`——检查到的 `FsTarget` 与之后真正被读的不是同一个对象，中间被换掉的符号链接理论上可利用。彻底修它需要**接管 `ctx.fs` 服务**，用户已决定不接管（那会连 GUI 一起接管）。读侧的正确性依赖 `ctx.fs.resolve()` 给出的 canonical 身份，**不依赖「检查与使用之间没有窗口」**。 |
+| **未建模工具里的内嵌路径** | 未知工具按「参数**取值**像路径」识别（参数名像路径但取值不像的不算，否则 MIME 与枚举值会被大面积误拦）。但只在**起始锚定**处识别：`{ content: 'see C:/tmp/x' }` 这种把路径写在字符串中间的形态识别不到。MCP 工具默认已被整体拒绝，所以这条主要影响**新注册的第三方工具**。 |
+| **`name:` 规则不覆盖 shell / 脚本通道** | 按文件名匹配（如 `name:readme.md`）只能作用于工具路径。子串扫描器面对的是整条命令，而文件名（`readme.md`）在普通命令里太常见、当 needle 会大量误伤——因此这类规则**不参与** shell 扫描，并会在激活时**告警列出**（不静默）。需要 shell 通道也覆盖就用 `shell: deny`。 |
+| **DSH 沙箱目前无法表达「按路径拒绝」** | 沙箱策略词表只有 `mode` + 一个 `workspaceRoot` + 可选 `sessionId`，**没有 deny 列表**（`packages/sandbox/sandbox/src/index.ts:40-73`）。所以「把 shell/workflow 交给 sandbox executor」这条路当前**无处可交**；`shell: scan` 仍是该通道唯一的覆盖，且明确是尽力而为。这是待 DSH 上游补齐的能力。 |
 
-**已知的规则边界**：UNC 路径（`\\server\share\x`）会被归一成 `/server/share/x`，可能与同名 POSIX 路径混淆；POSIX 下 `/` 不能作为根规则（Windows 的 `C:/` 可以）。
+**已知的规则边界**：UNC 路径与 POSIX 路径不再混淆（Windows 路径模型已重建：`\\?\` / `\\.\` 归一、`C:foo` 判为不可判定并 fail-safe、ADS 折叠为同一资源、尾部点空格按 Win32 词法语义）；但 **8.3 短名、junction 与 ADS 的真实身份**只能由 `ctx.fs.resolve()` 的规范化 pass 识别，纯字符串层做不到，已用测试记录边界。POSIX 下 `/` 不能作为根规则（Windows 的 `C:/` 可以）。
 
 ## 出问题时
 
