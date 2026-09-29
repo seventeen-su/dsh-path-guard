@@ -108,6 +108,27 @@ export function installSourceDenialText({ target, why }) {
 }
 
 /**
+ * The refusal for an unmodelled tool whose arguments carry a path-shaped value
+ * (or were nested too deeply to inspect).
+ * @param {{toolName: string, reason: string}} input - the tool and the finding.
+ * @returns {string} the model-facing reason.
+ */
+export function unknownToolDenialText({ toolName, reason }) {
+  return [
+    `访问被拒绝：工具 \`${toolName}\` 不在 dsh-path-guard 的已知工具表里，而它的参数里出现了路径形态的取值。`,
+    '',
+    `- 判定依据：${reason}`,
+    '',
+    '插件对没有建模的工具采取 fail-closed：**只要参数的取值看起来是路径**，就无法排除它在读写受保护位置，',
+    '因此拒绝。判据是「取值形态」而不是「参数名」——参数名叫 `path` 但取值是 `asc` 这类不会触发拒绝，',
+    '否则 MIME 类型和枚举值会被大面积误拦。',
+    '',
+    '如果你确实需要这个工具，请向用户说明它的用途，请他在「设置 → 路径守卫」里为该路径调整规则；',
+    '若这个工具本身不访问文件系统，请把工具名告知用户，由他补充到插件的建模表里。',
+  ].join('\n')
+}
+
+/**
  * The refusal for a surface the plugin cannot fence at all.
  * @param {{toolName: string}} input - the tool identity.
  * @returns {string} the model-facing reason.

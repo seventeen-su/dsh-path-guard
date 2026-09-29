@@ -436,10 +436,14 @@ function resolveKnown(spec, args) {
  * Walk an unmodelled tool's arguments and collect the resources the heuristics
  * can see, plus whether any argument is an opaque program.
  * @param {unknown} args - the parsed tool arguments.
- * @returns {{resources: Array<object>, opaque: boolean, truncated: boolean}} what was found.
+ * @returns {{resources: Array<object>, actionable: Array<object>, noted: Array<object>, opaque: boolean, truncated: boolean}} what was found.
  */
 function scanUnknownArgs(args) {
   const resources = []
+  /** Values whose SHAPE is a path: real evidence, safe to refuse on. */
+  const actionable = []
+  /** Values collected on the field-NAME leg alone: reported, never a ground to refuse. */
+  const noted = []
   const seen = new WeakSet()
   let opaque = false
   let truncated = false
@@ -459,12 +463,20 @@ function scanUnknownArgs(args) {
     const trimmed = raw.trim()
     if (trimmed === '') return
     const named = looksLikePathName(key)
+    const valueShaped = looksLikePathValue(trimmed)
     if (!named && looksLikeProgramField(key, trimmed)) opaque = true
-    if (!named && !looksLikePathValue(trimmed)) return
+    if (!named && !valueShaped) return
     // The stored value is trimmed: leading/trailing blanks are not part of a
     // resource identity, and keeping them would let ` C:/secrets ` be judged as
     // a cwd-relative path while the tool itself reads the trimmed one.
-    resources.push({ value: trimmed, capability: inferCapability(key), field })
+    const resource = { value: trimmed, capability: inferCapability(key), field }
+    resources.push(resource)
+    // WHICH leg matched is what the caller needs, so it is kept OUT of the
+    // resource shape (that stays `{value, capability, field}`) and reported as
+    // two lists instead. Separating them inside the resource objects would let a
+    // consumer treat a name-leg match as evidence, and `{dir:'asc'}` would then
+    // deny every MIME type and enum value on unmodelled tools.
+    ;(valueShaped ? actionable : noted).push(resource)
   }
 
   /**
@@ -498,7 +510,7 @@ function scanUnknownArgs(args) {
   }
 
   walk(args, '', '', 0)
-  return { resources, opaque, truncated }
+  return { resources, actionable, noted, opaque, truncated }
 }
 
 /**
@@ -506,7 +518,7 @@ function scanUnknownArgs(args) {
  * one. Never throws for non-object arguments.
  * @param {string} toolName - the model-facing tool name.
  * @param {unknown} args - the parsed, deep-frozen tool arguments.
- * @returns {{known: boolean, capability: string, resources: Array<{value: string, capability: string, field: string}>, opaque: boolean, reason?: string}} the resolution.
+ * @returns {{known: boolean, capability: string, resources: Array<{value: string, capability: string, field: string, matched?: string}>, actionable?: Array<object>, opaque: boolean, reason?: string, note?: string}} the resolution. `reason` present means the call MUST be refused; `note` is informational only.
  */
 export function resolveResources(toolName, args) {
   const name = typeof toolName === 'string' ? toolName : ''
@@ -518,7 +530,7 @@ export function resolveResources(toolName, args) {
   const spec = KNOWN_TOOLS[name]
   if (spec !== undefined) return resolveKnown(spec, args)
 
-  const { resources, opaque, truncated } = scanUnknownArgs(args)
+  const { resources, actionable, noted, opaque, truncated } = scanUnknownArgs(args)
   const capabilities = resources.map(resource => resource.capability)
   if (opaque) capabilities.push(CAPABILITY.EXECUTE)
 
@@ -526,18 +538,24 @@ export function resolveResources(toolName, args) {
     known: false,
     capability: strictestCapability(capabilities) ?? CAPABILITY.WRITE,
     resources,
+    actionable,
     opaque,
   }
+  const fieldsOf = list => [...new Set(list.map(resource => resource.field))].join(', ')
 
   // The caller needs the grounds for a fail-closed decision, not just the list.
-  if (resources.length > 0) {
-    const fields = [...new Set(resources.map(resource => resource.field))].join(', ')
-    result.reason = `工具 \`${name}\` 未被建模，但参数 ${fields} 疑似路径；按最严能力「${result.capability}」处理（fail-closed）。`
+  if (actionable.length > 0) {
+    result.reason = `工具 \`${name}\` 未被建模，但参数 ${fieldsOf(actionable)} 的取值形态是路径；`
+      + `按最严能力「${result.capability}」处理（fail-closed）。`
     if (truncated) {
       result.reason += ` 另有参数嵌套超过 ${MAX_ARG_DEPTH} 层，未能确认其中是否含路径。`
     }
   } else if (truncated) {
     result.reason = `工具 \`${name}\` 未被建模，且参数嵌套超过 ${MAX_ARG_DEPTH} 层，无法确认其中是否含路径（fail-closed）。`
+  }
+  if (noted.length > 0) {
+    result.note = `工具 \`${name}\` 未被建模，参数 ${fieldsOf(noted)} 的名字像路径字段但取值不像路径；`
+      + '不据此拒绝（否则 MIME 类型、枚举值会被大面积误拦）。'
   }
 
   return result

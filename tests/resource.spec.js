@@ -232,8 +232,26 @@ test('4. unknown + { query: "hello" } reports nothing (ordinary strings are not 
     known: false,
     capability: CAPABILITY.WRITE,
     resources: [],
+    // Lead extension: the two legs are reported separately so that a wiring
+    // mistake cannot treat a path-shaped FIELD NAME as evidence. See test 4b.
+    actionable: [],
     opaque: false,
   })
+})
+
+test('4b. a path-shaped field NAME alone never yields a fail-closed reason', () => {
+  // The over-blocking trap from docs/ARCHITECTURE.md §2.2.1: `{dir:'asc'}` matches
+  // the name leg, and denying on that would block MIME types (`text/html`) and
+  // enum values across every unmodelled tool. Only a path-shaped VALUE may deny.
+  const byName = resolveResources('third_party_tool', deepFreeze({ dir: 'asc' }))
+  assert.equal(byName.reason, undefined, 'a name-leg match must not be grounds for refusal')
+  assert.deepEqual(byName.actionable, [])
+  assert.equal(byName.resources.length, 1, 'it is still reported')
+  assert.ok(byName.note !== undefined, 'and explained, so the decision is auditable')
+
+  const byValue = resolveResources('third_party_tool', deepFreeze({ dir: 'D:/secrets' }))
+  assert.ok(byValue.reason !== undefined, 'a path-shaped value is grounds for refusal')
+  assert.equal(byValue.actionable.length, 1)
 })
 
 test('5. unknown + { target: "D:/a/b" } falls back to the strictest capability', () => {

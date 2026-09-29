@@ -43,12 +43,15 @@ import {
   redactGrepValue,
 } from './redact.js'
 import {
-  PATH_TOOLS,
+  KNOWN_TOOLS,
+  isGoverned,
+  policyAccessFor,
+  resolveResources,
+} from './resource.js'
+import {
   SHELL_TOOLS,
-  collectPaths,
   isExoticTool,
   isScriptTool,
-  opForCommand,
   scriptOf,
 } from './tool-fields.js'
 import {
@@ -59,6 +62,7 @@ import {
   redactionBlockedText,
   selfDenialText,
   shellDenialText,
+  unknownToolDenialText,
 } from './deny.js'
 import { buildNeedles, commandOf, redactTextBlocks, scanCommand, unscannablePatterns } from './scan.js'
 import { createNotifier } from './notify.js'
@@ -288,7 +292,13 @@ export function apply(ctx, config) {
   }
 
   /** Whether this plugin is the component responsible for judging a tool call. */
-  const governs = (toolName) => PATH_TOOLS[toolName] !== undefined
+  /**
+   * Whether a call is this plugin's business — and therefore whether an internal
+   * error must fail closed. Delegates to the resource layer, which knows the
+   * modelled tools, the opaque ones, the exotic ones, and the name shapes that
+   * mean "this could touch a filesystem".
+   */
+  const governs = toolName => isGoverned(toolName)
     || SHELL_TOOLS.has(toolName)
     || isScriptTool(toolName)
     || isExoticTool(toolName)
@@ -516,23 +526,60 @@ export function apply(ctx, config) {
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
    * @returns {Promise<string | undefined>} a denial reason, or undefined to allow.
    */
+  /**
+   * Judge one call's resources.
+   *
+   * This used to consult a static `PATH_TOOLS` table, so any tool not in it fell
+   * through to `undefined` — i.e. ALLOW. Since DSH registers tools dynamically
+   * (third-party, MCP), that made the security model "I recognise this tool → I
+   * can judge it; I don't → allow", which is exactly backwards. It now resolves
+   * the call into resources first and decides on those.
+   *
+   * Two deliberate limits, both from `docs/ARCHITECTURE.md` §2.2.1:
+   *   - an unmodelled tool is refused only when a path-shaped VALUE appears
+   *     (`result.reason`); a path-shaped FIELD NAME alone (`{dir:'asc'}`) must
+   *     not deny, or MIME types and enum values get blocked everywhere;
+   *   - an opaque tool (shell/script) yields no resources here — the scan pass in
+   *     the synchronous guard owns that channel.
+   * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
+   * @returns {Promise<string | undefined>} a denial reason, or undefined to allow.
+   */
   const evaluatePaths = async (exec) => {
-    const spec = PATH_TOOLS[exec.name]
-    if (spec === undefined) return undefined
     const args = exec.arguments
     const workspace = exec.agent?.session.header.cwd
-    for (const entry of spec.paths) {
-      const required = entry.op === 'by-command' ? opForCommand(args) : entry.op
-      const values = collectPaths(args, entry)
-      if (entry.root === true && values.length === 0 && typeof workspace === 'string') {
-        // A search tool without `path` walks the session workspace; check that root.
-        values.push(workspace)
-      }
-      for (const value of values) {
-        const hit = await checkPath(exec, value, required)
+    const resolved = resolveResources(exec.name, args)
+
+    if (resolved.known) {
+      if (resolved.opaque) return undefined
+      for (const resource of resolved.resources) {
+        const hit = await checkPath(exec, resource.value, policyAccessFor(resource.capability))
         if (hit !== undefined) return hit
       }
+      // A search tool without `path` walks the session workspace; check that root.
+      if (resolved.resources.length === 0 && typeof workspace === 'string') {
+        for (const field of KNOWN_TOOLS[exec.name]?.paths ?? []) {
+          if (field.root !== true) continue
+          const hit = await checkPath(exec, workspace, policyAccessFor(field.capability))
+          if (hit !== undefined) return hit
+        }
+      }
+      return undefined
     }
+
+    // Unmodelled tool. `reason` is set only when a VALUE looked like a path, or
+    // when the arguments were nested past the inspection depth — both mean this
+    // plugin cannot vouch for the call.
+    //
+    // `plugin_manager` is excluded first: its `target` IS a path by design (an
+    // install source), so the generic rule would refuse every install and shadow
+    // `evaluateLocalInstall()`, the layer that actually inspects a local bundle
+    // and makes installing one safe. Self-protection owns that tool.
+    if (exec.name === 'plugin_manager') return undefined
+    if (resolved.reason !== undefined) {
+      if (resolved.note !== undefined) ctx.logger.debug('path-guard: %s', resolved.note)
+      return unknownToolDenialText({ toolName: exec.name, reason: resolved.reason })
+    }
+    if (resolved.note !== undefined) ctx.logger.debug('path-guard: %s', resolved.note)
     return undefined
   }
 
