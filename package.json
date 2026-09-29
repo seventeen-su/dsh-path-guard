@@ -1,6 +1,6 @@
 {
   "name": "dsh-path-guard",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "Path-level access control for AI file access, effective even under danger-full-access.",

@@ -436,15 +436,32 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
   /**
    * Rules that generate shell-scan needles.
    *
-   * `write`-level rules are skipped: the policy already grants full access
-   * there, so mentioning such a path in a command is not a violation — refusing
-   * `cd D:/proj && npm test` would contradict the user's own `write` rule and
-   * make the plugin unusable for the workspace it is meant to allow.
+   * ONLY the tiers that FORBID READING may become needles: `none` (invisible) and
+   * `list` (names visible, contents not). Everything else is excluded, each for
+   * its own reason:
+   *
+   *   - `write` grants full access, so mentioning the path in a command is not a
+   *     violation — refusing `cd D:/proj && npm test` would contradict the user's
+   *     own rule and make the plugin unusable for the workspace it exists to allow.
+   *   - `read` GRANTS reading, and the scanner cannot tell a read from a write
+   *     inside an opaque command string. Treating a mention as a violation denied
+   *     exactly what the rule allows: `read` on the profile's package.json
+   *     returned the whole file, while `pwsh` printing that same path lost its
+   *     entire output. The write side is covered by the file tools and by the
+   *     authoritative fs-intent layer, which see the real target.
+   *   - `allow` is an EXEMPTION — `permits()` returns true for it unconditionally.
+   *     The old `access !== 'write'` test kept it, so EXEMPTING a path made the
+   *     plugin reach FURTHER. A rule that points the wrong way is worse than a
+   *     missing one, because it silently punishes the user for configuring it.
+   *
+   * The same filter applies to the self-protection rules: they are `read` tier on
+   * purpose (readable, not writable), so their paths must not be needles either.
    */
+  const SCAN_TIERS = ['none', 'list']
   const scanRules = () => [
-    ...rulesOf().filter(rule => rule === null || typeof rule !== 'object' || (rule as { access?: unknown }).access !== 'write'),
+    ...rulesOf(),
     ...selfRulesFor(),
-  ]
+  ].filter(rule => rule !== null && typeof rule === 'object' && SCAN_TIERS.includes(String((rule as { access?: unknown }).access)))
 
   /**
    * Build scan needles for the current rules and the calling session.
@@ -463,7 +480,16 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
    * modelled tools, the opaque ones, the exotic ones, and the name shapes that
    * mean "this could touch a filesystem".
    */
-  const governs = (toolName: string) => isGoverned(toolName)
+  /**
+   * Whether an internal error must fail CLOSED for this tool.
+   *
+   * A trusted tool is never this plugin's business, so a bug of ours must not
+   * take it away. `isGoverned()` alone cannot express that: it judges by name
+   * shape, and a name like `notes_files` looks filesystem-ish even when the user
+   * has explicitly trusted the whole plugin. Trust therefore has to be consulted
+   * HERE, at the one place the fail-closed decision is made.
+   */
+  const governs = (toolName: string) => !isTrustedTool(toolName) && isGoverned(toolName)
     || SHELL_TOOLS.has(toolName)
     || isScriptTool(toolName)
     || isExoticTool(toolName)
@@ -710,6 +736,10 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
    * @returns {Promise<DenialRecord | undefined>} a denial record, or undefined to allow.
    */
   const evaluatePaths = async (exec: ToolExecution): Promise<DenialRecord | undefined> => {
+    // Trust is consulted before anything else, so this pass cannot refuse a tool
+    // the user has trusted. Self-protection is the one axis trust must not defeat
+    // (see the synchronous guard): `plugin_manager` keeps its own handling below.
+    if (exec.name !== 'plugin_manager' && isTrustedTool(exec.name)) return undefined
     const args = exec.arguments
     const workspace = exec.agent?.session.header.cwd
     const resolved = resolveResources(exec.name, args)
@@ -995,14 +1025,27 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
   ctx.tools!.guard((exec: ToolExecution) => {
     try {
       if (read('enabled') !== true) return undefined
+      // Trust is consulted FIRST, so `trustedTools` really does skip every
+      // judgement this plugin makes — including `exoticTools: deny` and the shell
+      // scan. Checking it only in the unmodelled branch (as an earlier version
+      // did) left the promise in config.ts unfulfilled: `trustedTools: ['pwsh']`
+      // looked accepted and changed nothing, because the shell branch below never
+      // asked.
+      //
+      // ONE exception, and it is deliberate: self-protection outranks trust. A
+      // trust entry is a statement about a tool's FILE ACCESS; letting it defeat
+      // the guard's own integrity would let a single config line hand the AI the
+      // ability to disable the plugin.
+      const selfOwned = read('selfProtection') === true && exec.name === 'plugin_manager'
+      if (!selfOwned && isTrustedTool(exec.name)) return undefined
       let verdict: (DenialHit & { kind: string }) | undefined
-      if (read('exoticTools') === 'deny' && isExoticTool(exec.name)) {
-        verdict = { reason: exoticDenialText({ toolName: exec.name }), kind: 'exotic', target: exec.name }
-      } else if (read('selfProtection') === true && exec.name === 'plugin_manager') {
+      if (selfOwned) {
         const reason = selfTargetVerdict(exec.arguments)
         verdict = reason === undefined
           ? undefined
           : { reason, kind: 'self', target: String(exec.arguments?.target ?? '') }
+      } else if (read('exoticTools') === 'deny' && isExoticTool(exec.name)) {
+        verdict = { reason: exoticDenialText({ toolName: exec.name }), kind: 'exotic', target: exec.name }
       } else if (SHELL_TOOLS.has(exec.name) || isScriptTool(exec.name)) {
         const opaque = evaluateOpaque(exec)
         verdict = opaque === undefined ? undefined : { ...opaque, kind: 'shell' }
@@ -1092,6 +1135,12 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
   ctx.on('tools/post-execute', async (exec: ToolExecution, result: Record<string, unknown>, next: () => unknown) => {
     try {
       if (read('enabled') !== true) return next()
+      // A trusted tool skips the output filter too. Without this check the
+      // promise in config.ts ("trust skips every judgement") was silently false
+      // for exactly the tools people most want to trust: `trustedTools: ['pwsh']`
+      // was accepted, changed nothing, and the user's shell output was still
+      // withheld while the config said otherwise.
+      if (isTrustedTool(exec.name)) return next()
       if (result.isError === true) return next()
 
       // Shell output. The same substring test as the command scan, so it

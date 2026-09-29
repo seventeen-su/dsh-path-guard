@@ -413,11 +413,22 @@ test('self-protection resolves the profile from profileContext, not just the env
     apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
     assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: patch } })).kind, 'allow')
     assert.equal((await preExecute(ctx, { name: 'write', arguments: { file_path: patch, content: '' } })).kind, 'deny')
-    // The shell scan must see it too: glob/pwsh never call ctx.fs, so a lexical
-    // needle is all that stands between the model and the profile patch.
-    assert.match(
-      ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${patch}'` } })!,
-      /访问被拒绝/,
+    // The shell scan deliberately does NOT cover this path any more. The profile
+    // patch is a `read`-tier self-protection rule — readable on purpose — and the
+    // scanner cannot tell a read from a write inside an opaque command, so making
+    // it a needle denied exactly what the tier allows. That was a real false
+    // positive: `read` returned the profile's package.json in full while `pwsh`
+    // printing the same path lost its whole output.
+    //
+    // The trade-off, stated plainly: a shell command that WRITES to the profile
+    // patch is no longer caught by the scanner. Writes through the file tools are
+    // still denied (above), and writes through `ctx.fs` hit the authoritative
+    // fs-intent layer, which sees the resolved target. An opaque shell write was
+    // never fenceable here in the first place — see the README's shell row.
+    assert.equal(
+      ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${patch}'` } }),
+      undefined,
+      'a read-tier path, including a self-protection one, is not a shell-scan needle',
     )
   } finally {
     if (previous !== undefined) process.env.DSH_PROFILE_DIR = previous
@@ -792,20 +803,30 @@ test('a JSON-escaped Windows path is still detected in an opaque program', () =>
   assert.match(ctx.guards[0]!({ name: 'workflow', arguments: { script } })!, /访问被拒绝/)
 })
 
-test('V-1: shell output blocks mentioning a protected path are withheld', async () => {
+test('V-1: only the output LINES that mention a protected path are withheld', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'scan', selfProtection: false })
   const handler = ctx.listeners.get('tools/post-execute')![0]!
   const passthrough = { kind: 'accept' }
   const target = join(tmpdir(), 'pg-secrets', 'k.txt')
 
+  // Redaction is per LINE. Replacing the whole block meant one mention — often a
+  // single path the command printed itself — took every unrelated line with it
+  // and left the tool result useless for anything else.
   const leaked = await handler(
     { name: 'pwsh', arguments: {} },
-    { isError: false, content: [{ type: 'text', text: `-----BEGIN KEY-----\n${target}\n` }] },
+    { isError: false, content: [{ type: 'text', text: `HARMLESS-LINE-1\n${target}\nHARMLESS-LINE-2` }] },
     async () => passthrough,
   ) as PostDecision
   assert.equal(leaked.kind, 'accept')
-  assert.ok(!JSON.stringify(leaked.content).includes('BEGIN KEY'), 'the block must not survive')
+  const rendered = JSON.stringify(leaked.content)
+  assert.ok(!rendered.includes(target), 'the protected path must not survive')
+  assert.ok(rendered.includes('HARMLESS-LINE-1'), 'an unrelated line BEFORE the hit must survive')
+  assert.ok(rendered.includes('HARMLESS-LINE-2'), 'an unrelated line AFTER the hit must survive')
+  assert.ok(rendered.includes('已扣留'), 'the withheld line is replaced by a visible marker')
+
+  // The marker must not quote the path it withheld: the needle IS the path.
+  assert.ok(!rendered.includes('pg-secrets'), 'the marker must not leak the path it withheld')
 
   const clean = await handler(
     { name: 'pwsh', arguments: {} },
@@ -826,8 +847,8 @@ test('V-3: defaultAccess != allow with no rules refuses the shell instead of ope
   assert.equal(lax.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), undefined)
 })
 
-test('V-4: shell scanning skips write-level rules but keeps the stricter ones', () => {
-  const project = join(tmpdir(), 'pg-proj')
+test('V-4: only the tiers that FORBID reading become shell-scan needles', () => {
+  const base = join(tmpdir(), 'pg-tiers')
   const ctx = fakeCtx()
   apply(ctx, {
     enabled: true,
@@ -835,15 +856,41 @@ test('V-4: shell scanning skips write-level rules but keeps the stricter ones', 
     shell: 'scan',
     selfProtection: false,
     rules: [
-      { path: project, access: 'write', note: '' },
-      { path: join(HOME, '.ssh'), access: 'list', note: '' },
+      { path: join(base, 'none'), access: 'none', note: '' },
+      { path: join(base, 'list'), access: 'list', note: '' },
+      { path: join(base, 'read'), access: 'read', note: '' },
+      { path: join(base, 'write'), access: 'write', note: '' },
     ],
   })
   const guard = ctx.guards[0]!
-  // `write` already grants everything, so mentioning the path is not a violation.
-  assert.equal(guard({ name: 'pwsh', arguments: { command: `cd '${project}'; npm test` } }), undefined)
-  // `list` still refuses: the shell cannot be judged per-path, and it would leak content.
-  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(HOME, '.ssh', 'id_rsa')}'` } })!, /访问被拒绝/)
+  const refuses = (name: string) =>
+    guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(base, name)}'` } }) !== undefined
+
+  assert.equal(refuses('none'), true, '`none` hides even the names, so a mention is a violation')
+  assert.equal(refuses('list'), true, '`list` shows names but not contents, so reading is still a violation')
+
+  // The regression this pins. `read` GRANTS reading, and the scanner cannot tell a
+  // read from a write inside an opaque command string, so treating a mention as a
+  // violation denied exactly what the rule allows: `read` on the profile's
+  // package.json returned the whole file while `pwsh` printing that same path lost
+  // its entire output. This also covers the self-protection rules, which are
+  // `read` tier on purpose.
+  assert.equal(refuses('read'), false, '`read` grants reading -> a mention is legitimate')
+
+  // `write` already granted everything under the old filter; it stays out.
+  assert.equal(refuses('write'), false, '`write` grants everything -> a mention is legitimate')
+
+  // `allow` is an exemption, and the OLD test was a subtraction
+  // (`access !== 'write'`), so had an `allow` value reached the rule list it would
+  // have become a needle — exempting a path would have made the plugin reach
+  // FURTHER. It cannot arrive through the schema (`rule.access` unions
+  // none/list/read/write; only `defaultAccess` accepts `allow`), which is exactly
+  // why the filter is now an explicit allow-list of forbidding tiers rather than a
+  // subtraction that assumes what the rest of the values mean.
+  assert.equal(
+    guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(base, 'allow')}'` } }),
+    undefined,
+  )
 })
 
 test('V-7: a malformed rule list fails closed instead of silently disabling the policy', async () => {
@@ -853,6 +900,98 @@ test('V-7: a malformed rule list fails closed instead of silently disabling the 
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
   assert.equal(decision.kind, 'deny')
   assert.match(decision.reason!, /内部出错/)
+})
+
+test('trust reaches every judgement, not just the unmodelled branch', async () => {
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+  const ctx = fakeCtx()
+  apply(ctx, {
+    enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false,
+    exoticTools: 'deny',
+    trustedTools: [{ match: 'pwsh', note: '' }, { match: 'read', note: '' }],
+  })
+
+  // 1. The synchronous guard, which owns BOTH the shell scan and
+  //    `exoticTools: deny`. Consulting the trust table only in the unmodelled
+  //    branch (as an earlier version did) left `trustedTools: ['pwsh']` accepted
+  //    and completely inert: the config promised a skip that never happened, and
+  //    the user's shell output was still withheld while the page said otherwise.
+  assert.equal(
+    ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${target}'` } }),
+    undefined,
+    'a trusted shell tool is not scanned',
+  )
+
+  // 2. Path judgement.
+  assert.equal(
+    (await preExecute(ctx, { name: 'read', arguments: { file_path: target } })).kind,
+    'allow',
+    'a trusted tool is not path-judged',
+  )
+  // Negative control: the same call through an UNTRUSTED modelled tool is denied,
+  // so the assertion above is measuring trust and not a broken fixture.
+  assert.equal(
+    (await preExecute(ctx, { name: 'write', arguments: { file_path: target, content: '' } })).kind,
+    'deny',
+  )
+
+  // 3. The L4 output filter. This is the half that silently did nothing.
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
+  const passthrough = { kind: 'accept' }
+  assert.equal(
+    await handler(
+      { name: 'pwsh', arguments: {} },
+      { isError: false, content: [{ type: 'text', text: `line with ${target} in it` }] },
+      async () => passthrough,
+    ),
+    passthrough,
+    'a trusted tool skips the output filter too',
+  )
+})
+
+test('a trusted tool is judged before the policy, so a broken config cannot deny it', async () => {
+  // The fail-closed path asks `governs()`, which judges by NAME SHAPE —
+  // `PATH_NAME_TOKENS` contains `files`, so `notes_files` looks filesystem-ish and
+  // a plugin bug used to deny it even when the whole prefix was trusted. Making
+  // `governs()` trust-aware is the guarantee; this test pins its reachable half.
+  const target = join(tmpdir(), 'pg-secrets', 'k.txt')
+  const broken = Object.freeze({ get: () => 'not-an-array', [VOLATILE_WRITE]: () => {} })
+
+  const trusted = fakeCtx()
+  apply(trusted, {
+    enabled: true, rules: broken, defaultAccess: 'allow', selfProtection: false,
+    trustedTools: [{ match: 'notes_*', note: '' }],
+  })
+  assert.equal(
+    (await preExecute(trusted, { name: 'notes_files', arguments: { path: target } })).kind,
+    'allow',
+    'trust short-circuits before the policy is read, so the broken config cannot fail it closed',
+  )
+
+  // The same call, untrusted, DOES fail closed — which is the correct behaviour
+  // for a tool this plugin governs.
+  const untrusted = fakeCtx()
+  apply(untrusted, { enabled: true, rules: broken, defaultAccess: 'allow', selfProtection: false })
+  assert.equal(
+    (await preExecute(untrusted, { name: 'notes_files', arguments: { path: target } })).kind,
+    'deny',
+  )
+})
+
+test('V-11: a trusted tool cannot switch off self-protection', () => {
+  // Trust is a statement about a tool's FILE ACCESS. Letting it defeat the guard's
+  // own integrity would mean one config line hands the AI the ability to disable
+  // the plugin, so self-protection deliberately outranks trust.
+  const ctx = fakeCtx({ services: { profileContext: { patchPath: join(tmpdir(), 'pg-profile3', 'cordis.patch.yml') } } })
+  apply(ctx, {
+    enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true,
+    trustedTools: [{ match: 'plugin_manager', note: '' }, { match: 'pwsh', note: '' }],
+  })
+  assert.match(
+    ctx.guards[0]!({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'dsh-path-guard' } })!,
+    /自我保护/,
+    'trusting plugin_manager must not unlock the composition',
+  )
 })
 
 test('V-10: an internal failure does not take away tools this plugin does not govern', async () => {

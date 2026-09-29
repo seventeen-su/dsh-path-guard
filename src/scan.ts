@@ -201,17 +201,25 @@ export function commandOf(args: unknown): string | undefined {
   return undefined
 }
 
-/** What a withheld shell output block is replaced with. */
-const WITHHELD = '[dsh-path-guard] 该段输出提到了受保护路径，已整体扣留。'
-  + '（shell 输出无法被逐行判定，因此宁可整段不给）'
+/** What one withheld output LINE is replaced with. */
+const WITHHELD_LINE = '[dsh-path-guard] 本行提到了受保护路径，已扣留。'
 
 /**
- * Withhold output blocks that mention a protected path.
+ * Withhold the output LINES that mention a protected path.
  *
  * Only `text` blocks are inspected; anything else is passed through untouched.
- * A matching block is replaced wholesale rather than edited: command output has
- * no structure the plugin can rely on, so a partial redaction would be
- * guesswork, and a guess that keeps one line of a private key is worthless.
+ *
+ * Redaction is per LINE. Replacing the whole block meant one mention — often a
+ * single path the command printed itself — took every unrelated line down with
+ * it, and the tool result stopped being usable for anything else.
+ *
+ * The marker deliberately does NOT quote the path: the needle IS the protected
+ * path, so naming it in the replacement would leak precisely what is withheld.
+ *
+ * Known limit: a path the terminal WRAPS across two lines, or one the emitting
+ * program splits with a newline of its own, is not matched line-wise. The old
+ * whole-block test would have caught that; per-line redaction trades it away for
+ * output that stays usable.
  *
  * @param {unknown} content - the tool result's content blocks.
  * @param {Array<{needle: string, pattern: string, access: string}>} needles - from {@link buildNeedles}.
@@ -224,10 +232,15 @@ export function redactTextBlocks(content: unknown, needles: Needle[], windows: b
   const next = content.map((block) => {
     if (block === null || typeof block !== 'object') return block
     if (block.type !== 'text' || typeof block.text !== 'string') return block
-    const hit = scanCommand(block.text, needles, windows)
-    if (hit === undefined) return block
+    let blockChanged = false
+    const kept = (block.text as string).split('\n').map((line: string) => {
+      if (scanCommand(line, needles, windows) === undefined) return line
+      blockChanged = true
+      return WITHHELD_LINE
+    })
+    if (!blockChanged) return block
     changed = true
-    return { ...block, text: WITHHELD }
+    return { ...block, text: kept.join('\n') }
   })
   return changed ? { changed: true, content: next } : { changed: false, content }
 }
