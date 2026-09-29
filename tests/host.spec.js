@@ -15,7 +15,7 @@ import { join } from 'node:path'
 
 import { apply, Config, inject, name, unwrap } from '../src/index.js'
 import { opForCommand, collectPaths, isExoticTool } from '../src/tool-fields.js'
-import { buildNeedles, scanCommand, commandOf } from '../src/scan.js'
+import { buildNeedles, scanCommand, commandOf, literalNeedlePrefix, unscannablePatterns } from '../src/scan.js'
 
 // `~` rules are expanded with the real home directory by the plugin, so the
 // tests must use the same anchor or they would exercise an unmatched rule.
@@ -458,6 +458,44 @@ test('tool-fields helpers behave', () => {
   assert.equal(commandOf({ command: 'x' }), 'x')
   assert.equal(commandOf({ text: 'y' }), 'y')
   assert.equal(commandOf({}), undefined)
+})
+
+test('a trailing-glob rule still produces a usable shell needle', () => {
+  // Regression: expanding the pattern as written put a literal `**` in the
+  // needle, which no command ever contains — so `~/.ssh/**` was silently
+  // unenforced on every shell spelling while still counting as "scannable".
+  for (const pattern of ['~/.ssh', '~/.ssh/**', '~/.ssh/*']) {
+    const needles = buildNeedles([{ path: pattern, access: 'none' }], { home: HOME, windows: true })
+    assert.ok(needles.length > 0, `${pattern} must produce needles`)
+    assert.ok(scanCommand(`cat ${join(HOME, '.ssh', 'id_rsa')}`, needles, true), `${pattern} must catch the absolute form`)
+    assert.ok(scanCommand('cat ~/.ssh/id_rsa', needles, true), `${pattern} must catch the ~ form`)
+  }
+})
+
+test('an unreducible pattern is reported instead of silently unenforced', () => {
+  assert.equal(literalNeedlePrefix('~/.ssh/**'), '~/.ssh')
+  assert.equal(literalNeedlePrefix('D:/secrets/*'), 'D:/secrets')
+  // A wildcard inside a segment, or one with a literal tail, has no substring
+  // that means the same thing.
+  assert.equal(literalNeedlePrefix('D:/sec*'), undefined)
+  assert.equal(literalNeedlePrefix('D:/a/*/secret'), undefined)
+  assert.deepEqual(
+    unscannablePatterns([{ path: '~/.ssh/**' }, { path: 'D:/a/*/secret' }]),
+    ['D:/a/*/secret'],
+  )
+
+  const ctx = fakeCtx()
+  apply(ctx, {
+    enabled: true,
+    rules: [{ path: 'D:/a/*/secret', access: 'none' }],
+    defaultAccess: 'allow',
+    shell: 'scan',
+    selfProtection: false,
+  })
+  assert.ok(
+    ctx.logs.some(([level, message]) => level === 'warn' && String(message).includes('cannot be covered')),
+    'an unenforceable-on-shell rule must be reported, not left silent',
+  )
 })
 
 test('the shell scanner finds home spellings and ignores short needles', () => {

@@ -21,6 +21,55 @@ const MIN_NEEDLE = 4
 /** Environment-variable spellings of a home directory, per shell dialect. */
 const HOME_FORMS = ['~', '$HOME', '${HOME}', '$env:USERPROFILE', '%USERPROFILE%']
 
+/** Glob metacharacters that end a literal prefix. */
+const GLOB_META = /[*?[]/
+
+/**
+ * The literal text a rule pattern can be reduced to for substring scanning.
+ *
+ * The scanner matches substrings, so a pattern's WILDCARDS have to be dropped —
+ * a needle containing `**` can never appear in a real command. Only one shape is
+ * reducible without guessing: a trailing wildcard on a segment boundary
+ * (`~/.ssh/**`, `~/.ssh/*`, `D:/secrets/**`), whose literal prefix names exactly
+ * the protected directory.
+ *
+ * Everything else is refused rather than approximated:
+ *   - a wildcard cutting through a segment (`D:/sec` + `*`) has no literal
+ *     prefix that is not simply a longer string than the rule means;
+ *   - a wildcard with a literal tail (`D:/a/<any>/secret`) cannot be expressed
+ *     as a substring at all, and using the head (`D:/a`) would deny every command
+ *     that merely mentions that directory.
+ * Those rules are reported by {@link unscannablePatterns} so the user learns the
+ * scanner does not cover them, instead of believing they are enforced.
+ *
+ * @param {string} pattern - one rule path as written.
+ * @returns {string | undefined} the literal prefix, or undefined when the pattern is not reducible.
+ */
+export function literalNeedlePrefix(pattern) {
+  const at = pattern.search(GLOB_META)
+  if (at === -1) return pattern
+  if (!pattern.endsWith('*')) return undefined
+  const head = pattern.slice(0, at)
+  if (head === '' || !/[\\/]$/.test(head)) return undefined
+  return head.replace(/[\\/]+$/, '')
+}
+
+/**
+ * Rule patterns the substring scanner cannot cover.
+ * @param {Array<{path?: string}>} rules - the configured rules.
+ * @returns {string[]} the patterns that produced no needle for structural reasons.
+ */
+export function unscannablePatterns(rules) {
+  const out = []
+  for (const rule of rules ?? []) {
+    if (rule === null || typeof rule !== 'object') continue
+    const pattern = typeof rule.path === 'string' ? rule.path.trim() : ''
+    if (pattern === '') continue
+    if (literalNeedlePrefix(pattern) === undefined) out.push(pattern)
+  }
+  return out
+}
+
 /**
  * Build the search needles for a rule list.
  * @param {Array<{path?: string, access?: string}>} rules - the configured rules.
@@ -44,7 +93,12 @@ export function buildNeedles(rules, ctx) {
     const pattern = typeof rule.path === 'string' ? rule.path : ''
     if (pattern.trim() === '') continue
     const access = typeof rule.access === 'string' ? rule.access : 'none'
-    const absolute = expandPath(pattern, { home, workspace })
+    // Reduce the pattern to its literal prefix FIRST: expanding `~/.ssh/**`
+    // yields a needle with a literal `**` in it, which no command ever contains,
+    // so the rule would be silently unenforced in every spelling.
+    const literal = literalNeedlePrefix(pattern)
+    if (literal === undefined || literal === '') continue
+    const absolute = expandPath(literal, { home, workspace })
     if (absolute === '') continue
     push(absolute, pattern, access)
     push(absolute.replaceAll('/', '\\'), pattern, access)

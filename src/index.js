@@ -60,7 +60,7 @@ import {
   selfDenialText,
   shellDenialText,
 } from './deny.js'
-import { buildNeedles, commandOf, redactTextBlocks, scanCommand } from './scan.js'
+import { buildNeedles, commandOf, redactTextBlocks, scanCommand, unscannablePatterns } from './scan.js'
 import { createNotifier } from './notify.js'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -364,6 +364,7 @@ export function apply(ctx, config) {
   let cachedExtra = null
   let cachedPolicy = null
   let warnedInvalid = ''
+  let warnedUnscannable = ''
 
   /**
    * The compiled policy, recomputed only when the volatile rule snapshot changes
@@ -383,6 +384,23 @@ export function apply(ctx, config) {
         for (const bad of cachedPolicy.invalid) {
           ctx.logger.warn('path-guard: ignoring rule #%d (%s): %s', bad.index, bad.path ?? '', bad.reason)
         }
+      }
+      // A rule the substring scanner cannot reduce to a literal (a wildcard with
+      // a literal tail, or one cutting through a segment) is simply NOT enforced
+      // on the shell / script channels. Saying so is the difference between a
+      // documented limit and a silent hole — the failure mode this plugin was
+      // already bitten by once.
+      const unscannable = read('shell') === 'off' ? [] : unscannablePatterns([...configured, ...extra])
+      const key = unscannable.join('\u0000')
+      if (unscannable.length > 0 && key !== warnedUnscannable) {
+        warnedUnscannable = key
+        ctx.logger.warn(
+          'path-guard: %d rule(s) cannot be covered by the shell/script text scan (%s);'
+          + ' they stay enforced for tool paths, but use an exact path or a trailing-glob form'
+          + ' (like ~/.ssh/**) if you need them covered there too, or set shell: deny',
+          unscannable.length,
+          unscannable.join(', '),
+        )
       }
     }
     return cachedPolicy
