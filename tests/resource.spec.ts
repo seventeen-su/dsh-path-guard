@@ -15,7 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import * as legacy from '../src/tool-fields.js'
+import * as legacy from '../src/tool-fields.ts'
 import {
   CAPABILITY,
   KNOWN_TOOLS,
@@ -23,12 +23,32 @@ import {
   isGoverned,
   policyAccessFor,
   resolveResources,
-} from '../src/resource.js'
+} from '../src/resource.ts'
+
+/** The legacy field spec as these comparisons read it (src/tool-fields.ts `PATH_TOOLS`). */
+interface FieldSpec {
+  field: string
+  op: string
+  each?: string | undefined
+  root?: boolean | undefined
+}
+
+/** A modelled entry as these comparisons read it (src/resource.ts `KNOWN_TOOLS`). */
+interface ModelledEntry {
+  search?: unknown
+  paths: Array<{
+    field: string
+    each?: string | undefined
+    root?: boolean | undefined
+    byCommand?: boolean | undefined
+    capability?: string | undefined
+  }>
+}
 
 /** Deep-freeze a fixture the way the Harness hands arguments to a tool. */
-function deepFreeze(value) {
+function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
-    for (const entry of Object.values(value)) deepFreeze(entry)
+    for (const entry of Object.values(value as Record<string, unknown>)) deepFreeze(entry)
     Object.freeze(value)
   }
   return value
@@ -39,7 +59,7 @@ function deepFreeze(value) {
  * @param {unknown} args - the tool arguments.
  * @returns {Array<object>} the resolved resources.
  */
-const resourcesOf = args => resolveResources('third_party_tool', deepFreeze(args)).resources
+const resourcesOf = (args: unknown) => resolveResources('third_party_tool', deepFreeze(args)).resources
 
 // ---------------------------------------------------------------------------
 // 1. known tools: mapping and behaviour identical to the legacy table
@@ -96,8 +116,8 @@ test('1e. a search tool with no path yields no resource and keeps its capability
   assert.equal(result.known, true)
   assert.equal(result.capability, CAPABILITY.ENUMERATE)
   assert.deepEqual(result.resources, [])
-  assert.equal(KNOWN_TOOLS.glob.paths[0].root, true)
-  assert.equal(KNOWN_TOOLS.grep.paths[0].root, true)
+  assert.equal(KNOWN_TOOLS.glob.paths[0]!.root, true)
+  assert.equal(KNOWN_TOOLS.grep.paths[0]!.root, true)
 })
 
 test('1f. str_replace_editor splits on command: view reads, everything else writes', () => {
@@ -116,7 +136,7 @@ test('1g. a known tool never carries a fail-closed reason', () => {
 })
 
 test('1h. the known table is byte-identical to the legacy static table', t => {
-  const PATH_TOOLS = legacy.PATH_TOOLS
+  const PATH_TOOLS = legacy.PATH_TOOLS as unknown as Record<string, { paths: FieldSpec[]; search?: unknown }>
   if (PATH_TOOLS === undefined) {
     t.diagnostic('遗留 PATH_TOOLS 已移除，跳过等价校验（上面的硬编码断言仍然生效）')
     return
@@ -134,25 +154,25 @@ test('1h. the known table is byte-identical to the legacy static table', t => {
   }
   assert.deepEqual(Object.keys(KNOWN_TOOLS).sort(), Object.keys(PATH_TOOLS).sort())
   for (const [name, old] of Object.entries(PATH_TOOLS)) {
-    const mine = KNOWN_TOOLS[name]
+    const mine = KNOWN_TOOLS[name] as ModelledEntry
     assert.equal(mine.search, old.search, `${name}.search`)
     assert.equal(mine.paths.length, old.paths.length, `${name}.paths.length`)
     old.paths.forEach((field, index) => {
       const got = mine.paths[index]
-      assert.equal(got.field, field.field, `${name}[${index}].field`)
-      assert.equal(got.each, field.each, `${name}[${index}].each`)
-      assert.equal(got.root, field.root, `${name}[${index}].root`)
-      assert.equal(got.byCommand === true, field.op === 'by-command', `${name}[${index}].byCommand`)
-      assert.equal(got.capability ?? 'by-command', expected[name], `${name}[${index}].capability`)
+      assert.equal(got!.field, field.field, `${name}[${index}].field`)
+      assert.equal(got!.each, field.each, `${name}[${index}].each`)
+      assert.equal(got!.root, field.root, `${name}[${index}].root`)
+      assert.equal(got!.byCommand === true, field.op === 'by-command', `${name}[${index}].byCommand`)
+      assert.equal(got!.capability ?? 'by-command', (expected as Record<string, string>)[name], `${name}[${index}].capability`)
       if (field.op === 'by-command') return
       // The capability vocabulary must project back onto the exact legacy rung.
-      assert.equal(policyAccessFor(got.capability), field.op, `${name}: 能力投影必须回到遗留 op`)
+      assert.equal(policyAccessFor(got!.capability), field.op, `${name}: 能力投影必须回到遗留 op`)
     })
   }
 })
 
 test('1i. modelled values match the legacy collectPaths() exactly', t => {
-  const PATH_TOOLS = legacy.PATH_TOOLS
+  const PATH_TOOLS = legacy.PATH_TOOLS as unknown as Record<string, { paths: FieldSpec[]; search?: unknown }>
   if (PATH_TOOLS === undefined || typeof legacy.collectPaths !== 'function') {
     t.diagnostic('遗留 collectPaths 已移除，跳过')
     return
@@ -165,7 +185,7 @@ test('1i. modelled values match the legacy collectPaths() exactly', t => {
   }
   for (const [name, cases] of Object.entries(samples)) {
     for (const args of cases) {
-      const expected = legacy.collectPaths(args, PATH_TOOLS[name].paths[0])
+      const expected = legacy.collectPaths(args, PATH_TOOLS[name]!.paths[0]!)
       const actual = resolveResources(name, deepFreeze(args)).resources.map(resource => resource.value)
       assert.deepEqual(actual, expected, `${name} ${JSON.stringify(args)}`)
     }
@@ -222,9 +242,9 @@ test('3. unknown + { file_path: "C:/x.txt" } is reported with a fail-closed reas
     { value: 'C:/x.txt', capability: CAPABILITY.WRITE, field: 'file_path' },
   ])
   assert.equal(typeof result.reason, 'string')
-  assert.match(result.reason, /未被建模/)
-  assert.match(result.reason, /file_path/)
-  assert.match(result.reason, /fail-closed/)
+  assert.match(result.reason!, /未被建模/)
+  assert.match(result.reason!, /file_path/)
+  assert.match(result.reason!, /fail-closed/)
 })
 
 test('4. unknown + { query: "hello" } reports nothing (ordinary strings are not paths)', () => {
@@ -251,7 +271,7 @@ test('4b. a path-shaped field NAME alone never yields a fail-closed reason', () 
 
   const byValue = resolveResources('third_party_tool', deepFreeze({ dir: 'D:/secrets' }))
   assert.ok(byValue.reason !== undefined, 'a path-shaped value is grounds for refusal')
-  assert.equal(byValue.actionable.length, 1)
+  assert.equal(byValue.actionable!.length, 1)
 })
 
 test('5. unknown + { target: "D:/a/b" } falls back to the strictest capability', () => {
@@ -316,16 +336,16 @@ test('7d. a non-string tool name is treated as unmodelled, not as a crash', () =
 })
 
 test('7e. a cyclic or absurdly nested argument does not hang', () => {
-  const cyclic = { path: 'C:/x' }
+  const cyclic: { path: string; self?: unknown } = { path: 'C:/x' }
   cyclic.self = cyclic
   const looped = resolveResources('third_party_tool', cyclic)
   assert.deepEqual(looped.resources, [{ value: 'C:/x', capability: CAPABILITY.WRITE, field: 'path' }])
 
-  let deep = { path: 'C:/deep' }
+  let deep: Record<string, unknown> = { path: 'C:/deep' }
   for (let i = 0; i < 20; i += 1) deep = { nested: deep }
   const truncated = resolveResources('third_party_tool', deep)
   assert.deepEqual(truncated.resources, [])
-  assert.match(truncated.reason, /嵌套超过 16 层/)
+  assert.match(truncated.reason!, /嵌套超过 16 层/)
 })
 
 test('7f. deeply frozen arguments are read, never mutated', () => {
@@ -405,8 +425,8 @@ test('H1. absolute / home / env / file-URL value shapes are recognised', () => {
   for (const [value] of cases) {
     const resources = resourcesOf({ location: value })
     assert.equal(resources.length, 1, `${value} 应被识别为路径`)
-    assert.equal(resources[0].value, value)
-    assert.equal(resources[0].capability, CAPABILITY.WRITE, `${value} 无能力线索时按最严`)
+    assert.equal(resources[0]!.value, value)
+    assert.equal(resources[0]!.capability, CAPABILITY.WRITE, `${value} 无能力线索时按最严`)
   }
 })
 
@@ -455,7 +475,7 @@ test('H6. whole-token naming avoids the profile/file trap', () => {
 })
 
 test('H7. capability is inferred from the field name, write > read > list, else WRITE', () => {
-  const cases = [
+  const cases: Array<[string, string, string]> = [
     ['write_path', 'C:/x', CAPABILITY.WRITE],
     ['create_dir', 'C:/x', CAPABILITY.WRITE],
     ['delete_file', 'C:/x', CAPABILITY.WRITE],
@@ -473,7 +493,7 @@ test('H7. capability is inferred from the field name, write > read > list, else 
   for (const [key, value, expected] of cases) {
     const resources = resourcesOf({ [key]: value })
     assert.equal(resources.length, 1, key)
-    assert.equal(resources[0].capability, expected, key)
+    assert.equal(resources[0]!.capability, expected, key)
   }
 })
 

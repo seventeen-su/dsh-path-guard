@@ -8,7 +8,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createFsGuard } from '../src/fs-guard.js';
+import { createFsGuard } from '../src/fs-guard.ts';
+
+/** `createFsGuard` 的依赖包（取自 src 签名，避免手抄漂移）。 */
+type GuardDeps = Parameters<typeof createFsGuard>[0];
+/** 它返回的两个 handler 名：`writeIntent` | `editIntent`。 */
+type GuardHandlerName = keyof ReturnType<typeof createFsGuard>;
 
 // ---------------------------------------------------------------------------
 // 测试替身
@@ -16,7 +21,9 @@ import { createFsGuard } from '../src/fs-guard.js';
 
 /** 与 DSH 的 FsError 同形状：message + code（+ cause）。 */
 class TestFsError extends Error {
-  constructor(message, code, options) {
+  /** 与 DSH 的 `FsError` 一致的结构化错误码（`declare`：只在类型层声明，运行时字段仍由构造函数赋值）。 */
+  declare code: string;
+  constructor(message: string, code: string, options?: ErrorOptions) {
     super(message, options);
     this.name = 'FsError';
     this.code = code;
@@ -30,7 +37,7 @@ const AGENT = { name: 'write', agent: { session: { header: { cwd: 'D:/proj' } } 
 const USER_ACTOR = { source: 'gui', user: true };
 
 /** 两个 handler 的名字，需求 6 要求同一份用例跑两遍。 */
-const HANDLERS = ['writeIntent', 'editIntent'];
+const HANDLERS: readonly GuardHandlerName[] = ['writeIntent', 'editIntent'];
 
 /** 一个普通的已解析目标。 */
 const DISPLAY = 'D:/srv/secret/id_rsa';
@@ -51,10 +58,9 @@ function targetOf(displayPath = DISPLAY, targetKey = KEY) {
  * @param {unknown} value - next() 的解析值。
  * @returns {{next: Function, calls: unknown[][]}} next 与调用记录。
  */
-function makeNext(value = { kind: 'createIfAbsent' }) {
-  /** @type {unknown[][]} */
-  const calls = [];
-  const next = (...args) => {
+function makeNext(value: unknown = { kind: 'createIfAbsent' }) {
+  const calls: unknown[][] = [];
+  const next = (...args: unknown[]) => {
     calls.push(args);
     return Promise.resolve(value);
   };
@@ -66,16 +72,14 @@ function makeNext(value = { kind: 'createIfAbsent' }) {
  * @param {object} [overrides] - 覆盖 decide / actorIsAgent / FsError / logger。
  * @returns {{guard: object, warnings: unknown[][], debugs: unknown[][]}} guard 与日志记录。
  */
-function makeGuard(overrides = {}) {
-  /** @type {unknown[][]} */
-  const warnings = [];
-  /** @type {unknown[][]} */
-  const debugs = [];
+function makeGuard(overrides: Partial<GuardDeps> = {}) {
+  const warnings: unknown[][] = [];
+  const debugs: unknown[][] = [];
   const logger = Object.hasOwn(overrides, 'logger')
     ? overrides.logger
     : {
-      warn: (...args) => warnings.push(args),
-      debug: (...args) => debugs.push(args),
+      warn: (...args: unknown[]) => warnings.push(args),
+      debug: (...args: unknown[]) => debugs.push(args),
     };
   const guard = createFsGuard({
     decide: overrides.decide ?? (() => ({ access: 'write' })),
@@ -92,12 +96,12 @@ function makeGuard(overrides = {}) {
  * @param {string} label - 断言上下文。
  * @returns {Promise<Error & { code: string }>} 捕获到的错误。
  */
-async function rejectsDenied(promise, label) {
-  let caught;
+async function rejectsDenied(promise: Promise<unknown>, label: string) {
+  let caught: (Error & { code: string }) | undefined;
   try {
     await promise;
   } catch (error) {
-    caught = error;
+    caught = error as Error & { code: string };
   }
   assert.ok(caught !== undefined, `${label}: 应当抛错`);
   assert.equal(caught.code, 'FS_SANDBOX_DENIED', `${label}: code 应为 FS_SANDBOX_DENIED`);
@@ -110,7 +114,7 @@ async function rejectsDenied(promise, label) {
  * @param {(name: string) => Promise<void>} run - 场景体。
  * @returns {Promise<void>} 全部完成。
  */
-async function forEachHandler(run) {
+async function forEachHandler(run: (name: GuardHandlerName) => Promise<void>) {
   for (const name of HANDLERS) await run(name);
 }
 
@@ -315,12 +319,13 @@ test('6. writeIntent 与 editIntent 在同一输入矩阵上行为一致', async
     for (const scenario of scenarios) {
       const { guard } = makeGuard({ decide: scenario.decide });
       const { next, calls } = makeNext();
-      let outcome;
+      let outcome: string;
       try {
         await guard[name](targetOf(), scenario.actor, next);
         outcome = `allow/next=${calls.length}`;
       } catch (error) {
-        outcome = `throw/${error.code ?? error.name}/next=${calls.length}`;
+        // 此处故意违反契约：catch 绑定是 unknown；断言的是下游错误的 code/name 原样透传。
+        outcome = `throw/${(error as { code?: string; name?: string }).code ?? (error as { name?: string }).name}/next=${calls.length}`;
       }
       const key = `${scenario.label}`;
       if (outcomes.has(key)) {
@@ -367,11 +372,10 @@ test('7b. fail-closed 消息里也出现 displayPath', async () => {
 
 test('8. targetKey 原样转发给 decide，不被解析，也不出现在错误消息里', async () => {
   await forEachHandler(async (name) => {
-    /** @type {unknown[][]} */
-    const seen = [];
+    const seen: unknown[][] = [];
     const weirdKey = 'weird\u0000key::not-a-path::\\\\?\\C:\\other';
     const { guard } = makeGuard({
-      decide: (...args) => {
+      decide: (...args: unknown[]) => {
         seen.push(args);
         return { access: 'write' };
       },
@@ -381,15 +385,15 @@ test('8. targetKey 原样转发给 decide，不被解析，也不出现在错误
     await guard[name](targetOf(DISPLAY, weirdKey), AGENT, next);
 
     assert.equal(seen.length, 1, `${name}: decide 应被调用一次`);
-    assert.equal(seen[0][0], weirdKey, `${name}: targetKey 必须原样转发`);
-    assert.equal(seen[0][1], DISPLAY, `${name}: 第二个参数必须是 displayPath`);
-    assert.equal(seen[0][2], AGENT, `${name}: 第三个参数必须是 actor`);
+    assert.equal(seen[0]![0], weirdKey, `${name}: targetKey 必须原样转发`);
+    assert.equal(seen[0]![1], DISPLAY, `${name}: 第二个参数必须是 displayPath`);
+    assert.equal(seen[0]![2], AGENT, `${name}: 第三个参数必须是 actor`);
     assert.equal(calls.length, 1);
 
     // 判定只用 displayPath：即使 targetKey 指向别的路径，也按 displayPath 判定。
-    const denySeen = [];
+    const denySeen: unknown[][] = [];
     const denyGuard = makeGuard({
-      decide: (...args) => {
+      decide: (...args: unknown[]) => {
         denySeen.push(args);
         return { access: 'none' };
       },
@@ -399,7 +403,7 @@ test('8. targetKey 原样转发给 decide，不被解析，也不出现在错误
       denyGuard.guard[name](targetOf(DISPLAY, weirdKey), AGENT, denyNext.next),
       name,
     );
-    assert.equal(denySeen[0][1], DISPLAY, `${name}: 判定必须使用 displayPath`);
+    assert.equal(denySeen[0]![1], DISPLAY, `${name}: 判定必须使用 displayPath`);
     assert.ok(!error.message.includes(weirdKey), `${name}: 错误消息不应泄露/回显 targetKey`);
   });
 });
@@ -453,7 +457,8 @@ test('9c. AI 路径上 next 不可调用 → fail-closed 且 warn', async () => 
   await forEachHandler(async (name) => {
     const { guard, warnings } = makeGuard();
 
-    await rejectsDenied(guard[name](targetOf(), AGENT, undefined), name);
+    // 此处故意违反契约：next 整个缺失，断言的是 fail-closed 而不是透传。
+    await rejectsDenied(guard[name](targetOf(), AGENT, undefined as unknown as () => unknown), name);
 
     assert.ok(warnings.length >= 1, `${name}: 必须 logger.warn`);
   });
@@ -508,12 +513,13 @@ test('10b. logger 抛错 / 缺失都不影响判定', async () => {
 });
 
 test('10c. 依赖缺失 / 类型不对 → 构造期抛 TypeError（加载期暴露接线错误）', () => {
-  assert.throws(() => createFsGuard(), TypeError);
-  assert.throws(() => createFsGuard(null), TypeError);
-  assert.throws(() => createFsGuard({ actorIsAgent: () => true, FsError: TestFsError }), TypeError);
-  assert.throws(() => createFsGuard({ decide: () => undefined, FsError: TestFsError }), TypeError);
-  assert.throws(() => createFsGuard({ decide: () => undefined, actorIsAgent: () => true }), TypeError);
-  assert.throws(() => createFsGuard({ decide: 1, actorIsAgent: () => true, FsError: TestFsError }), TypeError);
+  // 以下六处故意违反契约：断言的就是构造期入参校验（缺参 / 空 / 类型不对都要抛 TypeError）。
+  assert.throws(() => createFsGuard(undefined as unknown as GuardDeps), TypeError);
+  assert.throws(() => createFsGuard(null as unknown as GuardDeps), TypeError);
+  assert.throws(() => createFsGuard({ actorIsAgent: () => true, FsError: TestFsError } as unknown as GuardDeps), TypeError);
+  assert.throws(() => createFsGuard({ decide: () => undefined, FsError: TestFsError } as unknown as GuardDeps), TypeError);
+  assert.throws(() => createFsGuard({ decide: () => undefined, actorIsAgent: () => true } as unknown as GuardDeps), TypeError);
+  assert.throws(() => createFsGuard({ decide: 1, actorIsAgent: () => true, FsError: TestFsError } as unknown as GuardDeps), TypeError);
 });
 
 test('10d. 返回的 guard 恰好导出 writeIntent / editIntent 两个 handler', () => {

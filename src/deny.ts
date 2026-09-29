@@ -14,7 +14,7 @@
  */
 
 /** Human wording for each access level, used inside the denial text. */
-const ACCESS_TEXT = {
+const ACCESS_TEXT: Record<string, string> = {
   none: '完全禁止（不可见、不可读、不可写）',
   list: '仅允许查看文件名与目录结构，不允许读取内容',
   read: '允许读取，不允许写入或修改',
@@ -36,7 +36,7 @@ const NO_BYPASS = [
  *          ruleId?: string, rulePath?: string}} input - the decision facts.
  * @returns {string} the model-facing reason.
  */
-export function denialText({ toolName, shownPath, access, required, ruleId, rulePath }) {
+export function denialText({ toolName, shownPath, access, required, ruleId, rulePath }: { toolName: string; shownPath: string; access: string; required: string; ruleId?: string; rulePath?: string }): string {
   // `ruleId` is either a user-supplied id or the policy engine's synthesized
   // `#<index>` for an anonymous rule; only add a marker when it needs one.
   const id = ruleId === undefined || ruleId === ''
@@ -65,7 +65,7 @@ export function denialText({ toolName, shownPath, access, required, ruleId, rule
  *          kind?: 'shell'|'script'}} input - the match facts.
  * @returns {string} the model-facing reason.
  */
-export function shellDenialText({ toolName, needle, rulePath, access, kind = 'shell' }) {
+export function shellDenialText({ toolName, needle, rulePath, access, kind = 'shell' }: { toolName: string; needle: string; rulePath?: string; access: string; kind?: 'shell' | 'script' }): string {
   const script = kind === 'script'
   return [
     `访问被拒绝：这${script ? '段脚本' : '条命令'}引用了用户通过 dsh-path-guard 保护的路径。这不是系统错误。`,
@@ -87,7 +87,7 @@ export function shellDenialText({ toolName, needle, rulePath, access, kind = 'sh
  * @param {{target: string, why?: string}} input - the attempted spec and the specific finding.
  * @returns {string} the model-facing reason.
  */
-export function installSourceDenialText({ target, why }) {
+export function installSourceDenialText({ target, why }: { target: string; why?: string }): string {
   return [
     '访问被拒绝：`install_bundle` 拒绝了这次安装来源。',
     '',
@@ -113,7 +113,7 @@ export function installSourceDenialText({ target, why }) {
  * @param {{toolName: string, reason: string}} input - the tool and the finding.
  * @returns {string} the model-facing reason.
  */
-export function unknownToolDenialText({ toolName, reason }) {
+export function unknownToolDenialText({ toolName, reason }: { toolName: string; reason: string }): string {
   return [
     `访问被拒绝：工具 \`${toolName}\` 不在 dsh-path-guard 的已知工具表里，而它的参数里出现了路径形态的取值。`,
     '',
@@ -133,7 +133,7 @@ export function unknownToolDenialText({ toolName, reason }) {
  * @param {{toolName: string}} input - the tool identity.
  * @returns {string} the model-facing reason.
  */
-export function exoticDenialText({ toolName }) {
+export function exoticDenialText({ toolName }: { toolName: string }): string {
   return [
     `访问被拒绝：工具 \`${toolName}\` 可以绕过 dsh-path-guard 的路径限制，因此已被用户的配置禁用。`,
     '',
@@ -150,7 +150,7 @@ export function exoticDenialText({ toolName }) {
  * @param {{action: string, target: string}} input - the attempted action.
  * @returns {string} the model-facing reason.
  */
-export function selfDenialText({ action, target }) {
+export function selfDenialText({ action, target }: { action: string; target: string }): string {
   return [
     '访问被拒绝：自我保护开启时，不允许修改 profile 的插件组合。',
     '',
@@ -179,7 +179,7 @@ export function selfDenialText({ action, target }) {
  * @param {string} where - the extension point that failed.
  * @returns {string} the model-facing reason.
  */
-export function internalErrorText(where) {
+export function internalErrorText(where: string): string {
   return [
     `访问被拒绝：dsh-path-guard 在 ${where} 内部出错，无法判定这次调用是否安全。`,
     '',
@@ -195,7 +195,7 @@ export function internalErrorText(where) {
  * @param {string} toolName - `glob` or `grep`.
  * @returns {string} the model-facing reason.
  */
-export function redactionBlockedText(toolName) {
+export function redactionBlockedText(toolName: string): string {
   return [
     `\`${toolName}\` 的结果已被整体扣留：dsh-path-guard 无法安全地确认其中是否包含受保护路径的内容。`,
     '',

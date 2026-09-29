@@ -100,8 +100,8 @@ const SRE_READ_COMMANDS = new Set(['view'])
  * @param {unknown} args - the parsed tool arguments.
  * @returns {string} one of {@link OP}.
  */
-export function opForCommand(args) {
-  const command = args !== null && typeof args === 'object' ? args.command : undefined
+export function opForCommand(args: unknown): string {
+  const command = args !== null && typeof args === 'object' ? (args as Record<string, unknown>).command : undefined
   return typeof command === 'string' && SRE_READ_COMMANDS.has(command) ? OP.READ : OP.WRITE
 }
 
@@ -110,7 +110,7 @@ export function opForCommand(args) {
  * @param {string} toolName - the model-facing tool name.
  * @returns {boolean} true for a script tool.
  */
-export function isScriptTool(toolName) {
+export function isScriptTool(toolName: string): boolean {
   return SCRIPT_TOOLS.has(toolName)
 }
 
@@ -120,10 +120,10 @@ export function isScriptTool(toolName) {
  * @param {unknown} args - the parsed tool arguments.
  * @returns {string | undefined} the script text, when present.
  */
-export function scriptOf(toolName, args) {
+export function scriptOf(toolName: string, args: unknown): string | undefined {
   const field = SCRIPT_TOOLS.get(toolName)
   if (field === undefined || args === null || typeof args !== 'object') return undefined
-  const value = args[field]
+  const value = (args as Record<string, unknown>)[field]
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
@@ -132,7 +132,7 @@ export function scriptOf(toolName, args) {
  * @param {string} toolName - the model-facing tool name.
  * @returns {boolean} true when the tool cannot be fenced.
  */
-export function isExoticTool(toolName) {
+export function isExoticTool(toolName: string): boolean {
   if (EXOTIC_TOOLS.has(toolName)) return true
   return EXOTIC_TOOL_PREFIXES.some(prefix => toolName.startsWith(prefix))
 }
@@ -143,13 +143,13 @@ export function isExoticTool(toolName) {
  * @param {{field: string, each?: string}} spec - the field spec.
  * @returns {string[]} the path strings present (blank values dropped).
  */
-export function collectPaths(args, spec) {
+export function collectPaths(args: unknown, spec: { field: string; each?: string | undefined }) {
   if (args === null || typeof args !== 'object') return []
-  const raw = args[spec.field]
+  const raw = (args as Record<string, unknown>)[spec.field]
   const values = spec.each === undefined
     ? [raw]
     : Array.isArray(raw)
-      ? raw.map(entry => (entry !== null && typeof entry === 'object' ? entry[spec.each] : undefined))
+      ? raw.map(entry => (entry !== null && typeof entry === 'object' ? (entry as Record<string, unknown>)[spec.each!] : undefined))
       : []
   return values.filter(value => typeof value === 'string' && value.trim() !== '')
 }

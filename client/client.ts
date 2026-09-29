@@ -16,11 +16,14 @@
  * `cordis.patch.yml` (packages/settings/settings/src/index.ts:315,382).
  *
  * Deliberate constraints:
- *   - plain JS, hand-written, loaded through `window.__ModuleLoader__.load`;
- *     `install_bundle` runs `pnpm add` only and never builds a package
- *     (packages/boot/plugin-manager/src/index.ts:461-559), so shipping a
- *     pre-built `client.js` is the only thing that works for a third-party
- *     bundle.
+ *   - compiled to `lib/client/client.js` by `tsc -p tsconfig.client.json` and
+ *     loaded through `window.__ModuleLoader__.load` as a **classic script**
+ *     (packages/client/modules/src/client/system.ts:15-29). `install_bundle`
+ *     runs `pnpm add` only and never builds a package
+ *     (packages/boot/plugin-manager/src/index.ts:461-559), so the built file has
+ *     to sit in the repository. Keep this file free of `import`/`export`: the
+ *     loader evaluates the output as a classic script, where ESM syntax does not
+ *     parse.
  *   - only `react` is required, and it is a baseline external
  *     (packages/client/web/src/platform.ts:8-14) — no other Harness client
  *     package is imported, per the plugin authoring policy.
@@ -32,10 +35,196 @@
  *     (base.css:7-8). See the comment above `CONTROL`/`STYLE`.
  */
 
-window.__ModuleLoader__.load({
+/**
+ * The client-module loader the shell publishes on `window` before any bundle
+ * runs. Declared locally instead of imported: a plugin may not depend on a DSH
+ * client package, and `tsconfig.client.json` sets `"types": []` so nothing may
+ * be borrowed from `@types/node` either.
+ */
+interface PathGuardModuleLoader {
+  /**
+   * Register one client half.
+   * @param spec - the module id and the factory the module system later calls.
+   */
+  load(spec: {
+    readonly id: string
+    readonly factory: (require: (id: string) => unknown) => unknown
+  }): void
+}
+
+// Reached through one cast rather than a `declare global` augmentation: this
+// file has to compile whether or not the compiler is told the package makes it
+// an ES module, and a global augmentation is legal only inside a module. (The
+// distinction matters for the build: under `"type": "module"` tsc appends
+// `export {}` to the output, which the loader's classic script cannot parse —
+// see the header note.)
+;(window as unknown as { __ModuleLoader__: PathGuardModuleLoader }).__ModuleLoader__.load({
   id: 'dsh-path-guard',
-  factory(require) {
-    const React = require('react')
+  factory(require: (id: string) => unknown) {
+    /**
+     * Local structural mirrors of the host faces this half touches. Type-only,
+     * so nothing here reaches the emitted classic script.
+     *
+     * Deliberate: a plugin may not import a DSH client package, and
+     * `tsconfig.client.json` sets `"types": []`, so the globals and service
+     * shapes are declared here instead of borrowed. Each mirror names the DSH
+     * source it was read from and declares only the members this file uses.
+     */
+
+    /**
+     * The slice of React this half uses. `react` is a baseline external the
+     * module system always answers (packages/client/web/src/platform.ts:8-14);
+     * anything else would be a package this plugin may not depend on.
+     */
+    interface ReactLike {
+      /** Mirrors React.createElement (props are passed through untouched). */
+      createElement(type: unknown, props?: unknown, ...children: unknown[]): unknown
+      /** Mirrors React.useState. */
+      useState<S>(initial: S): [S, (next: S) => void]
+      /** Mirrors React.useSyncExternalStore. */
+      useSyncExternalStore<T>(subscribe: (listener: () => void) => () => void, getSnapshot: () => T): T
+    }
+
+    /** One configured rule, as the `path-guard` settings namespace stores it. */
+    interface Rule {
+      path?: string | undefined
+      access?: string | undefined
+      note?: string | undefined
+    }
+
+    /** One one-click preset (a rule without a note). */
+    interface Preset {
+      readonly key: string
+      readonly path: string
+      readonly access: string
+    }
+
+    /** The page's transient status line. */
+    interface Message {
+      readonly kind: 'ok' | 'error'
+      readonly text: string
+    }
+
+    /** The slice of a DOM change event the handlers read; a React synthetic event satisfies it. */
+    interface ChangeEvent<T> {
+      readonly target: T
+    }
+
+    /** A change event's target for text inputs and selects. */
+    interface ValueTarget {
+      readonly value: string
+    }
+
+    /** A change event's target for a checkbox. */
+    interface CheckedTarget {
+      readonly checked: boolean
+    }
+
+    /** One `<option>` of an enum field. */
+    interface Option {
+      readonly value: string
+      readonly label: string
+    }
+
+    /** A thrown value that may carry a `message` (an Error, a DOMException, or anything else). */
+    interface ErrorLike {
+      readonly message?: unknown
+    }
+
+    /** Mirrors ConfigFormSnapshot<T> (packages/client/ui-settings/src/client/config-form-types.ts:8-34). */
+    interface ConfigSnapshot<T> {
+      readonly status: 'loading' | 'ready' | 'unavailable'
+      readonly value: T | undefined
+      readonly revision: number | undefined
+      readonly writable: boolean
+      readonly mode: 'host' | 'memory'
+    }
+
+    /** Mirrors the ConfigForm<T> members this half uses (config-form-types.ts:39-77). */
+    interface ConfigForm<T> {
+      getSnapshot(): ConfigSnapshot<T>
+      subscribe(listener: () => void): () => void
+      set(field: string, value: unknown): Promise<boolean>
+    }
+
+    /**
+     * Mirrors the `configForms` service face
+     * (ui-settings/src/client/config-form.ts:293 `get`, :317 `whileServed`).
+     */
+    interface ConfigFormsFace {
+      get<T>(namespace: string): ConfigForm<T>
+      whileServed(namespaces: readonly string[], register: (served: ReadonlySet<string>) => () => void): () => void
+    }
+
+    /**
+     * Mirrors PluginConfigViewProps
+     * (ui-plugin-manager/src/client/slot-contract.ts:23-28).
+     */
+    interface ConfigViewProps {
+      readonly view: 'summary' | 'page'
+    }
+
+    /** Mirrors the registration options these two seats are given (ui-slots/src/index.ts:1157-1203). */
+    interface SlotRegistration {
+      readonly name: string
+      readonly key: string
+      readonly locale: string
+    }
+
+    /**
+     * The `slots` service face this half uses. `inject` is the Cordis Context
+     * method the shipped pages call the same way
+     * (ui-settings-agent-loop/src/client/index.ts:47-48); `register` mirrors the
+     * used shape of SlotCore.register (ui-slots/src/index.ts:1157-1203).
+     */
+    interface SlotsFace {
+      inject(name: string, register: () => () => void): () => void
+      register(options: SlotRegistration, component: (props: ConfigViewProps | undefined) => unknown): () => void
+    }
+
+    /** The `locale` service face: one dictionary per language, addressed by namespace. */
+    interface LocaleFace {
+      register(namespace: string, dictionaries: { zh: Record<string, string>; en: Record<string, string> }): () => void
+      bind(namespace: string): (key: string) => string
+    }
+
+    /**
+     * The directory-picker Remote, mirrored from the Host method it is generated
+     * from (packages/api/workspace-controller/src/directory-picker.ts:49-62).
+     */
+    interface DirectoryPickerRemote {
+      /**
+       * Open the Host's chooser.
+       * @param signal - caller lifetime; abort terminates the chooser.
+       * @returns the chosen absolute path, or null when the operator cancels.
+       */
+      pick(signal: AbortSignal): Promise<string | null>
+    }
+
+    /** The context an `inject([...])` callback receives, reduced to the Remote this half asks for. */
+    interface RemoteInjectContext {
+      readonly remote: { readonly directoryPicker: DirectoryPickerRemote }
+    }
+
+    /** Local state of the optional "Browse…" affordance; it stays unavailable without the Remote. */
+    interface Picker extends DirectoryPickerRemote {
+      available: boolean
+    }
+
+    /**
+     * The client plugin Context, reduced to what this half uses. Structural
+     * mirror: `effect` and `inject` are Cordis Context methods, and the three
+     * services are the faces above.
+     */
+    interface ClientContext {
+      effect(callback: () => void | (() => void), label?: string): () => void
+      inject(deps: readonly string[], callback: (ctx: RemoteInjectContext) => void | (() => void)): void
+      readonly locale: LocaleFace
+      readonly configForms: ConfigFormsFace
+      readonly slots: SlotsFace
+    }
+
+    const React = require('react') as ReactLike
     const h = React.createElement
 
     /** Settings namespace == the plugin row id in the profile patch. */
@@ -436,21 +625,22 @@ window.__ModuleLoader__.load({
 
     /**
      * Build the settings section component around one bound config form.
-     * @param {object} ctx - the client plugin context.
-     * @param {(key: string) => string} t - locale lookup.
-     * @returns {Function} the React component.
+     * @param ctx - the client plugin context.
+     * @param t - locale lookup.
+     * @param picker - the optional directory-picker affordance.
+     * @returns the React component.
      */
-    function createSection(ctx, t, picker) {
-      const form = ctx.configForms.get(NS)
-      const subscribe = listener => form.subscribe(listener)
+    function createSection(ctx: ClientContext, t: (key: string) => string, picker: Picker) {
+      const form = ctx.configForms.get<Record<string, unknown>>(NS)
+      const subscribe = (listener: () => void) => form.subscribe(listener)
       const getSnapshot = () => form.getSnapshot()
-      const label = key => t(key)
+      const label = (key: string) => t(key)
 
       function PathGuardSection() {
         const snapshot = React.useSyncExternalStore(subscribe, getSnapshot)
-        const [draft, setDraft] = React.useState(null)
+        const [draft, setDraft] = React.useState<Rule[] | null>(null)
         const [busy, setBusy] = React.useState(false)
-        const [message, setMessage] = React.useState(null)
+        const [message, setMessage] = React.useState<Message | null>(null)
         const [helpOpen, setHelpOpen] = React.useState(false)
 
         if (snapshot.status === 'loading') {
@@ -460,72 +650,72 @@ window.__ModuleLoader__.load({
           return h('section', { ...ROOT_ATTR, style: STYLE.root }, h('p', { style: STYLE.statusWarn }, label('statusUnavailable')))
         }
 
-        const value = snapshot.value !== null && typeof snapshot.value === 'object' ? snapshot.value : {}
-        const persisted = Array.isArray(value.rules) ? value.rules : []
+        const value: Record<string, unknown> = snapshot.value !== null && typeof snapshot.value === 'object' ? snapshot.value : {}
+        const persisted: Rule[] = Array.isArray(value.rules) ? (value.rules as Rule[]) : []
         const rows = draft ?? persisted
         const writable = snapshot.writable !== false && snapshot.mode !== 'memory'
 
-        const write = async (field, next, okKey) => {
+        const write = async (field: string, next: unknown, okKey: string) => {
           setBusy(true)
           setMessage(null)
           try {
             const ok = await form.set(field, next)
             setMessage(ok === false ? { kind: 'error', text: label('saveFailed') } : { kind: 'ok', text: label(okKey) })
           } catch (error) {
-            setMessage({ kind: 'error', text: `${label('saveFailed')} ${String(error && error.message ? error.message : error)}` })
+            setMessage({ kind: 'error', text: `${label('saveFailed')} ${String(error && (error as ErrorLike).message ? (error as ErrorLike).message : error)}` })
           } finally {
             setBusy(false)
           }
         }
 
-        const updateRow = (index, patch) => {
+        const updateRow = (index: number, patch: Partial<Rule>) => {
           const next = rows.map((row, at) => (at === index ? { ...row, ...patch } : row))
           setDraft(next)
         }
 
-        const toggleRow = (index, key) => event => updateRow(index, { [key]: event.target.value })
+        const toggleRow = (index: number, key: string) => (event: ChangeEvent<ValueTarget>) => updateRow(index, { [key]: event.target.value })
 
         /** Append one rule to the draft, creating the draft if needed. */
-        const appendRule = rule => setDraft([...rows, rule])
+        const appendRule = (rule: Rule) => setDraft([...rows, rule])
 
         /** Append one preset; a path already present is not duplicated. */
-        const appendPreset = preset => {
+        const appendPreset = (preset: Preset) => {
           if (rows.some(row => row.path === preset.path)) return
           setDraft([...rows, { path: preset.path, access: preset.access, note: '' }])
         }
 
         /** Ask the Host's directory picker and put the result in one row. */
-        const browseInto = index => async () => {
+        const browseInto = (index: number) => async () => {
           if (!picker.available) return
           try {
             const chosen = await picker.pick(new AbortController().signal)
             if (typeof chosen === 'string' && chosen !== '') updateRow(index, { path: chosen })
           } catch (error) {
-            setMessage({ kind: 'error', text: String(error && error.message ? error.message : error) })
+            setMessage({ kind: 'error', text: String(error && (error as ErrorLike).message ? (error as ErrorLike).message : error) })
           }
         }
 
         // One settings-form field: label over control over hint (SF:3-8).
-        const scalar = (field, key, options) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+        const scalar = (field: string, key: string, options: readonly Option[]) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
           h('label', { style: STYLE.fieldLabel, htmlFor: `pg-${field}` }, label(key)),
           h('select', {
             id: `pg-${field}`,
             style: STYLE.select,
             value: String(value[field]),
             disabled: busy || !writable,
-            onChange: event => void write(field, event.target.value, 'saved'),
+            onChange: (event: ChangeEvent<ValueTarget>) => void write(field, event.target.value, 'saved'),
           }, options.map(option => h('option', { key: option.value, value: option.value }, option.label))),
           h('p', { style: STYLE.hint }, label(`${key}Hint`)),
         )
 
-        const checkbox = (field, key) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+        const checkbox = (field: string, key: string) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
           h('label', { style: STYLE.checkboxLabel },
             h('input', {
               type: 'checkbox',
               style: STYLE.checkbox,
               checked: value[field] !== false,
               disabled: busy || !writable,
-              onChange: event => void write(field, event.target.checked, 'saved'),
+              onChange: (event: ChangeEvent<CheckedTarget>) => void write(field, event.target.checked, 'saved'),
             }),
             label(key),
           ),
@@ -542,7 +732,7 @@ window.__ModuleLoader__.load({
             checkbox('enabled', 'master'),
             scalar('defaultAccess', 'defaultAccess', [
               { value: 'allow', label: label('defaultAllow') },
-              ...LEVELS.map(level => ({ value: level, label: label(`access${level[0].toUpperCase()}${level.slice(1)}`) })),
+              ...LEVELS.map(level => ({ value: level, label: label(`access${level[0]!.toUpperCase()}${level.slice(1)}`) })),
             ]),
           ),
 
@@ -584,7 +774,7 @@ window.__ModuleLoader__.load({
                     placeholder: label('pathPlaceholder'),
                     'aria-label': label('colPath'),
                     disabled: busy || !writable,
-                    onChange: event => updateRow(index, { path: event.target.value }),
+                    onChange: (event: ChangeEvent<ValueTarget>) => updateRow(index, { path: event.target.value }),
                   })),
                   h('td', { style: STYLE.td }, h('select', {
                     style: { ...STYLE.select, width: '100%' },
@@ -593,13 +783,13 @@ window.__ModuleLoader__.load({
                     disabled: busy || !writable,
                     onChange: toggleRow(index, 'access'),
                   }, LEVELS.map(level => h('option', { key: level, value: level },
-                    label(`access${level[0].toUpperCase()}${level.slice(1)}`))))),
+                    label(`access${level[0]!.toUpperCase()}${level.slice(1)}`))))),
                   h('td', { style: STYLE.td }, h('input', {
                     style: STYLE.input,
                     value: row.note ?? '',
                     'aria-label': label('colNote'),
                     disabled: busy || !writable,
-                    onChange: event => updateRow(index, { note: event.target.value }),
+                    onChange: (event: ChangeEvent<ValueTarget>) => updateRow(index, { note: event.target.value }),
                   })),
                   h('td', { style: STYLE.td }, h('div', { style: STYLE.actions },
                     picker.available
@@ -686,7 +876,7 @@ window.__ModuleLoader__.load({
     return {
       name: 'path-guard-client',
       inject: ['slots', 'locale', 'configForms'],
-      apply(ctx) {
+      apply(ctx: ClientContext) {
         ctx.effect(() => ctx.locale.register(L10N, { zh, en }), 'path-guard: locale')
         const t = ctx.locale.bind(L10N)
 
@@ -697,7 +887,7 @@ window.__ModuleLoader__.load({
         // The Host's directory picker is an optional Remote: a deployment
         // without `@deepseek-ai/dsh-directory-picker-auto` simply gets no
         // "Browse…" button instead of a broken one.
-        const picker = { available: false, pick: async () => null }
+        const picker: Picker = { available: false, pick: async () => null }
         ctx.inject(['remote', 'remote.directoryPicker'], pickerCtx => {
           picker.available = true
           picker.pick = signal => pickerCtx.remote.directoryPicker.pick(signal)
@@ -731,13 +921,13 @@ window.__ModuleLoader__.load({
               name: 'plugins.row.config',
               key: `${PKG}#${NS}`,
               locale: L10N,
-            }, props => (props?.view === 'summary' ? t('configSummary') : h(Section, null)))),
+            }, (props: ConfigViewProps | undefined) => (props?.view === 'summary' ? t('configSummary') : h(Section, null)))),
 
             ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
               name: 'plugins.bundle.config',
               key: PKG,
               locale: L10N,
-            }, props => (props?.view === 'summary' ? null : h(Section, null)))),
+            }, (props: ConfigViewProps | undefined) => (props?.view === 'summary' ? null : h(Section, null)))),
           ]
           return () => { for (const dispose of disposers) dispose() }
         }), 'path-guard: plugin config pages')

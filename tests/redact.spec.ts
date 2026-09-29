@@ -19,7 +19,25 @@ import {
   isRecognizedGrepValue,
   redactGlobValue,
   redactGrepValue,
-} from '../src/redact.js'
+} from '../src/redact.ts'
+
+/** The declared `glob` value shape (glob.ts:321-329). */
+interface GlobValue {
+  root: string
+  paths: string[]
+}
+
+/** One `grep` match (grep.ts:302-310). */
+interface GrepMatch {
+  path: string
+  lineNumber: number
+  line: string
+}
+
+/** The declared `grep` value shape (grep.ts:294-313). */
+interface GrepValue {
+  matches: GrepMatch[]
+}
 
 /** A deterministic fake session workdir (never touches the real filesystem). */
 const CWD = resolve(process.cwd(), 'fixture-workspace')
@@ -28,7 +46,7 @@ const CWD = resolve(process.cwd(), 'fixture-workspace')
 const OUTSIDE = join(parse(CWD).root, 'outside', 'b.ts')
 
 /** The declared `glob` value schema (glob.ts:322-329). */
-function assertGlobSchema(value) {
+function assertGlobSchema(value: GlobValue) {
   assert.deepEqual(Object.keys(value).sort(), ['paths', 'root'])
   assert.equal(typeof value.root, 'string')
   assert.ok(Array.isArray(value.paths))
@@ -36,7 +54,7 @@ function assertGlobSchema(value) {
 }
 
 /** The declared `grep` value schema (grep.ts:295-313). */
-function assertGrepSchema(value) {
+function assertGrepSchema(value: GrepValue) {
   assert.deepEqual(Object.keys(value), ['matches'])
   assert.ok(Array.isArray(value.matches))
   for (const match of value.matches) {
@@ -48,8 +66,8 @@ function assertGrepSchema(value) {
 }
 
 /** Group flat matches by file exactly as grep.ts:191-203 `formatGrepMatches` does. */
-function groupByFile(matches) {
-  const byFile = new Map()
+function groupByFile(matches: GrepMatch[]) {
+  const byFile = new Map<string, GrepMatch[]>()
   for (const match of matches) {
     const group = byFile.get(match.path)
     if (group !== undefined) group.push(match)
@@ -59,9 +77,9 @@ function groupByFile(matches) {
 }
 
 /** A `decide` that keys off the basename, recording every absolute path it saw. */
-function decideByBasename(map, fallback = 'none') {
-  const calls = []
-  const decide = (absolutePath) => {
+function decideByBasename(map: Record<string, string>, fallback = 'none') {
+  const calls: string[] = []
+  const decide = (absolutePath: string) => {
     calls.push(absolutePath)
     return map[basename(absolutePath)] ?? fallback
   }
@@ -69,9 +87,9 @@ function decideByBasename(map, fallback = 'none') {
 }
 
 /** Freeze a value deeply so any in-place mutation throws in strict mode. */
-function deepFreeze(value) {
+function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
-    for (const key of Object.keys(value)) deepFreeze(value[key])
+    for (const key of Object.keys(value)) deepFreeze((value as Record<string, unknown>)[key])
     Object.freeze(value)
   }
   return value
@@ -115,7 +133,7 @@ describe('isRecognizedGlobValue', () => {
     const { decide } = decideByBasename({ 'keep.ts': 'read' })
     const result = redactGlobValue({ root: '.', paths: [join('src', 'keep.ts'), join('src', 'drop.ts')] }, { cwd: CWD, decide })
     assert.equal(result.changed, true)
-    assertGlobSchema(result.value)
+    assertGlobSchema(result.value as GlobValue)
   })
 })
 
@@ -148,7 +166,7 @@ describe('redactGlobValue', () => {
       join('src', 'allow.ts'),
     ])
     assert.deepEqual(result.value.root, '.')
-    assertGlobSchema(result.value)
+    assertGlobSchema(result.value as GlobValue)
   })
 
   it('returns changed=false and the SAME reference when nothing is dropped', () => {
@@ -215,7 +233,8 @@ describe('redactGlobValue', () => {
     assert.equal(result.changed, true)
     assert.deepEqual(result.value.paths, [])
 
-    const silent = redactGlobValue({ root: '.', paths: ['a.ts'] }, { cwd: CWD, decide: () => undefined })
+    // 此处故意违反契约：断言的是 decide 返回非字符串时条目被丢弃（fail-closed）。
+    const silent = redactGlobValue({ root: '.', paths: ['a.ts'] }, { cwd: CWD, decide: () => undefined } as unknown as Parameters<typeof redactGlobValue>[1])
     assert.equal(silent.changed, true)
     assert.deepEqual(silent.value.paths, [])
   })
@@ -224,24 +243,26 @@ describe('redactGlobValue', () => {
     let calls = 0
     const ctx = { cwd: CWD, decide: () => { calls += 1; return 'allow' } }
     for (const [label, value] of [...UNRECOGNIZED, ['unknown key', { root: '.', paths: ['a.ts'], extra: 1 }]]) {
-      let result
+      let result: { changed: boolean; value: unknown } | undefined
       assert.doesNotThrow(() => { result = redactGlobValue(value, ctx) }, `threw for ${label}`)
-      assert.equal(result.changed, false, `changed for ${label}`)
-      assert.equal(result.value, value, `reference changed for ${label}`)
+      assert.equal(result!.changed, false, `changed for ${label}`)
+      assert.equal(result!.value, value, `reference changed for ${label}`)
     }
     assert.equal(calls, 0)
   })
 
   it('never throws for an unrecognized structure even with no usable ctx', () => {
-    let result
-    assert.doesNotThrow(() => { result = redactGlobValue(null, undefined) })
-    assert.equal(result.changed, false)
-    assert.equal(result.value, null)
+    let result: { changed: boolean; value: unknown } | undefined
+    // 此处故意违反契约：断言的是「无法识别的结构 + 无可用 ctx」时仍不抛。
+    assert.doesNotThrow(() => { result = redactGlobValue(null, undefined as unknown as Parameters<typeof redactGlobValue>[1]) })
+    assert.equal(result!.changed, false)
+    assert.equal(result!.value, null)
   })
 
   it('throws a TypeError when ctx.decide is missing for a recognized value', () => {
-    assert.throws(() => redactGlobValue({ root: '.', paths: ['a.ts'] }, { cwd: CWD }), TypeError)
-    assert.throws(() => redactGlobValue({ root: '.', paths: ['a.ts'] }, {}), TypeError)
+    // 此处故意违反契约：断言的是缺 decide 时抛 TypeError（调用方契约违规，不是结构不认识）。
+    assert.throws(() => redactGlobValue({ root: '.', paths: ['a.ts'] }, { cwd: CWD } as unknown as Parameters<typeof redactGlobValue>[1]), TypeError)
+    assert.throws(() => redactGlobValue({ root: '.', paths: ['a.ts'] }, {} as unknown as Parameters<typeof redactGlobValue>[1]), TypeError)
   })
 })
 
@@ -294,12 +315,12 @@ describe('redactGrepValue', () => {
     const result = redactGrepValue(value, { cwd: CWD, decide })
 
     assert.equal(result.changed, true)
-    assert.deepEqual(result.value.matches, [
+    assert.deepEqual((result.value as GrepValue).matches, [
       { path: join('src', 'read.ts'), lineNumber: 3, line: 'read' },
       { path: join('src', 'write.ts'), lineNumber: 4, line: 'write' },
       { path: join('src', 'allow.ts'), lineNumber: 5, line: 'allow' },
     ])
-    assertGrepSchema(result.value)
+    assertGrepSchema(result.value as GrepValue)
   })
 
   it('keeps matched line text and line numbers verbatim', () => {
@@ -310,7 +331,7 @@ describe('redactGrepValue', () => {
       { cwd: CWD, decide: (abs) => (basename(abs) === 'a.ts' ? 'read' : 'none') },
     )
 
-    assert.deepEqual(result.value.matches, [{ path: 'a.ts', lineNumber: 42, line }])
+    assert.deepEqual((result.value as GrepValue).matches, [{ path: 'a.ts', lineNumber: 42, line }])
   })
 
   it('returns changed=false and the SAME reference when nothing is dropped', () => {
@@ -352,16 +373,16 @@ describe('redactGrepValue', () => {
     const result = redactGrepValue(value, { cwd: CWD, decide })
 
     assert.equal(result.changed, true)
-    assert.deepEqual(result.value.matches, [{ path: join('src', 'keep.ts'), lineNumber: 3, line: 'c' }])
+    assert.deepEqual((result.value as GrepValue).matches, [{ path: join('src', 'keep.ts'), lineNumber: 3, line: 'c' }])
     const serialized = JSON.stringify(result.value)
     assert.equal(serialized.includes('none.ts'), false)
     assert.equal(serialized.includes('list.ts'), false)
 
     // Re-group exactly as the model-facing render does: no group may be empty.
-    const groups = groupByFile(result.value.matches)
+    const groups = groupByFile((result.value as GrepValue).matches)
     assert.deepEqual(groups.map((group) => group.path), [join('src', 'keep.ts')])
     assert.ok(groups.every((group) => group.group.length > 0), 'no empty file group may remain')
-    assertGrepSchema(result.value)
+    assertGrepSchema(result.value as GrepValue)
   })
 
   it('can drop every match of an all-protected result', () => {
@@ -377,9 +398,9 @@ describe('redactGrepValue', () => {
     )
 
     assert.equal(result.changed, true)
-    assert.deepEqual(result.value.matches, [])
-    assertGrepSchema(result.value)
-    assert.deepEqual(groupByFile(result.value.matches), [])
+    assert.deepEqual((result.value as GrepValue).matches, [])
+    assertGrepSchema(result.value as GrepValue)
+    assert.deepEqual(groupByFile((result.value as GrepValue).matches), [])
   })
 
   it('resolves relative paths against ctx.cwd and leaves absolute ones absolute', () => {
@@ -410,7 +431,7 @@ describe('redactGrepValue', () => {
     assert.equal(result.changed, true)
     assert.notEqual(result.value, value)
     assert.equal(value.matches.length, 2, 'the input array must keep both matches')
-    assert.deepEqual(result.value.matches, [{ path: join('src', 'keep.ts'), lineNumber: 2, line: 'public' }])
+    assert.deepEqual((result.value as GrepValue).matches, [{ path: join('src', 'keep.ts'), lineNumber: 2, line: 'public' }])
   })
 
   it('drops a match when decide throws (fail-closed)', () => {
@@ -420,37 +441,39 @@ describe('redactGrepValue', () => {
     )
 
     assert.equal(result.changed, true)
-    assert.deepEqual(result.value.matches, [])
+    assert.deepEqual((result.value as GrepValue).matches, [])
   })
 
   it('never throws and never calls decide for an unrecognized structure', () => {
     let calls = 0
     const ctx = { cwd: CWD, decide: () => { calls += 1; return 'allow' } }
     for (const [label, value] of [...UNRECOGNIZED, ['grouped meta shape', { shape: 'matches', files: [], truncated: false, total: 0 }]]) {
-      let result
+      let result: { changed: boolean; value: unknown } | undefined
       assert.doesNotThrow(() => { result = redactGrepValue(value, ctx) }, `threw for ${label}`)
-      assert.equal(result.changed, false, `changed for ${label}`)
-      assert.equal(result.value, value, `reference changed for ${label}`)
+      assert.equal(result!.changed, false, `changed for ${label}`)
+      assert.equal(result!.value, value, `reference changed for ${label}`)
     }
     assert.equal(calls, 0)
   })
 
   it('never throws for an unrecognized structure even with no usable ctx', () => {
-    let result
-    assert.doesNotThrow(() => { result = redactGrepValue(undefined, undefined) })
-    assert.equal(result.changed, false)
-    assert.equal(result.value, undefined)
+    let result: { changed: boolean; value: unknown } | undefined
+    // 此处故意违反契约：断言的是「无法识别的结构 + 无可用 ctx」时仍不抛。
+    assert.doesNotThrow(() => { result = redactGrepValue(undefined, undefined as unknown as Parameters<typeof redactGrepValue>[1]) })
+    assert.equal(result!.changed, false)
+    assert.equal(result!.value, undefined)
   })
 
   it('throws a TypeError when ctx.decide is missing for a recognized value', () => {
-    assert.throws(() => redactGrepValue({ matches: [] }, {}), TypeError)
-    assert.throws(() => redactGrepValue({ matches: [] }, { cwd: CWD, decide: 'none' }), TypeError)
+    // 此处故意违反契约：断言的是缺 decide 时抛 TypeError（调用方契约违规，不是结构不认识）。
+    assert.throws(() => redactGrepValue({ matches: [] }, {} as unknown as Parameters<typeof redactGrepValue>[1]), TypeError)
+    assert.throws(() => redactGrepValue({ matches: [] }, { cwd: CWD, decide: 'none' } as unknown as Parameters<typeof redactGrepValue>[1]), TypeError)
   })
 })
 
 describe('search-result redaction end to end (value shapes as the runtime hands them over)', () => {
   it('a mixed glob and grep run leaks no protected file into the replacement values', () => {
-    const decide = (absolutePath) => {
+    const decide = (absolutePath: string) => {
       assert.ok(resolve(absolutePath) === absolutePath || absolutePath.startsWith(parse(CWD).root))
       const name = basename(absolutePath)
       if (name === 'secrets.env' || name === 'id_rsa' || name === 'classify.ts' || name === 'ledger.csv') return 'none'
@@ -476,14 +499,14 @@ describe('search-result redaction end to end (value shapes as the runtime hands 
 
     assert.equal(globResult.changed, true)
     assert.deepEqual(globResult.value.paths, ['README.md', join('src', 'index.ts'), 'package.json'])
-    assertGlobSchema(globResult.value)
+    assertGlobSchema(globResult.value as GlobValue)
 
     assert.equal(grepResult.changed, true)
     // classify.ts is `none` here, so even its `read`-looking source line is gone.
-    assert.deepEqual(grepResult.value.matches, [
+    assert.deepEqual((grepResult.value as GrepValue).matches, [
       { path: 'README.md', lineNumber: 1, line: '# dsh-path-guard' },
     ])
-    assertGrepSchema(grepResult.value)
+    assertGrepSchema(grepResult.value as GrepValue)
 
     for (const leaked of ['secrets.env', 'id_rsa', 'ledger.csv', 'classify.ts', 'const x = 1', 'API_KEY', 'PRIVATE KEY']) {
       assert.equal(JSON.stringify(globResult.value).includes(leaked), false, `glob leaked ${leaked}`)

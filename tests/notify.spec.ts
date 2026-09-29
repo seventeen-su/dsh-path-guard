@@ -18,25 +18,43 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createNotifier } from '../src/notify.js'
+import { createNotifier } from '../src/notify.ts'
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
 /**
+ * One payload handed to the `desktopNotify` service. Structural mirror of the
+ * payload `src/notify.ts` builds (`deliver()` / `payload` declare `title`,
+ * `message` and `urgency` as required and `sessionId` as optional).
+ */
+interface NotifyItem {
+  title: string
+  message: string
+  urgency: string
+  sessionId?: unknown
+}
+
+/** The slice of `desktopNotify` this test fakes. */
+interface NotifyService {
+  push: (item: NotifyItem) => boolean
+  pushAlways: (item: NotifyItem) => boolean
+}
+
+/**
  * A recording fake of the `desktopNotify` service: both methods return `true`
  * (as the real one does when the notification is genuinely enqueued).
- * @param {Record<string, unknown>} [overrides] replace `push` / `pushAlways`
+ * @param overrides - replaces `push` / `pushAlways`
  */
-function fakeService(overrides = {}) {
-  const calls = { push: [], pushAlways: [] }
+function fakeService(overrides: Partial<NotifyService> = {}) {
+  const calls: { push: NotifyItem[]; pushAlways: NotifyItem[] } = { push: [], pushAlways: [] }
   const service = {
-    push(item) {
+    push(item: NotifyItem) {
       calls.push.push(item)
       return true
     },
-    pushAlways(item) {
+    pushAlways(item: NotifyItem) {
       calls.pushAlways.push(item)
       return true
     },
@@ -45,24 +63,32 @@ function fakeService(overrides = {}) {
   return { calls, service, pushed: () => calls.push.length + calls.pushAlways.length }
 }
 
+/** Dependency-injection options the harness lets a test override. */
+interface SetupOptions {
+  throttleMs?: number | undefined
+  maxTracked?: number | undefined
+  startAt?: number | undefined
+  resolve?: (() => NotifyService | null | undefined) | undefined
+  logger?: { warn?: (...args: unknown[]) => unknown; error?: (...args: unknown[]) => unknown } | null | undefined
+}
+
 /**
  * A notifier wired to a recording logger, a mutable service slot and a manual
  * clock. `slot.service` starts `undefined`, i.e. "the plugin is not installed".
- * @param {{throttleMs?: number, maxTracked?: number, startAt?: number,
- *          resolve?: () => any, logger?: object}} [options]
+ * @param options - dependency-injection overrides.
  */
-function setup(options = {}) {
-  const warns = []
-  const errors = []
+function setup(options: SetupOptions = {}) {
+  const warns: string[] = []
+  const errors: string[] = []
   let clock = options.startAt ?? 1000000
-  const slot = { service: undefined }
+  const slot: { service: NotifyService | null | undefined } = { service: undefined }
   const notifier = createNotifier({
     resolveService: options.resolve ?? (() => slot.service),
     logger: options.logger ?? {
       warn: (message) => {
         warns.push(String(message))
       },
-      error: (message) => {
+      error: (message: unknown) => {
         errors.push(String(message))
       },
     },
@@ -76,7 +102,7 @@ function setup(options = {}) {
     errors,
     slot,
     /** Advance the injected clock by `ms`. */
-    advance: (ms) => {
+    advance: (ms: number) => {
       clock += ms
     },
   }
@@ -148,7 +174,7 @@ describe('2. normal path', () => {
     assert.equal(fake.calls.push.length, 1)
     assert.equal(fake.calls.pushAlways.length, 0)
 
-    const payload = fake.calls.push[0]
+    const payload = fake.calls.push[0]!
     assert.equal(payload.title, '🚫 Path Guard 拦截')
     assert.equal(typeof payload.message, 'string')
     assert.ok(payload.message.length > 0, 'message must not be empty')
@@ -171,7 +197,7 @@ describe('2. normal path', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.denial({ kind: 'shell', toolName: 'pwsh', target: 'rm -rf /' }), true)
-    const { message } = fake.calls.push[0]
+    const { message } = fake.calls.push[0]!
     assert.match(message, /pwsh/)
     assert.match(message, /rm -rf/)
     assert.ok(!message.includes('规则'))
@@ -183,8 +209,8 @@ describe('2. normal path', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.denial({ kind: 'self', toolName: 'mcp__dsh__plugin', target: 'dsh-path-guard' }), true)
-    assert.equal(fake.calls.push[0].urgency, 'critical')
-    assert.equal(fake.calls.push[0].title, '🚫 Path Guard 拦截', 'the title stays the documented one')
+    assert.equal(fake.calls.push[0]!.urgency, 'critical')
+    assert.equal(fake.calls.push[0]!.title, '🚫 Path Guard 拦截', 'the title stays the documented one')
   })
 
   it('survives unknown kinds without touching Object.prototype', () => {
@@ -215,7 +241,7 @@ describe('3. always', () => {
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, always: true }), true)
     assert.equal(fake.calls.pushAlways.length, 1)
     assert.equal(fake.calls.push.length, 0)
-    assert.deepEqual(Object.keys(fake.calls.pushAlways[0]).sort(), ALLOWED_PAYLOAD_KEYS)
+    assert.deepEqual(Object.keys(fake.calls.pushAlways[0]!).sort(), ALLOWED_PAYLOAD_KEYS)
   })
 
   it('treats a falsy always as the focus-gated path', () => {
@@ -239,7 +265,7 @@ describe('4. sessionId', () => {
       const fake = fakeService()
       h.slot.service = fake.service
       assert.equal(h.notifier.denial({ ...PATH_DENIAL, sessionId }), true)
-      const payload = fake.calls.push[0]
+      const payload = fake.calls.push[0]!
       assert.ok(!('sessionId' in payload), `sessionId ${JSON.stringify(sessionId)} must not create a field`)
       assert.deepEqual(Object.keys(payload).sort(), ['message', 'title', 'urgency'])
     }
@@ -251,7 +277,7 @@ describe('4. sessionId', () => {
     h.slot.service = fake.service
     const session = { id: 'session-obj' }
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, sessionId: session }), true)
-    assert.equal(fake.calls.push[0].sessionId, session)
+    assert.equal(fake.calls.push[0]!.sessionId, session)
   })
 
   it('carries sessionId on the pushAlways path too (the peer builds the click link from it)', () => {
@@ -259,7 +285,7 @@ describe('4. sessionId', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, always: true }), true)
-    assert.equal(fake.calls.pushAlways[0].sessionId, 'session-1')
+    assert.equal(fake.calls.pushAlways[0]!.sessionId, 'session-1')
   })
 })
 
@@ -285,7 +311,7 @@ describe('5. throttle', () => {
     assert.equal(h.notifier.denial(PATH_DENIAL), true)
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, target: 'D:\\secret\\b.txt' }), true)
     assert.equal(fake.calls.push.length, 2, 'the user must see the second denied path')
-    assert.match(fake.calls.push[1].message, /b\.txt/)
+    assert.match(fake.calls.push[1]!.message, /b\.txt/)
   })
 
   it('treats a different tier, tool or kind as a different reason', () => {
@@ -400,7 +426,7 @@ describe('7. bounded throttle table', () => {
     const h = setup({ maxTracked: 4 })
     const fake = fakeService()
     h.slot.service = fake.service
-    const target = (i) => `D:\\many\\f${i}.txt`
+    const target = (i: number) => `D:\\many\\f${i}.txt`
     for (let i = 0; i < 20; i += 1) {
       assert.equal(h.notifier.denial({ ...PATH_DENIAL, target: target(i) }), true)
     }
@@ -435,7 +461,7 @@ describe('8. long input', () => {
     h.slot.service = fake.service
     const target = `D:\\${'x'.repeat(2000)}`
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, target }), true)
-    const { title, message } = fake.calls.push[0]
+    const { title, message } = fake.calls.push[0]!
     assert.ok(message.length <= 400, `message was ${message.length} characters`)
     assert.ok(title.length <= 160)
     assert.ok(!message.includes('\n'))
@@ -456,7 +482,7 @@ describe('8. long input', () => {
       }),
       true,
     )
-    const { message } = fake.calls.push[0]
+    const { message } = fake.calls.push[0]!
     assert.ok(message.length <= 400, `message was ${message.length} characters`)
     assert.match(message, /档位/, 'the tier must not be the field that truncation eats')
     assert.match(message, /规则/)
@@ -468,7 +494,7 @@ describe('8. long input', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, target: '😀'.repeat(300) }), true)
-    const { message } = fake.calls.push[0]
+    const { message } = fake.calls.push[0]!
     assert.ok(message.length <= 400)
     assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message), 'lone high surrogate in the payload')
     assert.ok(!/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(message), 'lone low surrogate in the payload')
@@ -479,7 +505,7 @@ describe('8. long input', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, target: 'D:\\a\nb\t c   d.txt' }), true)
-    const { message } = fake.calls.push[0]
+    const { message } = fake.calls.push[0]!
     assert.match(message, /D:\\a b c d\.txt/)
     assert.ok(!/\s{2,}/.test(message))
   })
@@ -505,7 +531,8 @@ describe('9. robustness', () => {
 
   it('returns false and warns when the service lacks both methods', () => {
     const h = setup()
-    h.slot.service = {}
+    // 此处故意违反契约：断言的是「服务对象两个方法都缺」时的降级与告警。
+    h.slot.service = {} as unknown as NotifyService
     assert.equal(h.notifier.denial(PATH_DENIAL), false)
     assert.match(h.warns.join('\n'), /push/)
     assert.deepEqual(h.errors, [])
@@ -514,7 +541,8 @@ describe('9. robustness', () => {
   it('returns false and warns when only the needed method is missing (no silent fallback)', () => {
     const h = setup()
     const fake = fakeService()
-    h.slot.service = { push: fake.service.push }
+    // 此处故意违反契约：断言的是「只缺一个方法」时不做静默回退。
+    h.slot.service = { push: fake.service.push } as unknown as NotifyService
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, always: true }), false)
     assert.match(h.warns.join('\n'), /pushAlways/)
     assert.equal(fake.calls.push.length, 0, 'always:true must not fall back to the focus-gated push')
@@ -537,17 +565,19 @@ describe('9. robustness', () => {
   it('treats undefined, null and non-boolean results as false', () => {
     for (const result of [undefined, null, 0, 'true', {}]) {
       const h = setup()
-      h.slot.service = fakeService({ push: () => result }).service
+      // 此处故意违反契约：断言的是非布尔返回（undefined/null/0/'true'/{}）一律视为未入队。
+      h.slot.service = fakeService({ push: () => result } as Partial<NotifyService>).service
       assert.equal(h.notifier.denial(PATH_DENIAL), false, `result ${String(result)} must not be true`)
     }
   })
 
   it('treats an asynchronous peer result as not queued and swallows its rejection', async () => {
     const h = setup()
+    // 此处故意违反契约：断言的是「异步 peer 结果视为未入队，且吞掉 rejection」。
     h.slot.service = {
       push: () => Promise.reject(new Error('async peer')),
       pushAlways: () => Promise.resolve(true),
-    }
+    } as unknown as NotifyService
     assert.equal(h.notifier.denial(PATH_DENIAL), false)
     assert.equal(h.notifier.denial({ ...PATH_DENIAL, always: true }), false)
     await new Promise((resolve) => setImmediate(resolve))
@@ -574,7 +604,8 @@ describe('9. robustness', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     for (const input of [null, undefined, 'deny', 42]) {
-      assert.equal(h.notifier.denial(input), false)
+      // 此处故意违反契约：断言的是 denial() 对畸形输入的容错（false、不抛、不推）。
+      assert.equal(h.notifier.denial(input as unknown as Parameters<typeof h.notifier.denial>[0]), false)
     }
     assert.equal(fake.pushed(), 0)
     assert.deepEqual(h.warns, [])
@@ -593,7 +624,7 @@ describe('10. malfunction', () => {
     assert.equal(h.notifier.malfunction('tools/pre-execute'), true)
     assert.equal(fake.calls.push.length, 1)
     assert.equal(fake.calls.pushAlways.length, 0, 'malfunction is focus-gated: it uses push')
-    const { title, message, urgency } = fake.calls.push[0]
+    const { title, message, urgency } = fake.calls.push[0]!
     assert.equal(title, '⚠️ Path Guard 内部错误')
     assert.ok(title.length <= 160)
     assert.match(message, /tools\/pre-execute/, 'names the extension point')
@@ -601,7 +632,7 @@ describe('10. malfunction', () => {
     assert.ok(message.length <= 400)
     assert.ok(!message.includes('\n'))
     assert.ok(['low', 'normal', 'critical'].includes(urgency), `invalid urgency ${urgency}`)
-    assert.deepEqual(Object.keys(fake.calls.push[0]).sort(), ['message', 'title', 'urgency'])
+    assert.deepEqual(Object.keys(fake.calls.push[0]!).sort(), ['message', 'title', 'urgency'])
   })
 
   it('is throttled per extension point (a fail-closed bug fires on every governed call)', () => {
@@ -634,9 +665,9 @@ describe('10. malfunction', () => {
     const fake = fakeService()
     h.slot.service = fake.service
     assert.equal(h.notifier.malfunction('w'.repeat(2000)), true)
-    assert.ok(fake.calls.push[0].message.length <= 400)
+    assert.ok(fake.calls.push[0]!.message.length <= 400)
     assert.equal(h.notifier.malfunction(''), true)
-    assert.match(fake.calls.push[1].message, /未提供扩展点/)
+    assert.match(fake.calls.push[1]!.message, /未提供扩展点/)
   })
 
   it('stays silent when the service is missing', () => {

@@ -13,32 +13,74 @@ import assert from 'node:assert/strict'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply, Config, inject, name, unwrap } from '../src/index.js'
-import { opForCommand, collectPaths, isExoticTool } from '../src/tool-fields.js'
-import { buildNeedles, scanCommand, commandOf, literalNeedlePrefix, unscannablePatterns } from '../src/scan.js'
+import { apply, Config, inject, name, unwrap } from '../src/index.ts'
+import { opForCommand, collectPaths, isExoticTool } from '../src/tool-fields.ts'
+import { buildNeedles, scanCommand, commandOf, literalNeedlePrefix, unscannablePatterns } from '../src/scan.ts'
 
 // `~` rules are expanded with the real home directory by the plugin, so the
 // tests must use the same anchor or they would exercise an unmatched rule.
 const HOME = homedir()
 const WORKSPACE = join(tmpdir(), 'pg-ws')
 
+/** The plugin's own ctx contract, derived from `apply` so the fake cannot drift from it. */
+type PluginCtx = Parameters<typeof apply>[0]
+/** The exec object the plugin's guard receives (src/index.ts mirrors DSH's ToolExecution). */
+type GuardExec = Parameters<Parameters<NonNullable<PluginCtx['tools']>['guard']>[0]>[0]
+/** A guard as the fake registry records it. */
+type GuardFn = (exec: GuardExec) => string | undefined
+/** A registered listener (pre-execute takes 2 args, post-execute 3). */
+type AnyListener = (...args: unknown[]) => unknown
+/** The decision a `tools/pre-execute` listener returns, as these tests read it back. */
+interface Decision {
+  kind: string
+  reason?: string | undefined
+}
+/** The decision a `tools/post-execute` listener returns, as these tests read it back. */
+interface PostDecision {
+  kind: string
+  content?: unknown
+  value?: { paths?: string[]; matches?: unknown[] } | undefined
+}
+/** One payload recorded by the fake `desktopNotify` service. */
+interface PushedItem {
+  title: string
+  message: string
+  urgency?: string | undefined
+  sessionId?: unknown
+}
+/** What the tests read off the fake beyond the plugin's own ctx contract. */
+interface FakeCtxExtra {
+  guards: GuardFn[]
+  listeners: Map<string, AnyListener[]>
+  logs: unknown[][]
+  pushed: PushedItem[]
+  pushedAlways: PushedItem[]
+}
+/** Overrides `fakeCtx` accepts (documented `canonical` plus per-case service wiring). */
+interface FakeCtxOptions {
+  canonical?: ((raw: string) => string) | undefined
+  notifyService?: Record<string, unknown> | undefined
+  services?: Record<string, unknown> | undefined
+  readText?: ((displayPath: string) => string) | undefined
+}
+
 /**
  * A minimal stand-in for the Cordis context surface this plugin touches.
- * @param {{canonical?: (raw: string) => string}} [options] - resolve override.
- * @returns {object} the fake context plus captured registrations.
+ * @param options - resolve override and per-case service wiring.
+ * @returns the fake context plus captured registrations.
  */
-function fakeCtx(options = {}) {
-  const guards = []
-  const listeners = new Map()
-  const logs = []
-  const pushed = []
-  const pushedAlways = []
-  const canonical = options.canonical ?? (raw => raw)
+function fakeCtx(options: FakeCtxOptions = {}): PluginCtx & FakeCtxExtra {
+  const guards: GuardFn[] = []
+  const listeners = new Map<string, AnyListener[]>()
+  const logs: unknown[][] = []
+  const pushed: PushedItem[] = []
+  const pushedAlways: PushedItem[] = []
+  const canonical = options.canonical ?? ((raw: string) => raw)
   const service = options.notifyService === undefined
     ? undefined
     : {
-      push: item => { pushed.push(item); return true },
-      pushAlways: item => { pushedAlways.push(item); return true },
+      push: (item: unknown) => { pushed.push(item as PushedItem); return true },
+      pushAlways: (item: unknown) => { pushedAlways.push(item as PushedItem); return true },
       ...options.notifyService,
     }
   return {
@@ -48,47 +90,50 @@ function fakeCtx(options = {}) {
     pushed,
     pushedAlways,
     logger: {
-      info: (...args) => logs.push(['info', ...args]),
-      warn: (...args) => logs.push(['warn', ...args]),
-      error: (...args) => logs.push(['error', ...args]),
-      debug: (...args) => logs.push(['debug', ...args]),
+      info: (...args: unknown[]) => logs.push(['info', ...args]),
+      warn: (...args: unknown[]) => logs.push(['warn', ...args]),
+      error: (...args: unknown[]) => logs.push(['error', ...args]),
+      debug: (...args: unknown[]) => logs.push(['debug', ...args]),
     },
-    get(name) {
+    get(name: string) {
       if (name === 'desktopNotify') return service
       return options.services === undefined ? undefined : options.services[name]
     },
-    tools: { guard: fn => { guards.push(fn); return () => {} } },
-    on(event, handler) {
+    tools: { guard: (fn: GuardFn) => { guards.push(fn); return () => {} } },
+    on(event: string, handler: AnyListener) {
       const list = listeners.get(event) ?? []
       list.push(handler)
       listeners.set(event, list)
       return () => {}
     },
     fs: {
-      async resolve(raw) {
+      async resolve(raw: string) {
         return { targetKey: `k:${raw}`, displayPath: canonical(raw) }
       },
-      processPath(target) {
+      processPath(target: { displayPath: string }) {
         return target.displayPath
       },
       ...(options.readText === undefined ? {} : {
-        async readText(target) {
-          return options.readText(target.displayPath)
+        async readText(target: { displayPath: string }) {
+          return options.readText!(target.displayPath)
         },
       }),
     },
-  }
+  } as unknown as PluginCtx & FakeCtxExtra
 }
 
 /**
  * Run one call through the plugin's pre-execute waterfall.
- * @param {object} ctx - the fake context.
- * @param {{name: string, arguments: unknown}} exec - the call.
- * @returns {Promise<object>} the decision the framework would receive.
+ * @param ctx - the fake context.
+ * @param exec - the call.
+ * @returns the decision the framework would receive.
  */
-async function preExecute(ctx, exec) {
+async function preExecute(
+  ctx: { listeners: Map<string, AnyListener[]> },
+  exec: { name: string; arguments: unknown },
+): Promise<Decision> {
   for (const handler of ctx.listeners.get('tools/pre-execute') ?? []) {
-    const decision = await handler({ ...exec, agent: undefined, signal: new AbortController().signal }, async () => ({ kind: 'allow' }))
+    const decision = await handler({ ...exec, agent: undefined, signal: new AbortController().signal }, async () => ({ kind: 'allow' })) as Decision | undefined
     if (decision !== undefined) return decision
   }
   return { kind: 'allow' }
@@ -120,8 +165,8 @@ test('none blocks reading a file under the protected directory', async () => {
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
   assert.equal(decision.kind, 'deny')
-  assert.match(decision.reason, /访问被拒绝/)
-  assert.match(decision.reason, /不要尝试绕过/)
+  assert.match(decision.reason!, /访问被拒绝/)
+  assert.match(decision.reason!, /不要尝试绕过/)
 })
 
 test('half access: list lets glob through but not grep', async () => {
@@ -131,7 +176,7 @@ test('half access: list lets glob through but not grep', async () => {
   assert.equal(glob.kind, 'allow', 'glob only lists names, which `list` permits')
   const grep = await preExecute(ctx, { name: 'grep', arguments: { pattern: 'KEY', path: '~/.ssh' } })
   assert.equal(grep.kind, 'deny', 'grep returns content, which `list` does not permit')
-  assert.match(grep.reason, /仅允许查看文件名/)
+  assert.match(grep.reason!, /仅允许查看文件名/)
 })
 
 test('exemption: a more specific rule overrides the broader one', async () => {
@@ -150,7 +195,7 @@ test('half access: read allows reading but refuses writing', async () => {
   assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: target } })).kind, 'allow')
   const write = await preExecute(ctx, { name: 'write', arguments: { file_path: target, content: 'x' } })
   assert.equal(write.kind, 'deny')
-  assert.match(write.reason, /不允许写入或修改/)
+  assert.match(write.reason!, /不允许写入或修改/)
 })
 
 test('write and edit are refused under none', async () => {
@@ -170,14 +215,14 @@ test('the resolved canonical path decides, so a symlink cannot evade the rule', 
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'innocent-link') } })
   assert.equal(decision.kind, 'deny')
-  assert.match(decision.reason, /pg-secrets/)
+  assert.match(decision.reason!, /pg-secrets/)
 })
 
 test('a search tool without a path checks the session workspace root', async () => {
   const ctx = fakeCtx({ canonical: () => join(tmpdir(), 'pg-secrets') })
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
   const exec = { name: 'glob', arguments: { pattern: '**/*' }, agent: { session: { header: { cwd: join(tmpdir(), 'pg-secrets') } } }, signal: new AbortController().signal }
-  const decision = await ctx.listeners.get('tools/pre-execute')[0](exec, async () => ({ kind: 'allow' }))
+  const decision = await ctx.listeners.get('tools/pre-execute')![0]!(exec, async () => ({ kind: 'allow' })) as Decision
   assert.equal(decision.kind, 'deny')
 })
 
@@ -210,20 +255,20 @@ test('an unknown tool with no known path field is left alone', async () => {
 test('guard refuses exotic tools by default, and allows them when configured', () => {
   const strict = fakeCtx()
   apply(strict, { enabled: true, rules: [], defaultAccess: 'allow', exoticTools: 'deny', selfProtection: false })
-  assert.equal(typeof strict.guards[0]({ name: 'run_code', arguments: {} }), 'string')
-  assert.equal(typeof strict.guards[0]({ name: 'mcp__filesystem__read_file', arguments: {} }), 'string')
-  assert.equal(strict.guards[0]({ name: 'read', arguments: {} }), undefined)
+  assert.equal(typeof strict.guards[0]!({ name: 'run_code', arguments: {} }), 'string')
+  assert.equal(typeof strict.guards[0]!({ name: 'mcp__filesystem__read_file', arguments: {} }), 'string')
+  assert.equal(strict.guards[0]!({ name: 'read', arguments: {} }), undefined)
 
   const lax = fakeCtx()
   apply(lax, { enabled: true, rules: [], defaultAccess: 'allow', exoticTools: 'allow', selfProtection: false })
-  assert.equal(lax.guards[0]({ name: 'run_code', arguments: {} }), undefined)
+  assert.equal(lax.guards[0]!({ name: 'run_code', arguments: {} }), undefined)
 })
 
 test('self-protection blocks only what can actually disable the guard', () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
-  const guard = ctx.guards[0]
-  const pm = args => guard({ name: 'plugin_manager', arguments: args })
+  const guard = ctx.guards[0]!
+  const pm = (args: Record<string, unknown>) => guard({ name: 'plugin_manager', arguments: args })
 
   // Reading stays available: the model can still see what is installed.
   assert.equal(pm({ action: 'list_plugins' }), undefined)
@@ -239,10 +284,10 @@ test('self-protection blocks only what can actually disable the guard', () => {
   assert.equal(pm({ action: 'install_bundle', target: '@scope/pkg@1.2.3' }), undefined)
 
   // Naming this plugin (by row id, entry id or bundle name) is refused.
-  assert.match(pm({ action: 'set_plugin', target: 'path-guard', enabled: false }), /自我保护/)
-  assert.match(pm({ action: 'set_plugin', target: 'include:path-guard', enabled: false }), /自我保护/)
-  assert.match(pm({ action: 'remove_bundle', target: 'dsh-path-guard' }), /自我保护/)
-  assert.match(pm({ action: 'install_bundle', target: 'dsh-path-guard@1.0.0' }), /自我保护/)
+  assert.match(pm({ action: 'set_plugin', target: 'path-guard', enabled: false })!, /自我保护/)
+  assert.match(pm({ action: 'set_plugin', target: 'include:path-guard', enabled: false })!, /自我保护/)
+  assert.match(pm({ action: 'remove_bundle', target: 'dsh-path-guard' })!, /自我保护/)
+  assert.match(pm({ action: 'install_bundle', target: 'dsh-path-guard@1.0.0' })!, /自我保护/)
 
   // Regression (verifier V-5): the model can author a package in the same turn
   // and install it from git or a tarball; its patch layer could then disable the
@@ -257,7 +302,7 @@ test('self-protection blocks only what can actually disable the guard', () => {
     './relative',
     '../up',
   ]) {
-    assert.match(pm({ action: 'install_bundle', target: spec }), /拒绝了这次安装来源/, `expected ${spec} to be refused`)
+    assert.match(pm({ action: 'install_bundle', target: spec })!, /拒绝了这次安装来源/, `expected ${spec} to be refused`)
   }
 
   // A LOCAL path is inspected by the async pass instead, so the synchronous
@@ -269,20 +314,20 @@ test('self-protection blocks only what can actually disable the guard', () => {
   // Turning self-protection off restores unrestricted management.
   const open = fakeCtx()
   apply(open, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
-  assert.equal(open.guards[0]({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'D:/tmp/copy' } }), undefined)
-  assert.equal(open.guards[0]({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'dsh-path-guard' } }), undefined)
+  assert.equal(open.guards[0]!({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'D:/tmp/copy' } }), undefined)
+  assert.equal(open.guards[0]!({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'dsh-path-guard' } }), undefined)
 })
 
 test('a local bundle is inspected before install, so the dev loop keeps working', async () => {
   const dir = join(tmpdir(), 'pg-local-bundle')
-  const clean = {
+  const clean: Record<string, string> = {
     [join(dir, 'package.json')]: JSON.stringify({
       name: 'my-local-plugin',
       dsh: { bundle: { patch: './cordis.patch.yml' } },
     }),
     [join(dir, 'cordis.patch.yml')]: '- insert:\n    - id: my-row\n      name: my-local-plugin\n',
   }
-  const ctx = fakeCtx({ readText: path => clean[path] })
+  const ctx = fakeCtx({ readText: path => clean[path]! })
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
   const decision = await preExecute(ctx, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
   assert.equal(decision.kind, 'allow', 'a local plugin that never touches this row installs normally')
@@ -299,7 +344,7 @@ test('a local bundle that could switch the guard off is refused', async () => {
   apply(hostile, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
   const denied = await preExecute(hostile, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
   assert.equal(denied.kind, 'deny')
-  assert.match(denied.reason, /row id 或包名/)
+  assert.match(denied.reason!, /row id 或包名/)
 
   // Its install hook would run code while installing.
   const hooked = fakeCtx({
@@ -308,34 +353,34 @@ test('a local bundle that could switch the guard off is refused', async () => {
   apply(hooked, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
   const hookDenied = await preExecute(hooked, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
   assert.equal(hookDenied.kind, 'deny')
-  assert.match(hookDenied.reason, /postinstall/)
+  assert.match(hookDenied.reason!, /postinstall/)
 
   // Nothing readable -> fail closed rather than wave it through.
   const blind = fakeCtx()
   apply(blind, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
   const blindDenied = await preExecute(blind, { name: 'plugin_manager', arguments: { action: 'install_bundle', target: dir } })
   assert.equal(blindDenied.kind, 'deny')
-  assert.match(blindDenied.reason, /fail-closed/)
+  assert.match(blindDenied.reason!, /fail-closed/)
 })
 
 test('guard scans shell command text for protected paths', () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'scan', selfProtection: false })
-  const guard = ctx.guards[0]
+  const guard = ctx.guards[0]!
   const protectedFile = join(tmpdir(), 'pg-secrets', 'k.txt')
-  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${protectedFile}'` } }), /pg-secrets/)
-  assert.match(guard({ name: 'bash', arguments: { command: `cat ${protectedFile.replaceAll('\\', '/')}` } }), /pg-secrets/)
+  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${protectedFile}'` } })!, /pg-secrets/)
+  assert.match(guard({ name: 'bash', arguments: { command: `cat ${protectedFile.replaceAll('\\', '/')}` } })!, /pg-secrets/)
   assert.equal(guard({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), undefined)
 })
 
 test('shell: deny refuses every shell call; shell: off refuses nothing', () => {
   const deny = fakeCtx()
   apply(deny, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'deny', selfProtection: false })
-  assert.match(deny.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), /访问被拒绝/)
+  assert.match(deny.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })!, /访问被拒绝/)
 
   const off = fakeCtx()
   apply(off, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'off', selfProtection: false })
-  assert.equal(off.guards[0]({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } }), undefined)
+  assert.equal(off.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } }), undefined)
 })
 
 test('self-protection makes the profile composition readable but not writable', async () => {
@@ -371,7 +416,7 @@ test('self-protection resolves the profile from profileContext, not just the env
     // The shell scan must see it too: glob/pwsh never call ctx.fs, so a lexical
     // needle is all that stands between the model and the profile patch.
     assert.match(
-      ctx.guards[0]({ name: 'pwsh', arguments: { command: `Get-Content '${patch}'` } }),
+      ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${patch}'` } })!,
       /访问被拒绝/,
     )
   } finally {
@@ -398,7 +443,7 @@ test('disabled means disabled', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: false, rules: RULES, defaultAccess: 'allow' })
   assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })).kind, 'allow')
-  assert.equal(ctx.guards[0]({ name: 'run_code', arguments: {} }), undefined)
+  assert.equal(ctx.guards[0]!({ name: 'run_code', arguments: {} }), undefined)
 })
 
 test('invalid rules are reported and skipped instead of breaking activation', () => {
@@ -410,7 +455,7 @@ test('invalid rules are reported and skipped instead of breaking activation', ()
 test('post-execute passes unrelated tools and untouched results straight through', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
-  const handler = ctx.listeners.get('tools/post-execute')[0]
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
   const passthrough = { kind: 'accept' }
   assert.equal(await handler({ name: 'read', arguments: {} }, { isError: false, value: {} }, async () => passthrough), passthrough)
 
@@ -422,28 +467,28 @@ test('post-execute passes unrelated tools and untouched results straight through
 test('post-execute redacts glob paths under a protected directory', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
-  const handler = ctx.listeners.get('tools/post-execute')[0]
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
   const protectedRoot = join(tmpdir(), 'pg-secrets')
   // Search results carry workdir-relative paths when the hit is inside the
   // workdir, so absolute inputs here stand in for the mixed real case.
   const value = { root: protectedRoot, paths: [join(protectedRoot, 'a.txt'), join(protectedRoot, 'b.txt')] }
-  const decision = await handler({ name: 'glob', arguments: {} }, { isError: false, value }, async () => ({ kind: 'accept' }))
+  const decision = await handler({ name: 'glob', arguments: {} }, { isError: false, value }, async () => ({ kind: 'accept' })) as PostDecision
   assert.equal(decision.kind, 'accept')
-  assert.deepEqual(decision.value.paths, [])
+  assert.deepEqual(decision.value!.paths, [])
 })
 
 test('post-execute withholds an unrecognized structure when rules exist (fail-closed)', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
-  const handler = ctx.listeners.get('tools/post-execute')[0]
-  const decision = await handler({ name: 'grep', arguments: {} }, { isError: false, value: { unexpected: true } }, async () => ({ kind: 'accept' }))
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
+  const decision = await handler({ name: 'grep', arguments: {} }, { isError: false, value: { unexpected: true } }, async () => ({ kind: 'accept' })) as PostDecision
   assert.equal(decision.kind, 'block')
 })
 
 test('post-execute never touches a failed result', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
-  const handler = ctx.listeners.get('tools/post-execute')[0]
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
   const passthrough = { kind: 'accept' }
   const decision = await handler({ name: 'grep', arguments: {} }, { isError: true, error: { message: 'x' }, value: undefined }, async () => passthrough)
   assert.equal(decision, passthrough)
@@ -541,9 +586,9 @@ const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
  * @param {unknown} initial - the starting snapshot.
  * @returns {object} a frozen volatile reference.
  */
-function ref(initial) {
+function ref(initial: unknown) {
   let current = initial
-  return Object.freeze({ get: () => current, [VOLATILE_WRITE]: value => { current = value } })
+  return Object.freeze({ get: () => current, [VOLATILE_WRITE]: (value: unknown) => { current = value } })
 }
 
 test('unwrap reads a volatile reference and passes plain values through', () => {
@@ -564,7 +609,7 @@ test('wrapped config fields still produce a working policy', async () => {
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
   assert.equal(decision.kind, 'deny', 'a wrapped rule list must not be silently dropped')
   // The shell path is where treating the reference as an array used to throw.
-  assert.match(ctx.guards[0]({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } }), /pg-secrets/)
+  assert.match(ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } })!, /pg-secrets/)
 })
 
 test('a live config change is picked up without re-activation', async () => {
@@ -583,7 +628,7 @@ test('defaultAccess other than allow applies to paths no rule matched', async ()
   apply(defaultDeny, { enabled: true, rules: [], defaultAccess: 'none', selfProtection: false })
   const denied = await preExecute(defaultDeny, { name: 'read', arguments: { file_path: join(tmpdir(), 'anything.txt') } })
   assert.equal(denied.kind, 'deny')
-  assert.match(denied.reason, /defaultAccess/)
+  assert.match(denied.reason!, /defaultAccess/)
 
   const defaultAllow = fakeCtx()
   apply(defaultAllow, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
@@ -607,14 +652,14 @@ test('an internal failure fails closed instead of throwing', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: ref(true), rules: flaky, defaultAccess: ref('allow'), selfProtection: ref(false) })
 
-  const guardResult = ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
+  const guardResult = ctx.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
   assert.equal(typeof guardResult, 'string', 'the guard must return a reason, never throw')
-  assert.match(guardResult, /内部出错/)
+  assert.match(guardResult!, /内部出错/)
   assert.ok(ctx.logs.some(([level]) => level === 'error'), 'the failure must be logged at error level')
 
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
   assert.equal(decision.kind, 'deny')
-  assert.match(decision.reason, /内部出错/)
+  assert.match(decision.reason!, /内部出错/)
 })
 
 // ---------------------------------------------------------------------------
@@ -627,8 +672,8 @@ test('a denial notifies through desktopNotify when it is mounted', async () => {
   await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
   assert.equal(ctx.pushed.length, 1, 'the default `focused` mode rides the focus gate')
   assert.equal(ctx.pushedAlways.length, 0)
-  assert.ok(ctx.pushed[0].title.includes('Path Guard'))
-  assert.ok(ctx.pushed[0].message.length > 0)
+  assert.ok(ctx.pushed[0]!.title.includes('Path Guard'))
+  assert.ok(ctx.pushed[0]!.message.length > 0)
 })
 
 test('notify: always bypasses the focus gate, notify: off sends nothing', async () => {
@@ -647,9 +692,9 @@ test('notify: always bypasses the focus gate, notify: off sends nothing', async 
 test('guard-side denials notify too, and a missing service is silent', async () => {
   const exotic = fakeCtx({ notifyService: {} })
   apply(exotic, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false, notify: 'always' })
-  exotic.guards[0]({ name: 'run_code', arguments: { code: 'x' } })
+  exotic.guards[0]!({ name: 'run_code', arguments: { code: 'x' } })
   assert.equal(exotic.pushedAlways.length, 1)
-  assert.match(exotic.pushedAlways[0].message, /run_code/)
+  assert.match(exotic.pushedAlways[0]!.message, /run_code/)
 
   // No `dsh-desktop-notify` in the profile: denials must still work and log.
   const bare = fakeCtx()
@@ -671,11 +716,11 @@ test('an internal failure notifies as a malfunction', async () => {
   })
   const ctx = fakeCtx({ notifyService: {} })
   apply(ctx, { enabled: ref(true), rules: flaky, defaultAccess: ref('allow'), selfProtection: ref(false), notify: 'always' })
-  ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
+  ctx.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })
   // `malfunction` is throttled per extension point and rides the focus gate
   // (`push`), unlike `always: true` denials.
   assert.equal(ctx.pushed.length, 1)
-  assert.match(ctx.pushed[0].title, /内部错误/)
+  assert.match(ctx.pushed[0]!.title, /内部错误/)
   assert.equal(ctx.pushedAlways.length, 0)
 })
 
@@ -686,7 +731,7 @@ test('an internal failure notifies as a malfunction', async () => {
 test('V-2: workflow is scanned as an opaque program, not refused outright', () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', exoticTools: 'deny', selfProtection: false })
-  const guard = ctx.guards[0]
+  const guard = ctx.guards[0]!
   const target = join(tmpdir(), 'pg-secrets', 'k.txt')
 
   // A workflow that never mentions a protected path stays usable: refusing the
@@ -695,10 +740,10 @@ test('V-2: workflow is scanned as an opaque program, not refused outright', () =
   assert.equal(guard({ name: 'workflow', arguments: { script: 'return 1' } }), undefined)
   // The escape is still real (`node:vm` -> real `process`), so a script that
   // names a protected path is refused like a shell command.
-  assert.match(guard({ name: 'workflow', arguments: { script: `readFileSync(${JSON.stringify(target)})` } }), /访问被拒绝/)
+  assert.match(guard({ name: 'workflow', arguments: { script: `readFileSync(${JSON.stringify(target)})` } })!, /访问被拒绝/)
   // Genuinely unobservable surfaces keep the hard refusal.
-  assert.match(guard({ name: 'run_code', arguments: { code: 'x' } }), /访问被拒绝/)
-  assert.match(guard({ name: 'ralph', arguments: {} }), /访问被拒绝/)
+  assert.match(guard({ name: 'run_code', arguments: { code: 'x' } })!, /访问被拒绝/)
+  assert.match(guard({ name: 'ralph', arguments: {} })!, /访问被拒绝/)
   assert.equal(isExoticTool('workflow'), false)
   assert.equal(isExoticTool('run_code'), true)
   // In-process delegation stays usable: the global guard covers those children.
@@ -715,13 +760,13 @@ test('a JSON-escaped Windows path is still detected in an opaque program', () =>
   // read as an unrelated string and slipped through.
   const script = `const fs = await import('node:fs'); return fs.readFileSync(${JSON.stringify(target)}, 'utf8')`
   assert.ok(script.includes('\\\\'), 'the fixture must actually contain doubled backslashes')
-  assert.match(ctx.guards[0]({ name: 'workflow', arguments: { script } }), /访问被拒绝/)
+  assert.match(ctx.guards[0]!({ name: 'workflow', arguments: { script } })!, /访问被拒绝/)
 })
 
 test('V-1: shell output blocks mentioning a protected path are withheld', async () => {
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', shell: 'scan', selfProtection: false })
-  const handler = ctx.listeners.get('tools/post-execute')[0]
+  const handler = ctx.listeners.get('tools/post-execute')![0]!
   const passthrough = { kind: 'accept' }
   const target = join(tmpdir(), 'pg-secrets', 'k.txt')
 
@@ -729,7 +774,7 @@ test('V-1: shell output blocks mentioning a protected path are withheld', async 
     { name: 'pwsh', arguments: {} },
     { isError: false, content: [{ type: 'text', text: `-----BEGIN KEY-----\n${target}\n` }] },
     async () => passthrough,
-  )
+  ) as PostDecision
   assert.equal(leaked.kind, 'accept')
   assert.ok(!JSON.stringify(leaked.content).includes('BEGIN KEY'), 'the block must not survive')
 
@@ -745,11 +790,11 @@ test('V-3: defaultAccess != allow with no rules refuses the shell instead of ope
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'none', shell: 'scan', selfProtection: false })
   // No rule can produce a needle, so "nothing matched" must not read as "safe".
-  assert.match(ctx.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), /访问被拒绝/)
+  assert.match(ctx.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } })!, /访问被拒绝/)
 
   const lax = fakeCtx()
   apply(lax, { enabled: true, rules: [], defaultAccess: 'allow', shell: 'scan', selfProtection: false })
-  assert.equal(lax.guards[0]({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), undefined)
+  assert.equal(lax.guards[0]!({ name: 'pwsh', arguments: { command: 'Get-ChildItem .' } }), undefined)
 })
 
 test('V-4: shell scanning skips write-level rules but keeps the stricter ones', () => {
@@ -765,11 +810,11 @@ test('V-4: shell scanning skips write-level rules but keeps the stricter ones', 
       { path: join(HOME, '.ssh'), access: 'list', note: '' },
     ],
   })
-  const guard = ctx.guards[0]
+  const guard = ctx.guards[0]!
   // `write` already grants everything, so mentioning the path is not a violation.
   assert.equal(guard({ name: 'pwsh', arguments: { command: `cd '${project}'; npm test` } }), undefined)
   // `list` still refuses: the shell cannot be judged per-path, and it would leak content.
-  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(HOME, '.ssh', 'id_rsa')}'` } }), /访问被拒绝/)
+  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(HOME, '.ssh', 'id_rsa')}'` } })!, /访问被拒绝/)
 })
 
 test('V-7: a malformed rule list fails closed instead of silently disabling the policy', async () => {
@@ -778,7 +823,7 @@ test('V-7: a malformed rule list fails closed instead of silently disabling the 
   apply(ctx, { enabled: ref(true), rules: broken, defaultAccess: ref('allow'), selfProtection: ref(false) })
   const decision = await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'x.txt') } })
   assert.equal(decision.kind, 'deny')
-  assert.match(decision.reason, /内部出错/)
+  assert.match(decision.reason!, /内部出错/)
 })
 
 test('V-10: an internal failure does not take away tools this plugin does not govern', async () => {
@@ -796,7 +841,34 @@ test('V-10: an internal failure does not take away tools this plugin does not go
   // Human-escalation and bookkeeping tools must survive a plugin bug.
   assert.equal((await preExecute(ctx, { name: 'ask_user_question', arguments: {} })).kind, 'allow')
   assert.equal((await preExecute(ctx, { name: 'todo_write', arguments: {} })).kind, 'allow')
-  assert.equal(ctx.guards[0]({ name: 'todo_write', arguments: {} }), undefined)
+  assert.equal(ctx.guards[0]!({ name: 'todo_write', arguments: {} }), undefined)
   // Governed calls still fail closed.
   assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: 'x' } })).kind, 'deny')
+})
+
+// Regression: the unmodelled-tool branch used to hand back a bare STRING while
+// the caller read `hit.reason`, so the refusal rendered as the literal text
+// `reason: "undefined"` — the model saw a denial with no explanation. Locking the
+// user-visible wording down (not just the deny/allow verdict) is the point here.
+test('V-8: an unmodelled tool with a path-shaped argument is refused with a real reason', async () => {
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+
+  const decision = await preExecute(ctx, {
+    name: 'third_party_tool',
+    arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') },
+  })
+
+  assert.equal(decision.kind, 'deny')
+  const reason = decision.reason
+  assert.equal(typeof reason, 'string', 'the denial must carry a string reason')
+  assert.ok(reason !== undefined && reason.length > 0, 'the reason must not be empty')
+  assert.ok(reason.includes('third_party_tool'), 'the reason must name the refused tool')
+  assert.notEqual(reason, 'undefined', 'the reason must never render as the literal "undefined"')
+  assert.ok(!/\bundefined\b/.test(reason), 'the reason text must not contain the word "undefined" anywhere')
+
+  // A string argument that is not path-shaped must stay allowed: the rule keys off
+  // the VALUE shape, not the parameter name.
+  const benign = await preExecute(ctx, { name: 'third_party_tool', arguments: { query: 'asc' } })
+  assert.equal(benign.kind, 'allow')
 })

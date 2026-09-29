@@ -13,7 +13,7 @@
  * @module dsh-path-guard/scan
  */
 
-import { expandPath } from './policy.js'
+import { expandPath } from './policy.ts'
 
 /** Needles shorter than this are too generic to be evidence of anything. */
 const MIN_NEEDLE = 4
@@ -27,6 +27,13 @@ const NAME_RULE_PREFIX = 'name:'
 
 /** Environment-variable spellings of a home directory, per shell dialect. */
 const HOME_FORMS = ['~', '$HOME', '${HOME}', '$env:USERPROFILE', '%USERPROFILE%']
+
+/** One scanner needle, as produced by {@link buildNeedles}. */
+export interface Needle {
+  needle: string
+  pattern: string
+  access: string
+}
 
 /** Glob metacharacters that end a literal prefix. */
 const GLOB_META = /[*?[]/
@@ -52,7 +59,7 @@ const GLOB_META = /[*?[]/
  * @param {string} pattern - one rule path as written.
  * @returns {string | undefined} the literal prefix, or undefined when the pattern is not reducible.
  */
-export function literalNeedlePrefix(pattern) {
+export function literalNeedlePrefix(pattern: string): string | undefined {
   const at = pattern.search(GLOB_META)
   if (at === -1) return pattern
   if (!pattern.endsWith('*')) return undefined
@@ -66,7 +73,7 @@ export function literalNeedlePrefix(pattern) {
  * @param {Array<{path?: string}>} rules - the configured rules.
  * @returns {string[]} the patterns that produced no needle for structural reasons.
  */
-export function unscannablePatterns(rules) {
+export function unscannablePatterns(rules?: ReadonlyArray<{ path?: unknown } | null | undefined>): string[] {
   const out = []
   for (const rule of rules ?? []) {
     if (rule === null || typeof rule !== 'object') continue
@@ -92,12 +99,14 @@ export function unscannablePatterns(rules) {
  * @param {{home?: string, workspace?: string, windows?: boolean}} ctx - expansion context.
  * @returns {Array<{needle: string, pattern: string, access: string}>} needles, longest first.
  */
-export function buildNeedles(rules, ctx) {
+export function buildNeedles(
+  rules: ReadonlyArray<{ path?: unknown; access?: unknown } | null | undefined>,
+  ctx: { home?: string | undefined; workspace?: string | undefined; windows?: boolean | undefined },
+): Needle[] {
   const { home, workspace, windows = false } = ctx
-  /** @type {Array<{needle: string, pattern: string, access: string}>} */
-  const needles = []
+  const needles: Needle[] = []
   const seen = new Set()
-  const push = (needle, pattern, access) => {
+  const push = (needle: string, pattern: string, access: string) => {
     if (needle.length < MIN_NEEDLE) return
     const key = windows ? needle.toLowerCase() : needle
     if (seen.has(key)) return
@@ -148,7 +157,7 @@ export function buildNeedles(rules, ctx) {
  * @param {boolean} windows - compare case-insensitively.
  * @returns {{needle: string, pattern: string, access: string} | undefined} the match, if any.
  */
-export function scanCommand(command, needles, windows) {
+export function scanCommand(command: unknown, needles: Needle[], windows: boolean) {
   if (typeof command !== 'string' || command === '' || needles.length === 0) return undefined
   const direct = scanText(command, needles, windows)
   if (direct !== undefined) return direct
@@ -169,7 +178,7 @@ export function scanCommand(command, needles, windows) {
  * @param {boolean} windows - compare case-insensitively.
  * @returns {{needle: string, pattern: string, access: string} | undefined} the match, if any.
  */
-function scanText(text, needles, windows) {
+function scanText(text: string, needles: Needle[], windows: boolean) {
   const haystack = windows ? text.toLowerCase() : text
   for (const entry of needles) {
     const needle = windows ? entry.needle.toLowerCase() : entry.needle
@@ -183,10 +192,10 @@ function scanText(text, needles, windows) {
  * @param {unknown} args - the parsed tool arguments.
  * @returns {string | undefined} `command` (bash/pwsh) or `text` (terminal_send).
  */
-export function commandOf(args) {
+export function commandOf(args: unknown): string | undefined {
   if (args === null || typeof args !== 'object') return undefined
   for (const field of ['command', 'text']) {
-    const value = args[field]
+    const value = (args as Record<string, unknown>)[field]
     if (typeof value === 'string' && value !== '') return value
   }
   return undefined
@@ -209,7 +218,7 @@ const WITHHELD = '[dsh-path-guard] 该段输出提到了受保护路径，已整
  * @param {boolean} windows - compare case-insensitively.
  * @returns {{changed: boolean, content: unknown}} the rewritten blocks, or the input when nothing matched.
  */
-export function redactTextBlocks(content, needles, windows) {
+export function redactTextBlocks(content: unknown, needles: Needle[], windows: boolean) {
   if (!Array.isArray(content) || needles.length === 0) return { changed: false, content }
   let changed = false
   const next = content.map((block) => {

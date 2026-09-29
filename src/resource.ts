@@ -65,6 +65,9 @@ export const CAPABILITY = Object.freeze({
   EXECUTE: 'execute',
 })
 
+/** Every capability value in {@link CAPABILITY}: the vocabulary's literal union. */
+type Capability = (typeof CAPABILITY)[keyof typeof CAPABILITY]
+
 /**
  * Strictness ladder, used to collapse the capabilities of several resources
  * into the one capability a call needs.
@@ -86,12 +89,82 @@ const CAPABILITY_RANK = Object.freeze({
 const MAX_ARG_DEPTH = 16
 
 /**
- * Freeze one modelled tool entry.
- * @param {ReadonlyArray<object>} fields - the tool's path-bearing argument fields.
- * @param {object} [extra] - extra metadata (the legacy `search` marker).
- * @returns {object} the frozen entry.
+ * One path-bearing argument field of a modelled tool.
+ *
+ * `capability` is absent exactly when `byCommand` is true — then the call's
+ * `command` argument decides the capability (see {@link KNOWN_TOOLS}).
  */
-const tool = (fields, extra = {}) => Object.freeze({
+interface FieldSpec {
+  /** The argument name, e.g. `file_path`. */
+  field: string
+  /** The capability this field's resource needs; absent only for a `byCommand` field. */
+  capability?: Capability
+  /** Fan-out: the field holds an array of objects and this key holds the path. */
+  each?: string
+  /** A search root: an absent argument means the caller must fall back to the session workspace. */
+  root?: boolean
+  /** Take the capability from the call's `command` argument instead. */
+  byCommand?: boolean
+}
+
+/** One modelled tool: its path-bearing fields, plus the legacy `search` marker. */
+interface KnownTool {
+  paths: ReadonlyArray<FieldSpec>
+  search?: string
+}
+
+/**
+ * The modelled tool table, keyed by tool name.
+ *
+ * The explicit key list keeps literal access (`KNOWN_TOOLS.glob.paths`)
+ * `undefined`-free under `noUncheckedIndexedAccess`, while the string index
+ * signature is what lets the wiring look up a model-facing name dynamically.
+ */
+type KnownToolTable = Readonly<Record<string, KnownTool>> & Readonly<Record<
+  'read' | 'read_image' | 'write' | 'edit' | 'lsp' | 'present' | 'str_replace_editor' | 'glob' | 'grep',
+  KnownTool
+>>
+
+/** One resource a call touches: the path value, the capability it needs, and where it was named. */
+interface Resource {
+  value: string
+  capability: Capability
+  field: string
+}
+
+/**
+ * What {@link resolveResources} reports.
+ *
+ * `reason` present means the call MUST be refused; `note` is informational only.
+ * `actionable` exists only on the unmodelled-tool path — modelled tools carry
+ * their resources directly.
+ */
+interface Resolution {
+  known: boolean
+  capability: Capability
+  resources: Resource[]
+  actionable?: Resource[]
+  opaque: boolean
+  reason?: string
+  note?: string
+}
+
+/** What {@link scanUnknownArgs} hands back to {@link resolveResources}. */
+interface ScanResult {
+  resources: Resource[]
+  actionable: Resource[]
+  noted: Resource[]
+  opaque: boolean
+  truncated: boolean
+}
+
+/**
+ * Freeze one modelled tool entry.
+ * @param {ReadonlyArray<FieldSpec>} fields - the tool's path-bearing argument fields.
+ * @param {{search?: string}} [extra] - extra metadata (the legacy `search` marker).
+ * @returns {KnownTool} the frozen entry.
+ */
+const tool = (fields: ReadonlyArray<FieldSpec>, extra: { search?: string } = {}): KnownTool => Object.freeze({
   paths: Object.freeze(fields.map(field => Object.freeze(field))),
   ...extra,
 })
@@ -117,7 +190,7 @@ const tool = (fields, extra = {}) => Object.freeze({
  * (`src/index.js` `evaluatePaths()` does this today). This module cannot: it
  * never sees the session.
  */
-export const KNOWN_TOOLS = Object.freeze({
+export const KNOWN_TOOLS: KnownToolTable = Object.freeze({
   read: tool([{ field: 'file_path', capability: CAPABILITY.READ }]),
   read_image: tool([{ field: 'file_path', capability: CAPABILITY.READ }]),
   write: tool([{ field: 'file_path', capability: CAPABILITY.WRITE }]),
@@ -214,7 +287,7 @@ const LIST_HINTS = new Set(['list', 'dir', 'scan'])
  * @param {unknown} name - the raw key or tool name.
  * @returns {string[]} the tokens.
  */
-function tokensOf(name) {
+function tokensOf(name: unknown) {
   return String(name)
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -229,7 +302,7 @@ function tokensOf(name) {
  * @param {unknown} name - the argument key or tool name.
  * @returns {boolean} true when the name reads as a path field.
  */
-function looksLikePathName(name) {
+function looksLikePathName(name: unknown): boolean {
   return tokensOf(name).some(token => PATH_NAME_TOKENS.has(token)
     || PATH_NAME_SUFFIXES.some(suffix => token.length > suffix.length && token.endsWith(suffix)))
 }
@@ -238,9 +311,9 @@ function looksLikePathName(name) {
  * Capability inferred from the field name. Order is write > read > list; an
  * unclassifiable name falls back to WRITE, the strictest rung.
  * @param {unknown} name - the argument key.
- * @returns {string} one of {@link CAPABILITY}.
+ * @returns {Capability} one of {@link CAPABILITY}.
  */
-function inferCapability(name) {
+function inferCapability(name: unknown): Capability {
   const tokens = tokensOf(name)
   if (tokens.some(token => WRITE_HINTS.has(token))) return CAPABILITY.WRITE
   if (tokens.some(token => READ_HINTS.has(token))) return CAPABILITY.READ
@@ -285,11 +358,13 @@ const POSIX_METACHARS = new Set(['/', '^', '$', '*', '+', '?', '(', ')', '[', ']
  * @param {string} text - the trimmed value.
  * @returns {boolean} true when it is an absolute POSIX path.
  */
-function isPosixAbsolute(text) {
+function isPosixAbsolute(text: string): boolean {
   if (!text.startsWith('/')) return false
   if (text === '/' || text === '//') return true
   const rest = text.startsWith('//') ? text.slice(2) : text.slice(1)
-  return rest !== '' && !POSIX_METACHARS.has(rest[0])
+  // `rest` is non-empty here, so `rest[0]` is defined; the assertion only
+  // satisfies `noUncheckedIndexedAccess` and is erased at emit.
+  return rest !== '' && !POSIX_METACHARS.has(rest[0]!)
 }
 
 /**
@@ -306,7 +381,7 @@ function isPosixAbsolute(text) {
  * @param {string} text - the trimmed, whitespace-free candidate.
  * @returns {boolean} true when it is an obvious relative path.
  */
-function looksLikeRelativePath(text) {
+function looksLikeRelativePath(text: string): boolean {
   if (/\s/.test(text)) return false
   // A leading separator means this is an absolute-ish form, already judged by
   // the dedicated legs above. Re-admitting it here would let a rejected regex
@@ -327,7 +402,7 @@ function looksLikeRelativePath(text) {
  * @param {string} raw - the argument value.
  * @returns {boolean} true when the value looks like a path.
  */
-function looksLikePathValue(raw) {
+function looksLikePathValue(raw: string): boolean {
   const text = raw.trim()
   if (text === '') return false
   if (WINDOWS_DRIVE.test(text) || WINDOWS_UNC.test(text) || isPosixAbsolute(text)) return true
@@ -344,7 +419,7 @@ function looksLikePathValue(raw) {
  * @param {string} value - the trimmed argument value.
  * @returns {boolean} true when the field holds an opaque program.
  */
-function looksLikeProgramField(name, value) {
+function looksLikeProgramField(name: unknown, value: string): boolean {
   const tokens = tokensOf(name)
   if (tokens.some(token => STRONG_PROGRAM_TOKENS.has(token))) return true
   return tokens.some(token => WEAK_PROGRAM_TOKENS.has(token)) && PROGRAM_SHAPE.test(value)
@@ -356,11 +431,11 @@ function looksLikeProgramField(name, value) {
 
 /**
  * The strictest capability of a set, or undefined when the set is empty.
- * @param {ReadonlyArray<string>} capabilities - candidate capabilities.
- * @returns {string | undefined} the strictest one.
+ * @param {ReadonlyArray<Capability>} capabilities - candidate capabilities.
+ * @returns {Capability | undefined} the strictest one.
  */
-function strictestCapability(capabilities) {
-  let strictest
+function strictestCapability(capabilities: ReadonlyArray<Capability>): Capability | undefined {
+  let strictest: Capability | undefined
   for (const capability of capabilities) {
     const rank = CAPABILITY_RANK[capability] ?? 0
     if (strictest === undefined || rank > (CAPABILITY_RANK[strictest] ?? 0)) strictest = capability
@@ -371,10 +446,10 @@ function strictestCapability(capabilities) {
 /**
  * The accessor notation used in a resource's `field`, e.g. `file_path` or
  * `files[].path`. Only used for messages, never for lookup.
- * @param {{field: string, each?: string}} spec - the field spec.
+ * @param {FieldSpec} spec - the field spec.
  * @returns {string} the accessor notation.
  */
-function fieldNotation(spec) {
+function fieldNotation(spec: FieldSpec): string {
   return spec.each === undefined ? spec.field : `${spec.field}[].${spec.each}`
 }
 
@@ -382,18 +457,20 @@ function fieldNotation(spec) {
  * Every non-blank string value a modelled field contributes, mirroring
  * `collectPaths()` in `src/tool-fields.js` exactly (including not trimming).
  * @param {unknown} args - the parsed tool arguments.
- * @param {{field: string, each?: string}} spec - the field spec.
+ * @param {FieldSpec} spec - the field spec.
  * @returns {string[]} the values present.
  */
-function modelledValues(args, spec) {
+function modelledValues(args: unknown, spec: FieldSpec): string[] {
   if (args === null || typeof args !== 'object') return []
-  const raw = args[spec.field]
+  // `as` is erased at emit, not a runtime coercion: the arguments are the parsed
+  // JSON object the caller already hands over.
+  const raw = (args as Record<string, unknown>)[spec.field]
   const values = spec.each === undefined
     ? [raw]
     : Array.isArray(raw)
-      ? raw.map(entry => (entry !== null && typeof entry === 'object' ? entry[spec.each] : undefined))
+      ? raw.map(entry => (entry !== null && typeof entry === 'object' ? (entry as Record<string, unknown>)[spec.each!] : undefined))
       : []
-  return values.filter(value => typeof value === 'string' && value.trim() !== '')
+  return values.filter((value): value is string => typeof value === 'string' && value.trim() !== '')
 }
 
 /**
@@ -401,24 +478,29 @@ function modelledValues(args, spec) {
  * `opForCommand()` in `src/tool-fields.js`: `view` reads, everything else —
  * including a missing command — writes.
  * @param {unknown} args - the parsed tool arguments.
- * @returns {string} {@link CAPABILITY.READ} or {@link CAPABILITY.WRITE}.
+ * @returns {Capability} {@link CAPABILITY.READ} or {@link CAPABILITY.WRITE}.
  */
-function commandCapability(args) {
-  const command = args !== null && typeof args === 'object' ? args.command : undefined
+function commandCapability(args: unknown): Capability {
+  // `as` is erased at emit; the guard in the same expression already proved the
+  // value is an object.
+  const command = args !== null && typeof args === 'object' ? (args as Record<string, unknown>).command : undefined
   return command === 'view' ? CAPABILITY.READ : CAPABILITY.WRITE
 }
 
 /**
  * Resolve a modelled tool's resources.
- * @param {object} spec - the {@link KNOWN_TOOLS} entry.
+ * @param {KnownTool} spec - the {@link KNOWN_TOOLS} entry.
  * @param {unknown} args - the parsed tool arguments.
- * @returns {{known: boolean, capability: string, resources: Array<object>, opaque: boolean}} the resolution.
+ * @returns {Resolution} the resolution.
  */
-function resolveKnown(spec, args) {
-  const resources = []
-  const capabilities = []
+function resolveKnown(spec: KnownTool, args: unknown): Resolution {
+  const resources: Resource[] = []
+  const capabilities: Capability[] = []
   for (const field of spec.paths) {
-    const capability = field.byCommand === true ? commandCapability(args) : field.capability
+    // `capability` is absent only on a `byCommand` field, which the left branch
+    // already answered. The assertion is erased at emit; a hypothetical
+    // `undefined` would still collapse onto WRITE below (fail-closed).
+    const capability = field.byCommand === true ? commandCapability(args) : field.capability!
     capabilities.push(capability)
     for (const value of modelledValues(args, field)) {
       resources.push({ value, capability, field: fieldNotation(field) })
@@ -436,15 +518,15 @@ function resolveKnown(spec, args) {
  * Walk an unmodelled tool's arguments and collect the resources the heuristics
  * can see, plus whether any argument is an opaque program.
  * @param {unknown} args - the parsed tool arguments.
- * @returns {{resources: Array<object>, actionable: Array<object>, noted: Array<object>, opaque: boolean, truncated: boolean}} what was found.
+ * @returns {ScanResult} what was found.
  */
-function scanUnknownArgs(args) {
-  const resources = []
+function scanUnknownArgs(args: unknown): ScanResult {
+  const resources: Resource[] = []
   /** Values whose SHAPE is a path: real evidence, safe to refuse on. */
-  const actionable = []
+  const actionable: Resource[] = []
   /** Values collected on the field-NAME leg alone: reported, never a ground to refuse. */
-  const noted = []
-  const seen = new WeakSet()
+  const noted: Resource[] = []
+  const seen = new WeakSet<object>()
   let opaque = false
   let truncated = false
 
@@ -459,7 +541,7 @@ function scanUnknownArgs(args) {
    * @param {string} field - the accessor notation.
    * @param {string} key - the immediate argument name.
    */
-  const visit = (raw, field, key) => {
+  const visit = (raw: string, field: string, key: string) => {
     const trimmed = raw.trim()
     if (trimmed === '') return
     const named = looksLikePathName(key)
@@ -469,7 +551,7 @@ function scanUnknownArgs(args) {
     // The stored value is trimmed: leading/trailing blanks are not part of a
     // resource identity, and keeping them would let ` C:/secrets ` be judged as
     // a cwd-relative path while the tool itself reads the trimmed one.
-    const resource = { value: trimmed, capability: inferCapability(key), field }
+    const resource: Resource = { value: trimmed, capability: inferCapability(key), field }
     resources.push(resource)
     // WHICH leg matched is what the caller needs, so it is kept OUT of the
     // resource shape (that stays `{value, capability, field}`) and reported as
@@ -486,7 +568,7 @@ function scanUnknownArgs(args) {
    * @param {string} key - the argument name that led here.
    * @param {number} depth - the current nesting depth.
    */
-  const walk = (node, prefix, key, depth) => {
+  const walk = (node: unknown, prefix: string, key: string, depth: number) => {
     if (depth > MAX_ARG_DEPTH) {
       truncated = true
       return
@@ -496,13 +578,15 @@ function scanUnknownArgs(args) {
     seen.add(node)
     if (Array.isArray(node)) {
       const item = prefix === '' ? '[]' : `${prefix}[]`
-      for (const entry of node) {
+      // The `as` casts below only pin down what `Array.isArray` / `Object.entries`
+      // already narrowed; they are erased at emit.
+      for (const entry of node as ReadonlyArray<unknown>) {
         if (typeof entry === 'string') visit(entry, item, key)
         else walk(entry, item, key, depth + 1)
       }
       return
     }
-    for (const [name, value] of Object.entries(node)) {
+    for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
       const field = prefix === '' ? name : `${prefix}.${name}`
       if (typeof value === 'string') visit(value, field, name)
       else walk(value, field, name, depth + 1)
@@ -518,9 +602,13 @@ function scanUnknownArgs(args) {
  * one. Never throws for non-object arguments.
  * @param {string} toolName - the model-facing tool name.
  * @param {unknown} args - the parsed, deep-frozen tool arguments.
- * @returns {{known: boolean, capability: string, resources: Array<{value: string, capability: string, field: string, matched?: string}>, actionable?: Array<object>, opaque: boolean, reason?: string, note?: string}} the resolution. `reason` present means the call MUST be refused; `note` is informational only.
+ * @returns {Resolution} the resolution. `reason` present means the call MUST be refused; `note` is informational only.
+ *
+ * `toolName` is typed `unknown` on purpose: the guard below is the contract, and
+ * callers really do hand over non-strings (the specs pin that down). Widening it
+ * from `string` is type-only — the runtime is unchanged.
  */
-export function resolveResources(toolName, args) {
+export function resolveResources(toolName: unknown, args: unknown): Resolution {
   const name = typeof toolName === 'string' ? toolName : ''
 
   if (OPAQUE_TOOLS.has(name)) {
@@ -531,17 +619,17 @@ export function resolveResources(toolName, args) {
   if (spec !== undefined) return resolveKnown(spec, args)
 
   const { resources, actionable, noted, opaque, truncated } = scanUnknownArgs(args)
-  const capabilities = resources.map(resource => resource.capability)
+  const capabilities: Capability[] = resources.map(resource => resource.capability)
   if (opaque) capabilities.push(CAPABILITY.EXECUTE)
 
-  const result = {
+  const result: Resolution = {
     known: false,
     capability: strictestCapability(capabilities) ?? CAPABILITY.WRITE,
     resources,
     actionable,
     opaque,
   }
-  const fieldsOf = list => [...new Set(list.map(resource => resource.field))].join(', ')
+  const fieldsOf = (list: ReadonlyArray<Resource>): string => [...new Set(list.map(resource => resource.field))].join(', ')
 
   // The caller needs the grounds for a fail-closed decision, not just the list.
   if (actionable.length > 0) {
@@ -578,10 +666,14 @@ export function resolveResources(toolName, args) {
  *
  * Note that MCP and desktop-driver prefixes count as governed through the
  * exotic surface, so an MCP tool is never silently ungoverned.
- * @param {string} toolName - the model-facing tool name.
+ * @param {unknown} toolName - the model-facing tool name; non-strings are simply not governed.
  * @returns {boolean} true when a call to this tool is this plugin's business.
+ *
+ * `toolName` is typed `unknown` on purpose: the `typeof` guard below is the
+ * contract (the specs pin non-string inputs to `false`), and widening it from
+ * `string` is type-only — the runtime is unchanged.
  */
-export function isGoverned(toolName) {
+export function isGoverned(toolName: unknown): boolean {
   const name = typeof toolName === 'string' ? toolName : ''
   if (name === '') return false
   if (KNOWN_TOOLS[name] !== undefined) return true
@@ -602,10 +694,13 @@ export function isGoverned(toolName) {
  * discloses content and `read` would be the stricter reading. That is a policy
  * decision, not a resolution one — flipping it here would silently change
  * verdicts for every existing rule.
- * @param {string} capability - one of {@link CAPABILITY}.
+ * `capability` also accepts `undefined`: the `default` branch IS the contract for
+ * anything unrecognised (the specs pin `policyAccessFor(undefined)` to `'write'`),
+ * so the widening is type-only and the runtime is unchanged.
+ * @param {string | undefined} capability - one of {@link CAPABILITY}, or anything unrecognised.
  * @returns {'list' | 'read' | 'write'} the policy ladder rung.
  */
-export function policyAccessFor(capability) {
+export function policyAccessFor(capability: string | undefined): 'list' | 'read' | 'write' {
   switch (capability) {
     case CAPABILITY.LIST:
     case CAPABILITY.ENUMERATE:

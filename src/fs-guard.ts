@@ -59,7 +59,7 @@ const DENY_ACCESS = new Set(['none', 'list', 'read']);
 const ALLOW_ACCESS = new Set(['write', 'allow']);
 
 /** 档位的人话说明，与 src/deny.js 的 ACCESS_TEXT 同源（此处自带一份以保持零依赖）。 */
-const ACCESS_TEXT = {
+const ACCESS_TEXT: Record<string, string> = {
   none: '完全禁止（不可见、不可读、不可写）',
   list: '仅允许查看文件名与目录结构，不允许读取内容',
   read: '允许读取，不允许写入或修改',
@@ -75,9 +75,9 @@ const REQUIRED_TEXT = 'write（创建或修改文件内容）';
  * @param {unknown} decision - `decide()` 的返回值。
  * @returns {{kind: 'allow' | 'deny' | 'invalid', access?: string}} 归类结果。
  */
-function classify(decision) {
+function classify(decision: unknown): { kind: 'allow'; access: string } | { kind: 'deny'; access: string } | { kind: 'invalid'; access?: string | undefined } {
   if (decision === null || typeof decision !== 'object') return { kind: 'invalid' };
-  const access = /** @type {{access?: unknown}} */ (decision).access;
+  const access = (decision as { access?: unknown }).access;
   if (typeof access !== 'string') return { kind: 'invalid' };
   if (ALLOW_ACCESS.has(access)) return { kind: 'allow', access };
   if (DENY_ACCESS.has(access)) return { kind: 'deny', access };
@@ -89,7 +89,7 @@ function classify(decision) {
  * @param {string | undefined} displayPath - 已校验的 displayPath。
  * @returns {string} 供错误文本使用的路径。
  */
-function shownPath(displayPath) {
+function shownPath(displayPath: string | undefined): string {
   return displayPath === undefined ? '(displayPath 不可用)' : displayPath;
 }
 
@@ -100,7 +100,7 @@ function shownPath(displayPath) {
  * @param {{eventName: string, displayPath: string | undefined, access: string}} input - 判定事实。
  * @returns {string} 面向模型/用户的拒绝原因。
  */
-function denialMessage({ eventName, displayPath, access }) {
+function denialMessage({ eventName, displayPath, access }: { eventName: string; displayPath: string | undefined; access: string }): string {
   const shown = shownPath(displayPath);
   return [
     `拒绝写入「${shown}」：该路径由用户通过 dsh-path-guard 限制为 access: ${access}，不允许写入。`,
@@ -127,7 +127,7 @@ function denialMessage({ eventName, displayPath, access }) {
  * @param {{eventName: string, displayPath: string | undefined, reason: string}} input - 失败事实。
  * @returns {string} 面向模型/用户的拒绝原因。
  */
-function failClosedMessage({ eventName, displayPath, reason }) {
+function failClosedMessage({ eventName, displayPath, reason }: { eventName: string; displayPath: string | undefined; reason: string }): string {
   const shown = shownPath(displayPath);
   return [
     `拒绝写入「${shown}」：路径守卫无法确定该目标的访问档位，按最严处理（fail-closed）。`,
@@ -160,7 +160,12 @@ function failClosedMessage({ eventName, displayPath, reason }) {
  * }} 与 `fs/write-intent` / `fs/edit-intent` 事件签名一致的 handler。
  * @throws {TypeError} 依赖缺失或类型不对（接线错误，加载期就报，避免静默 fail-open）。
  */
-export function createFsGuard(deps) {
+export function createFsGuard(deps: {
+  decide: (targetKey: unknown, displayPath: string, actor: unknown) => unknown
+  actorIsAgent: (actor: unknown) => unknown
+  FsError: new (message: string, code: string, options?: { cause?: unknown }) => Error
+  logger?: unknown
+}) {
   if (deps === null || typeof deps !== 'object') {
     throw new TypeError('createFsGuard: deps 必须是对象 { decide, actorIsAgent, FsError, logger? }');
   }
@@ -184,8 +189,8 @@ export function createFsGuard(deps) {
    * @param {...unknown} args - 透传给日志器的参数。
    * @returns {void}
    */
-  const log = (level, ...args) => {
-    const fn = logger === null || typeof logger !== 'object' ? undefined : logger[level];
+  const log = (level: 'warn' | 'debug', ...args: unknown[]): void => {
+    const fn = logger === null || typeof logger !== 'object' ? undefined : (logger as Record<string, unknown>)[level];
     if (typeof fn !== 'function') return;
     try {
       fn.apply(logger, args);
@@ -200,7 +205,7 @@ export function createFsGuard(deps) {
    * @param {unknown} [cause] - 可选原因链。
    * @returns {Error & { code: string }} `FS_SANDBOX_DENIED` 错误。
    */
-  const denied = (message, cause) => (cause === undefined
+  const denied = (message: string, cause?: unknown) => (cause === undefined
     ? new FsError(message, 'FS_SANDBOX_DENIED')
     : new FsError(message, 'FS_SANDBOX_DENIED', { cause }));
 
@@ -211,18 +216,16 @@ export function createFsGuard(deps) {
    * @param {'fs/write-intent' | 'fs/edit-intent'} eventName - 事件名。
    * @returns {(target: unknown, actor: unknown, next: Function) => Promise<unknown>} handler。
    */
-  const makeHandler = (eventName) => async function intentHandler(target, actor, next) {
+  const makeHandler = (eventName: 'fs/write-intent' | 'fs/edit-intent') => async function intentHandler(target: unknown, actor: unknown, next: () => unknown) {
     // 只读取 target 的公开字段，不解析 targetKey（types.ts:11-16：opaque，禁止解析）。
     // 属性读取本身也可能抛（异常后端 / Proxy 目标）：读不到就当形状不可用，
     // 但不能因此把用户调用也炸掉，所以这里吞掉异常、交给后面的分支处理。
-    /** @type {unknown} */
-    let targetKey;
-    /** @type {unknown} */
-    let rawDisplayPath;
+    let targetKey: unknown;
+    let rawDisplayPath: unknown;
     try {
       if (target !== null && typeof target === 'object') {
-        targetKey = target.targetKey;
-        rawDisplayPath = target.displayPath;
+        targetKey = (target as { targetKey?: unknown }).targetKey;
+        rawDisplayPath = (target as { displayPath?: unknown }).displayPath;
       }
     } catch {
       // 读不到字段 → 下面的形状校验会按 fail-closed 处理。

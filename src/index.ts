@@ -34,26 +34,26 @@
 import os from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 
-import { Config } from './config.js'
-import { capabilities, compile, expandPath, match } from './policy.js'
+import { Config } from './config.ts'
+import { capabilities, compile, expandPath, match } from './policy.ts'
 import {
   isRecognizedGlobValue,
   isRecognizedGrepValue,
   redactGlobValue,
   redactGrepValue,
-} from './redact.js'
+} from './redact.ts'
 import {
   KNOWN_TOOLS,
   isGoverned,
   policyAccessFor,
   resolveResources,
-} from './resource.js'
+} from './resource.ts'
 import {
   SHELL_TOOLS,
   isExoticTool,
   isScriptTool,
   scriptOf,
-} from './tool-fields.js'
+} from './tool-fields.ts'
 import {
   denialText,
   exoticDenialText,
@@ -63,10 +63,70 @@ import {
   selfDenialText,
   shellDenialText,
   unknownToolDenialText,
-} from './deny.js'
-import { buildNeedles, commandOf, redactTextBlocks, scanCommand, unscannablePatterns } from './scan.js'
-import { createNotifier } from './notify.js'
-import { createFsGuard } from './fs-guard.js'
+} from './deny.ts'
+import { buildNeedles, commandOf, redactTextBlocks, scanCommand, unscannablePatterns } from './scan.ts'
+import { createNotifier } from './notify.ts'
+import { createFsGuard } from './fs-guard.ts'
+
+/** 本插件自产的一条规则（与 `policy.ts` 的 `RuleInput` 形状一致）。 */
+type LocalRule = { id: string; path: string; access: string; note?: string | undefined }
+
+/** 策略判定结果。结构镜像自本仓 `src/policy.ts` 的 `match()` 返回形状（外加 `defaultAccess` 分支）。 */
+type Decision = {
+  access: string
+  ruleId?: string | undefined
+  pattern?: string | undefined
+}
+
+/** 一次拒绝的内部记录（`checkPath` 的返回值，供 `evaluatePaths` 原样上抛）。 */
+type DenialRecord = {
+  reason: string
+  target: string
+  access: string
+  ruleId?: string | undefined
+  rulePath?: string | undefined
+}
+
+/** 一条拒绝事实，`reportDenial` / `denialText` 的入参。 */
+type DenialHit = {
+  reason: string
+  target?: string | undefined
+  access?: string | undefined
+  rulePath?: string | undefined
+  ruleId?: string | undefined
+}
+
+/**
+ * 工具调用对象。结构镜像自 DSH `packages/core/tools/src/index.ts` 的 `ToolExecution`，
+ * 只列出本插件真正读取的字段（`name` / `arguments` / `signal` / `agent.session.header.cwd`）。
+ */
+type ToolExecution = {
+  name: string
+  arguments: Record<string, unknown>
+  signal?: unknown
+  agent?: { session: { header: { cwd: string } } } | undefined
+}
+
+/**
+ * Cordis 上下文子集。结构镜像自 DSH `packages/core` 各包的 `src/index.ts` 与
+ * `vendor/cordis/src/events.ts`，只列出本插件用到的成员。
+ */
+type CordisContext = {
+  logger: {
+    info: (...args: unknown[]) => unknown
+    warn: (...args: unknown[]) => unknown
+    error: (...args: unknown[]) => unknown
+    debug: (...args: unknown[]) => unknown
+  }
+  fs?: {
+    resolve: (path: string, opts?: { cwd?: string; signal?: unknown }) => Promise<{ targetKey: unknown; displayPath: string }>
+    processPath: (target: unknown) => string
+    readText?: (target: unknown, signal?: unknown) => Promise<string>
+  } | undefined
+  tools?: { guard: (handler: (exec: ToolExecution) => unknown) => unknown } | undefined
+  on: (...args: unknown[]) => unknown
+  get: (name: string) => unknown
+}
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'path-guard'
@@ -124,7 +184,7 @@ const TARBALL_SPEC = /\.(?:tgz|tar\.gz)(?:#.*)?$/i
  * @param {unknown} raw - the `install_bundle` target.
  * @returns {boolean} true for a plain registry package spec.
  */
-function isRegistrySpec(raw) {
+function isRegistrySpec(raw: unknown): boolean {
   const spec = String(raw ?? '').trim()
   if (spec === '') return false
   const path = spec.replace(/^(?:file|link):/, '')
@@ -141,7 +201,7 @@ function isRegistrySpec(raw) {
  * @param {unknown} raw - the `install_bundle` target.
  * @returns {string | undefined} the absolute directory, or undefined.
  */
-function localSpecPath(raw) {
+function localSpecPath(raw: unknown): string | undefined {
   const spec = String(raw ?? '').trim()
   if (spec === '') return undefined
   const stripped = spec.replace(/^(?:file|link):/, '')
@@ -163,15 +223,15 @@ const PROFILE_FILES = ['cordis.patch.yml', 'cordis.yml', 'package.json']
  * @param {unknown} value - candidate.
  * @returns {string | undefined} the string when usable.
  */
-function nonEmpty(value) {
+function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
 /** Capability ordering; a lower rank is stricter. */
-const RANK = { none: 0, list: 1, read: 2, write: 3 }
+const RANK: Record<string, number> = { none: 0, list: 1, read: 2, write: 3 }
 
 /** Wording for the operation a denied call was attempting. */
-const REQUIRED_TEXT = {
+const REQUIRED_TEXT: Record<string, string> = {
   list: '列目录 / 查看文件名与目录结构',
   read: '读取文件内容',
   write: '写入或修改文件',
@@ -198,9 +258,9 @@ const NO_RULES = Object.freeze([])
  * @param {unknown} value - a resolved config field or a plain value.
  * @returns {unknown} the current snapshot.
  */
-export function unwrap(value) {
-  if (value !== null && typeof value === 'object' && VOLATILE_WRITE in value && typeof value.get === 'function') {
-    return value.get()
+export function unwrap(value: unknown): unknown {
+  if (value !== null && typeof value === 'object' && VOLATILE_WRITE in value && typeof (value as { get?: unknown }).get === 'function') {
+    return (value as unknown as { get: () => unknown }).get()
   }
   return value
 }
@@ -211,10 +271,10 @@ export function unwrap(value) {
  * @param {{access: string} | undefined} b - second decision.
  * @returns {{access: string} | undefined} the stricter decision.
  */
-function strictest(a, b) {
+function strictest(a: Decision | undefined, b: Decision | undefined): Decision | undefined {
   if (a === undefined) return b
   if (b === undefined) return a
-  return RANK[a.access] <= RANK[b.access] ? a : b
+  return RANK[a.access]! <= RANK[b.access]! ? a : b
 }
 
 /**
@@ -223,9 +283,9 @@ function strictest(a, b) {
  * @param {string} required - the operation the call performs (`list`/`read`/`write`).
  * @returns {boolean} true when the call may proceed.
  */
-function permits(decision, required) {
+function permits(decision: Decision | undefined, required: string): boolean {
   if (decision === undefined || decision.access === 'allow') return true
-  return capabilities(decision.access)[required] === true
+  return (capabilities(decision.access) as Record<string, boolean>)[required] === true
 }
 
 /**
@@ -233,8 +293,8 @@ function permits(decision, required) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {Record<string, unknown>} config - the row config, volatile fields still wrapped.
  */
-export function apply(ctx, config) {
-  const raw = config !== null && typeof config === 'object' ? config : {}
+export function apply(ctx: CordisContext, config: Record<string, unknown>) {
+  const raw: Record<string, unknown> = config !== null && typeof config === 'object' ? config : {}
   const home = os.homedir()
   const windows = process.platform === 'win32'
 
@@ -244,7 +304,7 @@ export function apply(ctx, config) {
    * @param {keyof typeof DEFAULTS} key - the field name.
    * @returns {unknown} the current value.
    */
-  const read = (key) => {
+  const read = (key: keyof typeof DEFAULTS): unknown => {
     const value = unwrap(raw[key])
     return value === undefined || value === null ? DEFAULTS[key] : value
   }
@@ -259,7 +319,7 @@ export function apply(ctx, config) {
    * @returns {Array<object>} the configured rules.
    * @throws {TypeError} when the value is present and not an array.
    */
-  const rulesOf = () => {
+  const rulesOf = (): Array<object>  => {
     const value = read('rules')
     if (value === undefined || value === null) return []
     if (!Array.isArray(value)) {
@@ -277,7 +337,7 @@ export function apply(ctx, config) {
    * make the plugin unusable for the workspace it is meant to allow.
    */
   const scanRules = () => [
-    ...rulesOf().filter(rule => rule === null || typeof rule !== 'object' || rule.access !== 'write'),
+    ...rulesOf().filter(rule => rule === null || typeof rule !== 'object' || (rule as { access?: unknown }).access !== 'write'),
     ...selfRulesFor(),
   ]
 
@@ -286,7 +346,7 @@ export function apply(ctx, config) {
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
    * @returns {ReturnType<typeof buildNeedles>} the needles, longest first.
    */
-  const shellNeedles = (exec) => {
+  const shellNeedles = (exec: ToolExecution) => {
     const workspace = exec.agent?.session.header.cwd
     return buildNeedles(scanRules(), { home, windows, ...(workspace === undefined ? {} : { workspace }) })
   }
@@ -298,7 +358,7 @@ export function apply(ctx, config) {
    * modelled tools, the opaque ones, the exotic ones, and the name shapes that
    * mean "this could touch a filesystem".
    */
-  const governs = toolName => isGoverned(toolName)
+  const governs = (toolName: string) => isGoverned(toolName)
     || SHELL_TOOLS.has(toolName)
     || isScriptTool(toolName)
     || isExoticTool(toolName)
@@ -319,10 +379,10 @@ export function apply(ctx, config) {
    * environment variable as a last resort.
    * @returns {readonly string[]} absolute paths, or `NO_RULES` when unresolvable.
    */
-  const resolveSelfPaths = () => {
-    const lookup = (name, field) => {
+  const resolveSelfPaths = (): readonly string[] | readonly never[] => {
+    const lookup = (name: string, field: string) => {
       try {
-        return nonEmpty(ctx.get?.(name)?.[field])
+        return nonEmpty((ctx.get?.(name) as Record<string, unknown> | undefined)?.[field])
       } catch {
         return undefined
       }
@@ -339,8 +399,8 @@ export function apply(ctx, config) {
       : Object.freeze(PROFILE_FILES.map(file => join(dir, file)))
   }
 
-  let selfRulePaths = null
-  let selfRules = NO_RULES
+  let selfRulePaths: string | null | undefined = null
+  let selfRules: readonly LocalRule[] = NO_RULES
   let warnedNoProfile = false
 
   /** Implicit rules that keep the AI from editing the composition carrying this policy. */
@@ -371,9 +431,9 @@ export function apply(ctx, config) {
     return selfRules
   }
 
-  let cachedRules = null
-  let cachedExtra = null
-  let cachedPolicy = null
+  let cachedRules: unknown = null
+  let cachedExtra: unknown = null
+  let cachedPolicy: ReturnType<typeof compile> | null = null
   let warnedInvalid = ''
   let warnedUnscannable = ''
 
@@ -438,7 +498,7 @@ export function apply(ctx, config) {
    * @param {string | undefined} workspace - the session workspace, for `${workspace}` rules.
    * @returns {{access: string, ruleId?: string, pattern?: string} | undefined} the decision.
    */
-  const decideAbsolute = (absolutePath, workspace) => {
+  const decideAbsolute = (absolutePath: string, workspace: string | undefined): Decision | undefined => {
     if (typeof absolutePath !== 'string' || absolutePath === '') return undefined
     const opts = workspace === undefined ? {} : { workspace }
     const hit = match(policy().rules, absolutePath, opts)
@@ -455,7 +515,7 @@ export function apply(ctx, config) {
    * @param {string} rawPath - the argument as the model wrote it.
    * @returns {Promise<{decision: object | undefined, shown: string}>} the stricter decision and its path.
    */
-  const decidePath = async (exec, rawPath) => {
+  const decidePath = async (exec: ToolExecution, rawPath: string) => {
     const workspace = exec.agent?.session.header.cwd
     let expanded = rawPath
     try {
@@ -502,22 +562,22 @@ export function apply(ctx, config) {
    * @param {string} required - `list`, `read` or `write`.
    * @returns {Promise<string | undefined>} a denial reason, or undefined to allow.
    */
-  const checkPath = async (exec, rawPath, required) => {
+  const checkPath = async (exec: ToolExecution, rawPath: string, required: string): Promise<DenialRecord | undefined> => {
     const { decision, shown } = await decidePath(exec, rawPath)
     if (permits(decision, required)) return undefined
     return {
       reason: denialText({
         toolName: exec.name,
         shownPath: shown,
-        access: decision.access,
+        access: decision!.access,
         required: REQUIRED_TEXT[required] ?? required,
-        ...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
-        ...(decision.pattern === undefined ? {} : { rulePath: decision.pattern }),
+        ...(decision!.ruleId === undefined ? {} : { ruleId: decision!.ruleId }),
+        ...(decision!.pattern === undefined ? {} : { rulePath: decision!.pattern }),
       }),
       target: shown,
-      access: decision.access,
-      ...(decision.ruleId === undefined ? {} : { ruleId: decision.ruleId }),
-      ...(decision.pattern === undefined ? {} : { rulePath: decision.pattern }),
+      access: decision!.access,
+      ...(decision!.ruleId === undefined ? {} : { ruleId: decision!.ruleId }),
+      ...(decision!.pattern === undefined ? {} : { rulePath: decision!.pattern }),
     }
   }
 
@@ -542,9 +602,9 @@ export function apply(ctx, config) {
    *   - an opaque tool (shell/script) yields no resources here — the scan pass in
    *     the synchronous guard owns that channel.
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
-   * @returns {Promise<string | undefined>} a denial reason, or undefined to allow.
+   * @returns {Promise<DenialRecord | undefined>} a denial record, or undefined to allow.
    */
-  const evaluatePaths = async (exec) => {
+  const evaluatePaths = async (exec: ToolExecution): Promise<DenialRecord | undefined> => {
     const args = exec.arguments
     const workspace = exec.agent?.session.header.cwd
     const resolved = resolveResources(exec.name, args)
@@ -577,9 +637,17 @@ export function apply(ctx, config) {
     if (exec.name === 'plugin_manager') return undefined
     if (resolved.reason !== undefined) {
       if (resolved.note !== undefined) ctx.logger.debug('path-guard: %s', resolved.note)
-      return unknownToolDenialText({ toolName: exec.name, reason: resolved.reason })
+      // Return a RECORD, not the message string. The caller reads `hit.reason`
+      // (and reports `hit.target`), so returning a bare string here silently
+      // rendered the refusal as the literal text `undefined` — a real defect,
+      // caught while typing this file and fixed rather than asserted away.
+      return {
+        reason: unknownToolDenialText({ toolName: exec.name, reason: resolved.reason }),
+        target: exec.name,
+        access: 'none',
+      }
     }
-    if (resolved.note !== undefined) ctx.logger.debug('path-guard: %s', resolved.note)
+    if ((resolved as { note?: string | undefined }).note !== undefined) ctx.logger.debug('path-guard: %s', (resolved as { note?: string | undefined }).note)
     return undefined
   }
 
@@ -590,7 +658,7 @@ export function apply(ctx, config) {
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
    * @returns {{reason: string, target: string, access: string, rulePath?: string} | undefined} the verdict.
    */
-  const evaluateOpaque = (exec) => {
+  const evaluateOpaque = (exec: ToolExecution) => {
     const script = isScriptTool(exec.name)
     const text = script ? scriptOf(exec.name, exec.arguments) : commandOf(exec.arguments)
     if (text === undefined) return undefined
@@ -646,11 +714,11 @@ export function apply(ctx, config) {
    * @param {unknown} args - the `plugin_manager` arguments.
    * @returns {string | undefined} a denial reason, or undefined to allow.
    */
-  const selfTargetVerdict = (args) => {
+  const selfTargetVerdict = (args: unknown): string | undefined  => {
     if (args === null || typeof args !== 'object') return undefined
-    const action = args.action
+    const action = (args as Record<string, unknown>).action
     if (typeof action !== 'string' || !COMPOSITION_CHANGING_ACTIONS.has(action)) return undefined
-    const target = typeof args.target === 'string' ? args.target : ''
+    const target = typeof (args as Record<string, unknown>).target === 'string' ? (args as Record<string, unknown>).target as string : ''
     // Identity by name: the entry id and the bundle name are stable, so nothing
     // can dodge this by renaming a file.
     if (target.includes(SELF_PACKAGE) || target.includes(SELF_ROW_ID)) {
@@ -689,7 +757,7 @@ export function apply(ctx, config) {
    * @param {{reason: string, target?: string, access?: string, rulePath?: string, ruleId?: string}} hit - the verdict.
    * @param {string} kind - `path` | `shell` | `exotic` | `self` | `redaction`.
    */
-  const reportDenial = (exec, hit, kind) => {
+  const reportDenial = (exec: ToolExecution, hit: DenialHit, kind: string) => {
     ctx.logger.warn('path-guard: denied %s — %s', exec.name, String(hit.reason).split('\n')[0])
     const mode = read('notify')
     if (mode === 'off') return
@@ -725,22 +793,22 @@ export function apply(ctx, config) {
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the running call.
    * @returns {Promise<{reason: string, target: string} | undefined>} a denial, or undefined to allow.
    */
-  const evaluateLocalInstall = async (exec) => {
+  const evaluateLocalInstall = async (exec: ToolExecution) => {
     if (read('selfProtection') !== true || exec.name !== 'plugin_manager') return undefined
     const args = exec.arguments
     if (args === null || typeof args !== 'object' || args.action !== 'install_bundle') return undefined
     const target = typeof args.target === 'string' ? args.target : ''
     const dir = localSpecPath(target)
     if (dir === undefined) return undefined // registry / git / tarball: handled by the guard
-    const reason = why => ({ reason: installSourceDenialText({ target, why }), target })
+    const reason = (why?: string) => ({ reason: installSourceDenialText({ target, why } as unknown as { target: string; why?: string }), target })
     const fs = ctx.fs
     if (fs === undefined || typeof fs.readText !== 'function') {
       return reason('无法读取该本地包的内容（fail-closed）')
     }
     try {
-      const read = async relative => {
+      const read = async (relative: string) => {
         const resolved = await fs.resolve(join(dir, relative), { signal: exec.signal })
-        return await fs.readText(resolved, exec.signal)
+        return await fs.readText!(resolved, exec.signal)
       }
       const manifest = JSON.parse(await read('package.json'))
       const scripts = manifest?.scripts
@@ -774,7 +842,7 @@ export function apply(ctx, config) {
   // failure, so an internal bug would take the tool surface down with a stack
   // trace the model cannot act on. Failing closed with an actionable message is
   // the only acceptable outcome for a security control (see `internalErrorText`).
-  ctx.on('tools/pre-execute', async (exec, next) => {
+  ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => unknown) => {
     try {
       if (read('enabled') !== true) return next()
       const install = await evaluateLocalInstall(exec)
@@ -789,7 +857,7 @@ export function apply(ctx, config) {
       }
       return next()
     } catch (error) {
-      ctx.logger.error('path-guard: internal error in tools/pre-execute: %s', error?.stack ?? String(error))
+      ctx.logger.error('path-guard: internal error in tools/pre-execute: %s', (error as { stack?: string } | undefined)?.stack ?? String(error))
       // Fail closed ONLY for calls this plugin is responsible for judging. A bug
       // here must not take away the model's unrelated tools — above all the
       // human-escalation ones (`ask_user_question`), which are how a stuck model
@@ -801,10 +869,10 @@ export function apply(ctx, config) {
   })
 
   // ---- L2/L5/L6: the synchronous guard ------------------------------------
-  ctx.tools.guard((exec) => {
+  ctx.tools!.guard((exec: ToolExecution) => {
     try {
       if (read('enabled') !== true) return undefined
-      let verdict
+      let verdict: (DenialHit & { kind: string }) | undefined
       if (read('exoticTools') === 'deny' && isExoticTool(exec.name)) {
         verdict = { reason: exoticDenialText({ toolName: exec.name }), kind: 'exotic', target: exec.name }
       } else if (read('selfProtection') === true && exec.name === 'plugin_manager') {
@@ -819,7 +887,7 @@ export function apply(ctx, config) {
       if (verdict !== undefined) reportDenial(exec, verdict, verdict.kind)
       return verdict?.reason
     } catch (error) {
-      ctx.logger.error('path-guard: internal error in tools.guard: %s', error?.stack ?? String(error))
+      ctx.logger.error('path-guard: internal error in tools.guard: %s', (error as { stack?: string } | undefined)?.stack ?? String(error))
       if (!governs(exec.name)) return undefined
       notifier.malfunction('ctx.tools.guard()')
       return internalErrorText('ctx.tools.guard()')
@@ -850,7 +918,8 @@ export function apply(ctx, config) {
    * its rendering off `code`.
    */
   class PathGuardFsError extends Error {
-    constructor(message, code, options) {
+    declare code: string
+    constructor(message: string, code: string, options?: { cause?: unknown }) {
       super(message, options)
       this.name = 'FsError'
       this.code = code
@@ -897,7 +966,7 @@ export function apply(ctx, config) {
   // (packages/core/tools/src/index.ts:1803-1813,1839,1848).
   //
   // Everything that needs no redaction is passed straight through with `next()`.
-  ctx.on('tools/post-execute', async (exec, result, next) => {
+  ctx.on('tools/post-execute', async (exec: ToolExecution, result: Record<string, unknown>, next: () => unknown) => {
     try {
       if (read('enabled') !== true) return next()
       if (result.isError === true) return next()
@@ -927,7 +996,7 @@ export function apply(ctx, config) {
 
       const workspace = exec.agent?.session.header.cwd
       const cwd = workspace ?? process.cwd()
-      const decide = absolutePath => decideAbsolute(absolutePath, workspace)?.access ?? 'allow'
+      const decide = (absolutePath: string) => decideAbsolute(absolutePath, workspace)?.access ?? 'allow'
 
       const recognized = kind === 'glob' ? isRecognizedGlobValue(result.value) : isRecognizedGrepValue(result.value)
       if (!recognized) {
@@ -935,7 +1004,7 @@ export function apply(ctx, config) {
         // when a user rule actually protects something — the implicit
         // self-protection rules are `read`-level (the AI may read the profile
         // composition by design), so they never justify blocking a search.
-        const protects = rulesOf().some(rule => rule !== null && typeof rule === 'object' && rule.access !== 'write')
+        const protects = rulesOf().some(rule => rule !== null && typeof rule === 'object' && (rule as { access?: unknown }).access !== 'write')
         if (!protects) return next()
         ctx.logger.warn('path-guard: withheld an unrecognized %s result (fail-closed)', kind)
         reportDenial(exec, {
@@ -953,7 +1022,7 @@ export function apply(ctx, config) {
       ctx.logger.info('path-guard: redacted %s results under a protected path', kind)
       return { kind: 'accept', value: redacted.value }
     } catch (error) {
-      ctx.logger.error('path-guard: internal error in tools/post-execute: %s', error?.stack ?? String(error))
+      ctx.logger.error('path-guard: internal error in tools/post-execute: %s', (error as { stack?: string } | undefined)?.stack ?? String(error))
       notifier.malfunction('tools/post-execute')
       return { kind: 'block', feedback: [{ type: 'text', text: internalErrorText('tools/post-execute') }] }
     }

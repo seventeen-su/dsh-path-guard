@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "client",
+    "outDir": "lib/client",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": [],
+    // The client half is loaded as a CLASSIC script, not a module:
+    // `packages/client/modules/src/client/system.ts:15-29` creates a plain
+    // `<script src>` (no `type="module"`) to fetch it. Without this line the
+    // package's own `"type": "module"` makes tsc treat `client.ts` as an ES
+    // module and append `export {};` to the output — which is a parse-time
+    // SyntaxError for a classic script, so the config page would never render.
+    // `node --check` does NOT catch it (Node parses the file as ESM because of
+    // `"type": "module"`); only a classic-script parse does.
+    "moduleDetection": "legacy"
+  },
+  "include": ["client/**/*.ts"]
+}

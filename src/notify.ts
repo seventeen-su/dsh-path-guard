@@ -141,7 +141,7 @@ const KEY_SEPARATOR = '\u0000'
  * @param {number} max
  * @returns {string}
  */
-function truncateText(value, max) {
+function truncateText(value: unknown, max: number): string {
   const text = String(value === undefined || value === null ? '' : value)
   if (!Number.isFinite(max) || max <= 0) return ''
   if (text.length <= max) return text
@@ -157,7 +157,7 @@ function truncateText(value, max) {
  * @param {number} max
  * @returns {string}
  */
-function clipField(value, max) {
+function clipField(value: unknown, max: number): string {
   if (value === undefined || value === null) return ''
   const text = String(value).replace(/\s+/g, ' ').trim()
   if (text.length <= max) return text
@@ -169,7 +169,7 @@ function clipField(value, max) {
  * @param {unknown} error
  * @returns {string}
  */
-function describeError(error) {
+function describeError(error: unknown): string {
   if (error instanceof Error) return truncateText(error.stack ?? error.message, 300)
   return truncateText(String(error), 300)
 }
@@ -180,11 +180,11 @@ function describeError(error) {
  * @param {unknown} value
  * @returns {boolean}
  */
-function isThenable(value) {
+function isThenable(value: unknown): boolean {
   return (
     value !== null &&
     (typeof value === 'object' || typeof value === 'function') &&
-    typeof /** @type {{then?: unknown}} */ (value).then === 'function'
+    typeof (value as { then?: unknown }).then === 'function'
   )
 }
 
@@ -219,7 +219,13 @@ function isThenable(value) {
  *   reported the notification as actually queued; every failure (no service,
  *   missing method, thrown error, throttled, `undefined` result) returns `false`.
  */
-export function createNotifier(deps) {
+export function createNotifier(deps?: {
+  resolveService?: unknown
+  logger?: { warn?: (...args: unknown[]) => unknown } | null
+  now?: (() => number) | undefined
+  throttleMs?: number | undefined
+  maxTracked?: number | undefined
+}) {
   const {
     resolveService,
     logger,
@@ -237,12 +243,11 @@ export function createNotifier(deps) {
   /**
    * Reason key → timestamp of the last push ATTEMPT. Map insertion order is
    * refreshed on every attempt, so the head is the least recently used reason.
-   * @type {Map<string, number>}
    */
-  const lastAttemptAt = new Map()
+  const lastAttemptAt = new Map<string, number>()
 
   /** Log through the injected logger without ever letting it break the hook. */
-  function logWarn(detail) {
+  function logWarn(detail: unknown) {
     if (warn === undefined) return
     try {
       warn(`path-guard: desktop notification: ${detail}`)
@@ -258,7 +263,7 @@ export function createNotifier(deps) {
   }
 
   /** True when the same reason was already pushed inside the current window. */
-  function isThrottled(key, at) {
+  function isThrottled(key: string, at: number) {
     const previous = lastAttemptAt.get(key)
     if (previous === undefined) return false
     // A clock that moved backwards is treated as "still inside the window".
@@ -266,7 +271,7 @@ export function createNotifier(deps) {
   }
 
   /** Record a push attempt and evict the oldest entries beyond `maxTracked`. */
-  function remember(key, at) {
+  function remember(key: string, at: number) {
     if (lastAttemptAt.has(key)) lastAttemptAt.delete(key)
     lastAttemptAt.set(key, at)
     while (lastAttemptAt.size > limit) {
@@ -286,7 +291,7 @@ export function createNotifier(deps) {
    *   push method was invoked (even if it returned false or threw) — that is what
    *   the throttle records.
    */
-  function deliver(payload, always, site) {
+  function deliver(payload: { title: string; message: string; urgency: string; sessionId?: unknown }, always: boolean, site: string) {
     let service
     try {
       service = resolve === undefined ? undefined : resolve()
@@ -328,7 +333,7 @@ export function createNotifier(deps) {
    * Normalize the whole denial input into the fields the key and the message need.
    * @param {Record<string, unknown>} input
    */
-  function readDenialFields(input) {
+  function readDenialFields(input: Record<string, unknown>) {
     const kind = clipField(input.kind, FIELD_LIMITS.kind) || 'unknown'
     const tool = clipField(input.toolName, FIELD_LIMITS.toolName)
     const rulePath = clipField(input.rulePath, FIELD_LIMITS.rule)
@@ -360,7 +365,7 @@ export function createNotifier(deps) {
    * Build the denial payload for one reason.
    * @param {ReturnType<typeof readDenialFields>} fields
    */
-  function denialPayload(fields) {
+  function denialPayload(fields: ReturnType<typeof readDenialFields>) {
     const head = `已拦截（${fields.kindLabel}）：工具 ${fields.tool || '(未提供)'}`
     const tail = `${fields.rule ? `，规则 ${fields.rule}` : ''}${fields.access ? `，档位 ${fields.access}` : ''}`
     // Reserve room for the tail (rule + tier) so truncation can never hide which
@@ -370,7 +375,7 @@ export function createNotifier(deps) {
       ? clipField(fields.target, Math.max(MIN_TARGET_BUDGET, Math.min(FIELD_LIMITS.target, budget)))
       : ''
     const body = `${head}${target ? `，目标 ${target}` : ''}${tail}`
-    const payload = {
+    const payload: { title: string; message: string; urgency: string; sessionId?: unknown } = {
       title: truncateText(DENIAL_TITLE, MAX_TITLE),
       message: truncateText(body, MAX_MESSAGE),
       urgency: KIND_URGENCY.get(fields.kind) ?? 'normal',
@@ -401,7 +406,16 @@ export function createNotifier(deps) {
    * }} input `always: true` uses `pushAlways` (bypasses the peer focus gate).
    * @returns {boolean} true only when the peer queued the notification.
    */
-  function denial(input) {
+  function denial(input: {
+    toolName?: string | undefined
+    target?: string | undefined
+    access?: string | undefined
+    rulePath?: string | undefined
+    ruleId?: string | undefined
+    sessionId?: unknown
+    kind?: 'path' | 'shell' | 'exotic' | 'self' | 'redaction' | string
+    always?: boolean | undefined
+  }): boolean {
     try {
       // Not an object: a caller bug, not an event worth surfacing to a human.
       if (input === null || typeof input !== 'object') return false
@@ -425,7 +439,7 @@ export function createNotifier(deps) {
    * @param {string} where extension-point name, e.g. `'tools/pre-execute'`.
    * @returns {boolean} true only when the peer queued the notification.
    */
-  function malfunction(where) {
+  function malfunction(where: string): boolean {
     try {
       const label = clipField(where, FIELD_LIMITS.where) || '(未提供扩展点)'
       const at = currentTime()

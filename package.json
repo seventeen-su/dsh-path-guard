@@ -8,10 +8,15 @@
   "author": "苏拾柒 <seventeen_su@proton.me>",
   "icon": "./icon.svg",
   "exports": {
-    ".": "./src/index.js",
-    "./client": "./client/client.js",
+    ".": "./lib/index.js",
+    "./client": "./lib/client/client.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --test tests/policy.spec.ts tests/resource.spec.ts tests/fs-guard.spec.ts tests/host.spec.ts tests/redact.spec.ts tests/notify.spec.ts tests/build.spec.ts"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
@@ -32,5 +37,9 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
+  },
+  "devDependencies": {
+    "@types/node": "26.6.3",
+    "typescript": "6.0.3"
   }
 }
