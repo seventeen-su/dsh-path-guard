@@ -16,6 +16,12 @@
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
   },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "^0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
