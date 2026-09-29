@@ -596,25 +596,21 @@ window.__ModuleLoader__.load({
         // Register only while the Host actually serves the namespace, so a
         // profile without this bundle's row shows no trace of the page.
         //
-        // The same editor is registered in THREE places, because users look for
-        // it in different ones and a missing page reads as "the plugin has no
-        // settings at all":
-        //   - `settings.section`      → its own nav entry in the Settings dialog
+        // A plugin's OWN configuration belongs on the Plugins page, not in the
+        // Settings navigation. Verified against every shipped client package:
+        // `settings.section` is registered only by deployment-level sections
+        // (general, models, account, agent-presets), while a plugin's own config
+        // page registers into `plugins.item` (agent-loop, shell, web-search,
+        // subagent). NO shipped package registers both, so a second nav entry
+        // would be off-standard rather than helpful.
+        //
+        // For a third-party BUNDLE the plugins-page seats are these two:
         //   - `plugins.row.config`    → the configure control on this bundle's
-        //                               row in the Plugins page, keyed
-        //                               `<package name>#<row id>`
+        //                               row, keyed `<package name>#<row id>`
         //   - `plugins.bundle.config` → the bundle card's own page, keyed by the
         //                               bundle package name
         ctx.effect(() => ctx.configForms.whileServed([NS], () => {
           const disposers = [
-            ctx.slots.inject('settings.section', () => ctx.slots.register({
-              name: 'settings.section',
-              id: NS,
-              order: 60,
-              label: () => t('title'),
-              locale: L10N,
-            }, Section)),
-
             ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
               name: 'plugins.row.config',
               key: `${PKG}#${NS}`,
@@ -628,7 +624,7 @@ window.__ModuleLoader__.load({
             }, props => (props?.view === 'summary' ? null : h(Section, null)))),
           ]
           return () => { for (const dispose of disposers) dispose() }
-        }), 'path-guard: settings pages')
+        }), 'path-guard: plugin config pages')
       },
     }
   },
