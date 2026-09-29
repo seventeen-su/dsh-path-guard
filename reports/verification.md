@@ -28,7 +28,7 @@ $env:TEMP\pg-verify\exp7.mjs   # 长格式规则 vs 8.3/\\?\ 拼写（规范化�
 
 | # | 清单项 | 结论 | 位置 |
 |---|---|---|---|
-| 1 | `tool-fields.js` 字段映射 vs 真实工具；已挂载但未映射的工具 | 9 个映射逐字正确；`workflow` 是已挂载且完全没有被映射的文件访问工具（**严重**）；`skill`/`job_output`/`omb_files` 属路径/内容弱披露或已被其他机制覆盖 | D-2、V-2 |
+| 1 | `tool-fields.js` 字段映射 vs 真实工具；已挂载但未映射的工具 | 9 个映射逐字正确；`workflow` 是已挂载且完全没有被映射的文件访问工具（**严重**）；`skill`/`job_output` 与若干第三方插件的检索类工具属路径/内容弱披露或已被其他机制覆盖 | D-2、V-2 |
 | 2 | `plugin_manager` 自我保护可否绕过 | `set_plugin`/`remove_bundle` 打不到自己（entryId = `include:path-guard` 仍含子串）；但 `install_bundle` 可用不含子串的绝对路径装一个"停用 path-guard"的 bundle 绕过 —— **源码可证、未端到端验证** | V-5 |
 | 3 | 子代理是否继承防护 | **是**，同进程 provider 下 guard 落在 global 层 + 未打标签监听者收到所有子 scope 事件；外部 provider 已被 exoticTools 默认拒绝 | D-4 |
 | 4 | redact 的路径基准 | 与 `search-core.ts:234-235` 的 workdir 逐字一致，`path.resolve(cwd, entry)` 是 `toWorkdirRelative` 的正确逆运算；相对/平台分隔符/绝对三类结果都正确 | D-5 |

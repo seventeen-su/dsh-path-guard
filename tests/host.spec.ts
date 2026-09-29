@@ -676,6 +676,35 @@ test('a denial notifies through desktopNotify when it is mounted', async () => {
   assert.ok(ctx.pushed[0]!.message.length > 0)
 })
 
+test('the first sighting of an unmodelled tool notifies once, naming the prefix to trust', async () => {
+  const ctx = fakeCtx({ notifyService: {} })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+
+  // A path-shaped argument no rule covers: the call is allowed, but the tool is
+  // new to this plugin, so the user is told how to trust the whole plugin rather
+  // than being left to guess a tool name they never saw.
+  const probe = { name: 'notes_search', arguments: { query: join(tmpdir(), 'pg-uncovered', 'k.txt') } }
+  assert.equal((await preExecute(ctx, probe)).kind, 'allow')
+  assert.equal(ctx.pushed.length, 1, 'a first sighting notifies')
+  assert.ok(ctx.pushed[0]!.message.includes('notes_*'), 'the suggestion must be the prefix form, not just the tool name')
+
+  // Once per TOOL, not once per call: `unmodelledSeen` is the dedup, so this can
+  // never turn into a stream of notifications.
+  await preExecute(ctx, probe)
+  await preExecute(ctx, { name: 'notes_search', arguments: { query: join(tmpdir(), 'pg-uncovered', 'other.txt') } })
+  assert.equal(ctx.pushed.length, 1, 'the suggestion must not repeat for the same tool')
+
+  // A second, different tool notifies in turn.
+  await preExecute(ctx, { name: 'notes_list', arguments: { query: join(tmpdir(), 'pg-uncovered', 'k.txt') } })
+  assert.equal(ctx.pushed.length, 2)
+
+  // `notify: off` silences it, like every other notification.
+  const off = fakeCtx({ notifyService: {} })
+  apply(off, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false, notify: 'off' })
+  await preExecute(off, { name: 'notes_status', arguments: { query: join(tmpdir(), 'pg-uncovered', 'k.txt') } })
+  assert.equal(off.pushed.length, 0)
+})
+
 test('notify: always bypasses the focus gate, notify: off sends nothing', async () => {
   const always = fakeCtx({ notifyService: {} })
   apply(always, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false, notify: 'always' })
@@ -850,17 +879,40 @@ test('V-10: an internal failure does not take away tools this plugin does not go
 // the caller read `hit.reason`, so the refusal rendered as the literal text
 // `reason: "undefined"` — the model saw a denial with no explanation. Locking the
 // user-visible wording down (not just the deny/allow verdict) is the point here.
-test('V-8: an unmodelled tool with a path-shaped argument is refused with a real reason', async () => {
+test('V-8: an unmodelled tool is judged by the paths it names, not by shape alone', async () => {
+  // Default `unknownTools: 'check'`. A path-shaped argument that NO rule covers
+  // must stay allowed. Blanket refusal on shape was a real false positive in the
+  // live profile: `notes_search` takes a natural-language query that is often a
+  // file path, and refusing a memory lookup protects nothing.
   const ctx = fakeCtx()
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  const uncovered = await preExecute(ctx, {
+    name: 'third_party_tool',
+    arguments: { file_path: join(tmpdir(), 'pg-uncovered', 'k.txt') },
+  })
+  assert.equal(uncovered.kind, 'allow', 'a path no rule covers must not be refused')
 
-  const decision = await preExecute(ctx, {
+  // A path a rule DOES cover is still refused — with the rule's own reason.
+  const guarded = fakeCtx()
+  apply(guarded, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  const covered = await preExecute(guarded, {
     name: 'third_party_tool',
     arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') },
   })
+  assert.equal(covered.kind, 'deny', 'a covered path must be refused even for an unmodelled tool')
 
-  assert.equal(decision.kind, 'deny')
-  const reason = decision.reason
+  // `unknownTools: 'deny'` restores the strict posture, and its reason must be a
+  // real string naming the tool — never the literal `undefined`.
+  const strict = fakeCtx()
+  apply(strict, {
+    enabled: true, rules: [], defaultAccess: 'allow', unknownTools: 'deny', selfProtection: false,
+  })
+  const denied = await preExecute(strict, {
+    name: 'third_party_tool',
+    arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') },
+  })
+  assert.equal(denied.kind, 'deny')
+  const reason = denied.reason
   assert.equal(typeof reason, 'string', 'the denial must carry a string reason')
   assert.ok(reason !== undefined && reason.length > 0, 'the reason must not be empty')
   assert.ok(reason.includes('third_party_tool'), 'the reason must name the refused tool')
@@ -869,6 +921,70 @@ test('V-8: an unmodelled tool with a path-shaped argument is refused with a real
 
   // A string argument that is not path-shaped must stay allowed: the rule keys off
   // the VALUE shape, not the parameter name.
-  const benign = await preExecute(ctx, { name: 'third_party_tool', arguments: { query: 'asc' } })
+  const benign = await preExecute(strict, { name: 'third_party_tool', arguments: { query: 'asc' } })
   assert.equal(benign.kind, 'allow')
+})
+
+test('the reported false positive stays fixed: notes_search with a path-shaped query', async () => {
+  // The exact live case. `notes_search` reads the memory store — it never touches
+  // the filesystem — but its `query` is natural language and often IS a file
+  // path. Under blanket fail-closed the whole memory lookup was refused:
+  //
+  //   访问被拒绝：工具 `notes_search` 不在 dsh-path-guard 的已知工具表里，
+  //   而它的参数里出现了路径形态的取值。
+  //
+  // No rule covers the query, so there is nothing to protect and nothing to
+  // refuse. This test pins that, because the failure mode was user-visible and
+  // the denial was indistinguishable from a real policy decision.
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  const decision = await preExecute(ctx, {
+    name: 'notes_search',
+    arguments: { query: 'D:/Program/dsh-path-guard/src/index.ts', limit: 2 },
+  })
+  assert.equal(decision.kind, 'allow', 'a memory lookup naming an uncovered path must not be refused')
+
+  // Same tool, a query that DOES name a protected path: now it is refused, and by
+  // the rule rather than by the tool's name.
+  const guarded = await preExecute(ctx, {
+    name: 'notes_search',
+    arguments: { query: join(tmpdir(), 'pg-secrets', 'k.txt') },
+  })
+  assert.equal(guarded.kind, 'deny', 'a query naming a protected path must be refused')
+})
+
+test('trustedTools skips the plugin entirely, by exact name or by prefix', async () => {
+  const probe = { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') }
+
+  const exact = fakeCtx()
+  apply(exact, {
+    enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false,
+    trustedTools: [{ match: 'notes_search', note: '' }],
+  })
+  assert.equal((await preExecute(exact, { name: 'notes_search', arguments: probe })).kind, 'allow')
+  // The exact entry trusts only that tool.
+  assert.equal((await preExecute(exact, { name: 'notes_save', arguments: probe })).kind, 'deny')
+
+  // The prefix form trusts a whole plugin's tool set — including tools that
+  // plugin has not shipped yet. That is the point: a per-tool list rots, and a
+  // plugin's tool list changes between versions.
+  const prefix = fakeCtx()
+  apply(prefix, {
+    enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false,
+    trustedTools: [{ match: 'notes_*', note: '' }],
+  })
+  for (const name of ['notes_search', 'notes_save', 'notes_a_tool_from_a_future_version']) {
+    const decision = await preExecute(prefix, { name, arguments: probe })
+    assert.equal(decision.kind, 'allow', `${name} must be trusted by the notes_* prefix`)
+  }
+  // A different prefix stays governed: trust is scoped, not global.
+  assert.equal((await preExecute(prefix, { name: 'other_tool', arguments: probe })).kind, 'deny')
+
+  // An empty or malformed entry must never widen trust.
+  const malformed = fakeCtx()
+  apply(malformed, {
+    enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false,
+    trustedTools: [{ match: '', note: '' }, null, { note: 'no match field' }],
+  })
+  assert.equal((await preExecute(malformed, { name: 'other_tool', arguments: probe })).kind, 'deny')
 })

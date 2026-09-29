@@ -92,6 +92,16 @@ interface PathGuardModuleLoader {
       note?: string | undefined
     }
 
+    /**
+     * One trusted tool, as the `trustedTools` namespace field stores it. `match`
+     * is a tool name (`notes_search`) or a prefix wildcard (`notes_*`); the Host
+     * ignores an empty `match` and any element that is not an object.
+     */
+    interface Trust {
+      match?: string | undefined
+      note?: string | undefined
+    }
+
     /** The page's transient status line. */
     interface Message {
       readonly kind: 'ok' | 'error'
@@ -302,6 +312,30 @@ interface PathGuardModuleLoader {
         '【生效方式】点保存后立即生效，不需要重启。写入只会改 profile 补丁里本插件那一条 config。',
         '【已知边界】shell 命令与脚本里的路径靠文本扫描，属于尽力而为；name: 规则不参与该扫描。',
       ].join('\n'),
+      trust: '工具信任',
+      unknownTools: '未建模工具的判定',
+      unknownToolsHint: '对没有被本插件逐一建模的工具（MCP、记忆、第三方工具……），只在它报出的参数里找路径，命中规则才拒。',
+      unknownToolsCheck: '只按规则判定它报出的路径（推荐）',
+      unknownToolsDeny: '只要参数看起来像路径就拒绝（更严，会误伤）',
+      trustedTools: '信任的工具',
+      colMatch: '工具名 / 前缀',
+      addTrust: '添加信任',
+      trustPlaceholder: '例如 notes_search 或 notes_*',
+      trustEmpty: '还没有信任任何工具。',
+      // Always visible, like the rules reference: what a prefix wildcard buys and
+      // what it costs IS the decision this group asks for.
+      trustDocTitle: '信任是怎么生效的',
+      trustDoc: [
+        '【两种写法】match 填工具名或前缀通配：',
+        '  notes_search 只信任这一个工具',
+        '  notes_*      前缀通配：信任该插件的全部工具，包括它以后新增的',
+        '  mcp__*       同理，按前缀批量信任某个 MCP 服务',
+        '',
+        '【代价】命中信任后，本插件对该工具的判定被整体跳过——路径规则、shell 扫描、结果脱敏都不再过问。',
+        '所以只信任你了解用途的插件；拿不准就写具体工具名，别写通配。',
+        '',
+        '【不会生效】match 留空会被忽略，不匹配任何工具。',
+      ].join('\n'),
       remove: '删除',
       save: '保存',
       revert: '放弃修改',
@@ -389,6 +423,28 @@ interface PathGuardModuleLoader {
         '',
         'A save applies immediately — no restart. A write only touches this plugin\'s own config entry in the profile patch.',
         'Known limit: paths inside shell commands and scripts are found by text scanning, which is best effort; name: rules do not take part in that scan.',
+      ].join('\n'),
+      trust: 'Tool trust',
+      unknownTools: 'How unmodelled tools are judged',
+      unknownToolsHint: 'For tools this plugin does not model one by one (MCP servers, memory, third-party tools), look only for paths among the arguments the tool reports, and refuse only when a rule matches one.',
+      unknownToolsCheck: 'Judge only the paths it reports (recommended)',
+      unknownToolsDeny: 'Refuse whenever an argument looks like a path (stricter, false positives)',
+      trustedTools: 'Trusted tools',
+      colMatch: 'Tool / prefix',
+      addTrust: 'Trust a tool',
+      trustPlaceholder: 'e.g. notes_search or notes_*',
+      trustEmpty: 'No trusted tools yet.',
+      trustDocTitle: 'How trust works',
+      trustDoc: [
+        'Two spellings — match takes a tool name or a prefix wildcard:',
+        '  notes_search trust exactly this one tool',
+        '  notes_*      prefix wildcard: trust every tool of that plugin, INCLUDING the ones it adds later',
+        '  mcp__*       the same, to trust one MCP server by prefix',
+        '',
+        'The cost: a match skips every check this plugin makes for that tool — path rules, shell scanning and result redaction all stand aside.',
+        'So trust only plugins whose purpose you understand; when in doubt, name one tool instead of a wildcard.',
+        '',
+        'Not a wildcard: an empty match is ignored and matches nothing.',
       ].join('\n'),
       remove: 'Remove',
       save: 'Save',
@@ -653,6 +709,7 @@ interface PathGuardModuleLoader {
       function PathGuardSection() {
         const snapshot = React.useSyncExternalStore(subscribe, getSnapshot)
         const [draft, setDraft] = React.useState<Rule[] | null>(null)
+        const [trustDraft, setTrustDraft] = React.useState<Trust[] | null>(null)
         const [busy, setBusy] = React.useState(false)
         const [message, setMessage] = React.useState<Message | null>(null)
 
@@ -690,6 +747,20 @@ interface PathGuardModuleLoader {
 
         /** Append one rule to the draft, creating the draft if needed. */
         const appendRule = (rule: Rule) => setDraft([...rows, rule])
+
+        // The trust list reuses the rules list's draft pattern verbatim — same
+        // useState, same save/abandon pair, its own copy so the two lists are
+        // edited and written independently (the Host stores them in two fields).
+        const persistedTrust: Trust[] = Array.isArray(value.trustedTools) ? (value.trustedTools as Trust[]) : []
+        const trustRows = trustDraft ?? persistedTrust
+
+        const updateTrust = (index: number, patch: Partial<Trust>) => {
+          const next = trustRows.map((row, at) => (at === index ? { ...row, ...patch } : row))
+          setTrustDraft(next)
+        }
+
+        /** Append one trusted tool to the draft, creating the draft if needed. */
+        const appendTrust = (trust: Trust) => setTrustDraft([...trustRows, trust])
 
         /** Ask the Host's directory picker and put the result in one row. */
         const browseInto = (index: number) => async () => {
@@ -741,9 +812,12 @@ interface PathGuardModuleLoader {
           h('p', { style: STYLE.intro }, label('intro')),
           !writable ? h('p', { style: STYLE.notice }, label('statusReadonly')) : null,
 
+          // Box 1 has no heading: every control in it names itself to its right
+          // (the checkbox label, the field label), so a heading would only repeat
+          // the first control's own text — the duplicate-title bug fixed earlier.
           h('div', { style: STYLE.group },
-            h('h3', { style: STYLE.groupTitle }, label('master')),
-            checkbox('enabled', 'master', label('master')),
+            checkbox('enabled', 'master'),
+            checkbox('selfProtection', 'selfProtection'),
             scalar('defaultAccess', 'defaultAccess', [
               { value: 'allow', label: label('defaultAllow') },
               ...LEVELS.map(level => ({ value: level, label: label(`access${level[0]!.toUpperCase()}${level.slice(1)}`) })),
@@ -839,25 +913,103 @@ interface PathGuardModuleLoader {
           ),
 
           h('div', { style: STYLE.group },
-            h('h3', { style: STYLE.groupTitle }, label('shell')),
+            h('h3', { style: STYLE.groupTitle }, label('trust')),
+            // No `namedBy`: the heading above names the topic, not this control,
+            // so the select keeps its own visible label.
+            scalar('unknownTools', 'unknownTools', [
+              { value: 'check', label: label('unknownToolsCheck') },
+              { value: 'deny', label: label('unknownToolsDeny') },
+            ]),
+            // Always visible, like the rules reference: what a prefix wildcard
+            // buys and what it costs is the decision this group asks for.
+            h('div', { style: STYLE.doc },
+              h('h4', { style: STYLE.docTitle }, label('trustDocTitle')),
+              h('pre', { style: { margin: 0, fontFamily: 'inherit', whiteSpace: 'pre-wrap' } }, label('trustDoc')),
+            ),
+            trustRows.length === 0
+              ? h('p', { style: STYLE.hint }, label('trustEmpty'))
+              : h('table', { style: STYLE.table, 'aria-label': label('trustedTools') },
+                h('thead', null, h('tr', null,
+                  h('th', { style: { ...STYLE.th, width: '46%' } }, label('colMatch')),
+                  h('th', { style: STYLE.th }, label('colNote')),
+                  h('th', { style: { ...STYLE.th, width: '1%', whiteSpace: 'nowrap' } }, label('colActions')),
+                )),
+                h('tbody', null, trustRows.map((row, index) => h('tr', { key: index },
+                  h('td', { style: STYLE.td }, h('input', {
+                    style: { ...STYLE.input, ...STYLE.mono },
+                    value: row.match ?? '',
+                    placeholder: label('trustPlaceholder'),
+                    'aria-label': label('colMatch'),
+                    disabled: busy || !writable,
+                    onChange: (event: ChangeEvent<ValueTarget>) => updateTrust(index, { match: event.target.value }),
+                  })),
+                  h('td', { style: STYLE.td }, h('input', {
+                    style: STYLE.input,
+                    value: row.note ?? '',
+                    'aria-label': label('colNote'),
+                    disabled: busy || !writable,
+                    onChange: (event: ChangeEvent<ValueTarget>) => updateTrust(index, { note: event.target.value }),
+                  })),
+                  h('td', { style: STYLE.actionsCell }, h('div', { style: STYLE.actions },
+                    h('button', {
+                      type: 'button',
+                      style: STYLE.button,
+                      disabled: busy || !writable,
+                      onClick: () => setTrustDraft(trustRows.filter((_row, at) => at !== index)),
+                    }, label('remove')))),
+                ))),
+              ),
+            h('div', { style: STYLE.footer },
+              h('button', {
+                type: 'button',
+                style: STYLE.button,
+                disabled: busy || !writable,
+                onClick: () => appendTrust({ match: '', note: '' }),
+              }, label('addTrust')),
+              trustDraft === null ? null : h('span', { style: STYLE.warn }, label('unsaved')),
+              trustDraft === null ? null : h('button', {
+                type: 'button',
+                style: STYLE.primary,
+                'data-pg-primary': '',
+                disabled: busy,
+                onClick: async () => {
+                  await write('trustedTools', trustRows, 'saved')
+                  setTrustDraft(null)
+                },
+              }, label('save')),
+              trustDraft === null ? null : h('button', {
+                type: 'button',
+                style: STYLE.button,
+                disabled: busy,
+                onClick: () => setTrustDraft(null),
+              }, label('revert')),
+            ),
+          ),
+
+          // ONE frame holding three sub-sections, drawn with the SAME style as
+          // every other box. An earlier version gave it its own weaker border and
+          // a different surface token to signal the nesting; in the running UI that
+          // just read as a box whose colour did not match the others, so the frame
+          // is deliberately uniform now. The grouping is carried by what is
+          // actually informative: each sub-section names itself through its own
+          // visible label (the builders render label + control + hint), and the
+          // injected stylesheet's `.dsh-path-guard-field + .dsh-path-guard-field`
+          // hairline (STATE_CSS, copied from SF:10-12) separates two of them.
+          h('div', { style: STYLE.group },
             scalar('shell', 'shell', [
               { value: 'scan', label: label('shellScan') },
               { value: 'deny', label: label('shellDeny') },
               { value: 'off', label: label('shellOff') },
-            ], label('shell')),
-          ),
-
-          h('div', { style: STYLE.group },
-            h('h3', { style: STYLE.groupTitle }, label('exotic')),
+            ]),
             scalar('exoticTools', 'exotic', [
               { value: 'deny', label: label('exoticDeny') },
               { value: 'allow', label: label('exoticAllow') },
-            ], label('exotic')),
+            ]),
+            checkbox('searchRedaction', 'searchRedaction'),
           ),
 
+          // Its own frame, named by the field's own visible label.
           h('div', { style: STYLE.group },
-            checkbox('searchRedaction', 'searchRedaction'),
-            checkbox('selfProtection', 'selfProtection'),
             scalar('notify', 'notify', [
               { value: 'focused', label: label('notifyFocused') },
               { value: 'always', label: label('notifyAlways') },
