@@ -280,17 +280,39 @@ interface PathGuardModuleLoader {
       rulesExemptHint: '想给受保护目录里的某个文件开例外？再加一条更具体的规则就行——例如「~/.ssh → 仅文件名」再加「~/.ssh/README.md → 只读」，就只有那一个文件可读。',
       browse: '浏览…',
       browseTitle: '把选中的目录填入这一行',
-      help: '怎么用？看四个例子',
-      helpHide: '收起说明',
-      helpBody: [
-        '① 完全禁止：规则路径填 ~/.ssh，档位选「完全禁止」。AI 连这个目录里有哪些文件名都看不到。',
-        '② 只让看名字、不让读内容：档位选「半访问·仅文件名」。glob 仍能看到文件名，read / grep 会被拒。',
-        '③ 可读但不可写：档位选「半访问·只读」。读得到，write / edit 会被拒。',
-        '④ 豁免某个文件：再加一条更具体的规则。例如先给 ~/.ssh 设「仅文件名」，再加 ~/.ssh/README.md 设「只读」，就只有那一个文件能读。',
+      // The rules reference is ALWAYS visible. A toggle hid the one thing this
+      // page exists to explain, and what it hid was already the shortest complete
+      // description of the matching semantics — so the page spent a click to show
+      // less. Documenting the rules directly is the whole point.
+      rulesDocTitle: '规则说明',
+      rulesDoc: [
+        '一条规则 = 路径模式 + 访问档位。模式匹配的是「该路径本身」以及「它的所有后代」。',
         '',
-        '规则不区分先后：越具体的路径自动优先——先比命中目录的深度，再比字面量前缀长度，然后比通配符多少。',
-        '路径写法：~ 是家目录；${workspace} 是当前会话的工作区；* 匹配一段，** 匹配任意层。',
-        '改动即时生效，不需要重启。写操作只会改 profile 补丁里本插件那一条 config。',
+        '【档位】权限逐级累积，从宽到严：',
+        '  完全允许        看得到名字、读得到内容、写得了',
+        '  半访问·只读      能读内容，不能修改',
+        '  半访问·仅文件名  只看得到目录结构与文件名，读不到内容，更不能写',
+        '  完全禁止        连这个目录里有哪些文件都看不到',
+        '',
+        '【多条规则如何判定】与书写顺序无关，永远是最具体的那条生效，依次比较：',
+        '  1. 命中的目录更深（越贴近该文件越具体）',
+        '  2. 字面量前缀更长',
+        '  3. 通配符更少',
+        '  4. 仍并列时，后写的那条优先',
+        '',
+        '【豁免】豁免不是特殊语法，就是「再加一条更具体的规则」。先给 ~/.ssh 设「仅文件名」，',
+        '再给 ~/.ssh/README.md 设「只读」，就只有这一个文件能读，其余照旧。',
+        '',
+        '【路径写法】',
+        '  ~              家目录',
+        '  ${workspace}   当前会话的工作区',
+        '  *              匹配一段，不跨目录分隔符',
+        '  **             匹配任意层',
+        '  name:文件名    按文件名匹配，任意位置生效；例如 name:readme.md、name:*.md',
+        '  绝对路径       例如 D:/secrets/**',
+        '',
+        '【生效方式】点保存后立即生效，不需要重启。写入只会改 profile 补丁里本插件那一条 config。',
+        '【已知边界】shell 命令与脚本里的路径靠文本扫描，属于尽力而为；name: 规则不参与该扫描。',
       ].join('\n'),
       remove: '删除',
       save: '保存',
@@ -353,17 +375,37 @@ interface PathGuardModuleLoader {
       rulesExemptHint: 'Need one file inside a protected directory to stay readable? Add a second, more specific rule — e.g. "~/.ssh → names only" plus "~/.ssh/README.md → read only" makes exactly that one file readable.',
       browse: 'Browse…',
       browseTitle: 'Put the chosen directory into this row',
-      help: 'How do I use this? Four examples',
-      helpHide: 'Hide help',
-      helpBody: [
-        '1. Blocked: set the path to ~/.ssh and the level to "Blocked". The AI cannot even see which file names live there.',
-        '2. Names only: pick "Half access · names only". glob still lists file names; read and grep are refused.',
-        '3. Read only: pick "Half access · read only". Reads succeed; write and edit are refused.',
-        '4. Exemption: add a second, more specific rule. Set ~/.ssh to "names only" and ~/.ssh/README.md to "read only" to make exactly that one file readable.',
+      // Always visible, for the same reason as the zh copy: the reference IS the
+      // page's content, so hiding it behind a click showed strictly less.
+      rulesDocTitle: 'How the rules work',
+      rulesDoc: [
+        'A rule is a path pattern plus an access level. The pattern matches that path itself AND every descendant of it.',
         '',
-        'Order does not matter: the more specific path wins automatically — first by how deep the matched directory is, then by literal prefix length, then by fewest wildcards.',
-        'Path syntax: ~ is your home directory; ${workspace} is the current session workspace; * matches one segment, ** matches any depth.',
-        'Changes apply immediately, no restart. A write only touches this plugin\'s own config entry in the profile patch.',
+        'Levels accumulate, widest to strictest:',
+        '  Full access        names, contents and writes',
+        '  Half · read only   contents readable, no writes',
+        '  Half · names only  directory structure and file names visible; contents unreadable, writes refused',
+        '  Blocked            not even the file names inside are visible',
+        '',
+        'Which of several rules wins does NOT depend on the order you wrote them in — the most specific one always applies, compared in this order:',
+        '  1. the deeper matched directory (closer to the file wins)',
+        '  2. the longer literal prefix',
+        '  3. the fewer wildcards',
+        '  4. still tied: the rule written later wins',
+        '',
+        'Exemptions are not special syntax — they are just a second, more specific rule.',
+        'Set ~/.ssh to "names only", then ~/.ssh/README.md to "read only", and exactly that one file becomes readable.',
+        '',
+        'Path syntax:',
+        '  ~              your home directory',
+        '  ${workspace}   the current session workspace',
+        '  *              one segment, not crossing a separator',
+        '  **             any depth',
+        '  name:<file>    match by file name anywhere; e.g. name:readme.md, name:*.md',
+        '  absolute       e.g. D:/secrets/**',
+        '',
+        'A save applies immediately — no restart. A write only touches this plugin\'s own config entry in the profile patch.',
+        'Known limit: paths inside shell commands and scripts are found by text scanning, which is best effort; name: rules do not take part in that scan.',
       ].join('\n'),
       remove: 'Remove',
       save: 'Save',
@@ -551,18 +593,8 @@ interface PathGuardModuleLoader {
       mono: { fontFamily: 'var(--ds-font-family-code)' },
       presets: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '0 0 10px' }, // PM:1070-1075 `.approvalList`; PS:78
       chip: { ...SM_BUTTON, borderRadius: '999px', padding: '0 12px' }, // PL:8 pill; BT:29-32 for the box
-      helpToggle: { margin: '0 0 10px' }, // PS:78 `.cards { gap: 10px }`
-      link: { // INV:383-391 `.jumpLink`
-        border: 'none',
-        padding: 0,
-        background: 'none',
-        color: 'var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary))',
-        fontFamily: 'inherit',
-        fontSize: '12px',
-        lineHeight: 1.5,
-      },
-      help: { // PM:566-581 `.guide` + `.guideHint`; text metrics from SF:67-72
-        margin: '6px 0 0',
+      doc: { // PM:566-581 `.guide` + `.guideHint`; text metrics from SF:67-72
+        margin: '6px 0 12px',
         padding: '8px 14px',
         border: '0.5px solid var(--dsw-alias-border-l4, currentColor)',
         borderRadius: 'var(--dsw-radius-lg, 16px)',
@@ -573,7 +605,11 @@ interface PathGuardModuleLoader {
         whiteSpace: 'pre-wrap',
         fontFamily: 'inherit',
       },
-      actions: { display: 'flex', gap: '4px', flexWrap: 'wrap' }, // PM:544 `.guideToggle { gap: 4px }`
+      docTitle: { margin: '0 0 6px', fontSize: '13px', fontWeight: 500, lineHeight: '20px', color: 'var(--dsw-alias-label-primary, inherit)' },
+      // The action cell must never wrap: two buttons on one line is the whole
+      // point, so the container refuses to wrap and the COLUMN is sized to its
+      // content instead (see the `1%` width at the render site).
+      actions: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'nowrap' },
       footer: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '16px' }, // SG:16-21
     }
 
@@ -595,9 +631,8 @@ interface PathGuardModuleLoader {
 [data-path-guard] button, [data-path-guard] select { cursor: pointer; } /* MS:593 */
 [data-path-guard] button:disabled { opacity: 0.4; cursor: default; } /* BT:18-21 */
 [data-path-guard] input:disabled, [data-path-guard] select:disabled { opacity: 0.6; cursor: default; } /* MS:605-608 */
-[data-path-guard] button:not([data-pg-primary]):not([data-pg-link]):not(:disabled):hover { background: var(--dsw-alias-interactive-bg-hover) !important; } /* BT:45-47 */
+[data-path-guard] button:not([data-pg-primary]):not(:disabled):hover { background: var(--dsw-alias-interactive-bg-hover) !important; } /* BT:45-47 */
 [data-path-guard] button[data-pg-primary]:not(:disabled):hover { background: var(--dsw-alias-button-primary-hover, var(--dsw-alias-brand-primary)) !important; } /* BT:41-43 */
-[data-path-guard] button[data-pg-link]:hover { color: var(--dsw-alias-label-primary); } /* PM:554-556 */
 [data-path-guard] .dsh-path-guard-field + .dsh-path-guard-field { border-top: 0.5px solid var(--dsw-alias-border-l2); padding-top: 12px; } /* SF:10-12 */
 `
 
@@ -641,7 +676,6 @@ interface PathGuardModuleLoader {
         const [draft, setDraft] = React.useState<Rule[] | null>(null)
         const [busy, setBusy] = React.useState(false)
         const [message, setMessage] = React.useState<Message | null>(null)
-        const [helpOpen, setHelpOpen] = React.useState(false)
 
         if (snapshot.status === 'loading') {
           return h('section', { ...ROOT_ATTR, style: STYLE.root, 'aria-busy': true }, h('p', { style: STYLE.status }, label('statusLoading')))
@@ -696,28 +730,35 @@ interface PathGuardModuleLoader {
         }
 
         // One settings-form field: label over control over hint (SF:3-8).
-        const scalar = (field: string, key: string, options: readonly Option[]) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
-          h('label', { style: STYLE.fieldLabel, htmlFor: `pg-${field}` }, label(key)),
+        // When the enclosing group heading already names the field, `namedBy`
+        // suppresses the second visible label: the page was printing e.g.
+        // "shell 工具（bash / pwsh）" twice, once as the `<h3>` and once as the
+        // control's own label. The accessible name survives as `aria-label`, so
+        // screen readers still announce the control by name.
+        const scalar = (field: string, key: string, options: readonly Option[], namedBy?: string) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+          namedBy === undefined ? h('label', { style: STYLE.fieldLabel, htmlFor: `pg-${field}` }, label(key)) : null,
           h('select', {
             id: `pg-${field}`,
             style: STYLE.select,
             value: String(value[field]),
+            ...(namedBy === undefined ? {} : { 'aria-label': namedBy }),
             disabled: busy || !writable,
             onChange: (event: ChangeEvent<ValueTarget>) => void write(field, event.target.value, 'saved'),
           }, options.map(option => h('option', { key: option.value, value: option.value }, option.label))),
           h('p', { style: STYLE.hint }, label(`${key}Hint`)),
         )
 
-        const checkbox = (field: string, key: string) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
+        const checkbox = (field: string, key: string, namedBy?: string) => h('div', { key: field, className: FIELD_CLASS, style: STYLE.field },
           h('label', { style: STYLE.checkboxLabel },
             h('input', {
               type: 'checkbox',
               style: STYLE.checkbox,
               checked: value[field] !== false,
+              ...(namedBy === undefined ? {} : { 'aria-label': namedBy }),
               disabled: busy || !writable,
               onChange: (event: ChangeEvent<CheckedTarget>) => void write(field, event.target.checked, 'saved'),
             }),
-            label(key),
+            namedBy === undefined ? label(key) : null,
           ),
           h('p', { style: STYLE.hint }, label(`${key}Hint`)),
         )
@@ -729,7 +770,7 @@ interface PathGuardModuleLoader {
 
           h('div', { style: STYLE.group },
             h('h3', { style: STYLE.groupTitle }, label('master')),
-            checkbox('enabled', 'master'),
+            checkbox('enabled', 'master', label('master')),
             scalar('defaultAccess', 'defaultAccess', [
               { value: 'allow', label: label('defaultAllow') },
               ...LEVELS.map(level => ({ value: level, label: label(`access${level[0]!.toUpperCase()}${level.slice(1)}`) })),
@@ -747,16 +788,11 @@ interface PathGuardModuleLoader {
               disabled: busy || !writable,
               onClick: () => appendPreset(preset),
             }, label(preset.key)))),
-            h('div', { style: STYLE.helpToggle },
-              h('button', {
-                type: 'button',
-                style: STYLE.link,
-                'data-pg-link': '',
-                onClick: () => setHelpOpen(!helpOpen),
-              }, label(helpOpen ? 'helpHide' : 'help')),
-              helpOpen
-                ? h('pre', { style: STYLE.help }, label('helpBody'))
-                : null,
+            // Always visible: this reference documents the matching semantics the
+            // page configures, so a toggle would only hide the page's own content.
+            h('div', { style: STYLE.doc },
+              h('h4', { style: STYLE.docTitle }, label('rulesDocTitle')),
+              h('pre', { style: { margin: 0, fontFamily: 'inherit', whiteSpace: 'pre-wrap' } }, label('rulesDoc')),
             ),
             rows.length === 0
               ? h('p', { style: STYLE.hint }, label('empty'))
@@ -765,7 +801,7 @@ interface PathGuardModuleLoader {
                   h('th', { style: { ...STYLE.th, width: '34%' } }, label('colPath')),
                   h('th', { style: { ...STYLE.th, width: '38%' } }, label('colAccess')),
                   h('th', { style: STYLE.th }, label('colNote')),
-                  h('th', { style: { ...STYLE.th, width: '112px' } }, label('colActions')),
+                  h('th', { style: { ...STYLE.th, width: '1%', whiteSpace: 'nowrap' } }, label('colActions')),
                 )),
                 h('tbody', null, rows.map((row, index) => h('tr', { key: index },
                   h('td', { style: STYLE.td }, h('input', {
@@ -843,7 +879,7 @@ interface PathGuardModuleLoader {
               { value: 'scan', label: label('shellScan') },
               { value: 'deny', label: label('shellDeny') },
               { value: 'off', label: label('shellOff') },
-            ]),
+            ], label('shell')),
           ),
 
           h('div', { style: STYLE.group },
@@ -851,7 +887,7 @@ interface PathGuardModuleLoader {
             scalar('exoticTools', 'exotic', [
               { value: 'deny', label: label('exoticDeny') },
               { value: 'allow', label: label('exoticAllow') },
-            ]),
+            ], label('exotic')),
           ),
 
           h('div', { style: STYLE.group },
