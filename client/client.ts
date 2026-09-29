@@ -92,13 +92,6 @@ interface PathGuardModuleLoader {
       note?: string | undefined
     }
 
-    /** One one-click preset (a rule without a note). */
-    interface Preset {
-      readonly key: string
-      readonly path: string
-      readonly access: string
-    }
-
     /** The page's transient status line. */
     interface Message {
       readonly kind: 'ok' | 'error'
@@ -272,11 +265,6 @@ interface PathGuardModuleLoader {
       colNote: '备注',
       colActions: '操作',
       addRule: '添加规则',
-      presets: '常用位置（点一下即添加）',
-      presetSsh: '~/.ssh → 仅文件名',
-      presetAws: '~/.aws → 完全禁止',
-      presetGnupg: '~/.gnupg → 完全禁止',
-      presetDocker: '~/.docker → 完全禁止',
       rulesExemptHint: '想给受保护目录里的某个文件开例外？再加一条更具体的规则就行——例如「~/.ssh → 仅文件名」再加「~/.ssh/README.md → 只读」，就只有那一个文件可读。',
       browse: '浏览…',
       browseTitle: '把选中的目录填入这一行',
@@ -367,11 +355,6 @@ interface PathGuardModuleLoader {
       colNote: 'Note',
       colActions: 'Actions',
       addRule: 'Add rule',
-      presets: 'Common locations (click to add)',
-      presetSsh: '~/.ssh → names only',
-      presetAws: '~/.aws → blocked',
-      presetGnupg: '~/.gnupg → blocked',
-      presetDocker: '~/.docker → blocked',
       rulesExemptHint: 'Need one file inside a protected directory to stay readable? Add a second, more specific rule — e.g. "~/.ssh → names only" plus "~/.ssh/README.md → read only" makes exactly that one file readable.',
       browse: 'Browse…',
       browseTitle: 'Put the chosen directory into this row',
@@ -426,19 +409,6 @@ interface PathGuardModuleLoader {
 
     /** Access levels in ladder order, weakest first. */
     const LEVELS = ['none', 'list', 'read', 'write']
-
-    /**
-     * One-click rules for the locations people actually protect first. The
-     * access level is the conservative-but-usable default for each: SSH keeps
-     * names visible so the agent can still tell a key exists, everything else
-     * is hidden outright.
-     */
-    const PRESETS = [
-      { key: 'presetSsh', path: '~/.ssh', access: 'list' },
-      { key: 'presetAws', path: '~/.aws', access: 'none' },
-      { key: 'presetGnupg', path: '~/.gnupg', access: 'none' },
-      { key: 'presetDocker', path: '~/.docker', access: 'none' },
-    ]
 
     /**
      * Visual language copied from the shipped plugin and settings pages: every
@@ -497,6 +467,12 @@ interface PathGuardModuleLoader {
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
+      // A button label must stay on ONE line. Without these two the buttons in a
+      // narrow table cell shrank and Chinese labels wrapped once per character,
+      // which reads as vertical text: `flex: 0 0 auto` refuses the shrink,
+      // `white-space: nowrap` refuses the wrap.
+      flex: '0 0 auto',
+      whiteSpace: 'nowrap',
       height: '28px', // BT:29
       padding: '0 10px', // BT:32
       border: '0.5px solid var(--dsw-alias-border-l3, currentColor)', // BT:55
@@ -574,6 +550,9 @@ interface PathGuardModuleLoader {
       // TR:151-159 keeps a 30px cell height too; the 34px controls in these cells
       // set their own, so only the 8px inset is copied.
       td: { boxSizing: 'border-box', padding: '4px 8px', verticalAlign: 'middle' },
+      // The action cell never wraps: the two buttons sit on one line whatever the
+      // table's layout algorithm decides for the column.
+      actionsCell: { boxSizing: 'border-box', padding: '4px 8px', verticalAlign: 'middle', whiteSpace: 'nowrap' },
       button: SM_BUTTON,
       // BT:36-39: the primary variant fills with the brand tone and writes its
       // label in the foreground tone. Same painted pair as before, token-only.
@@ -591,8 +570,8 @@ interface PathGuardModuleLoader {
       // absent the declaration drops and the text inherits the host family — the
       // same result the host's own `font: inherit` rules give.
       mono: { fontFamily: 'var(--ds-font-family-code)' },
-      presets: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '0 0 10px' }, // PM:1070-1075 `.approvalList`; PS:78
-      chip: { ...SM_BUTTON, borderRadius: '999px', padding: '0 12px' }, // PL:8 pill; BT:29-32 for the box
+      // The two action buttons are the only inline-flex controls left; the pill
+      // chip style went with the one-click presets.
       doc: { // PM:566-581 `.guide` + `.guideHint`; text metrics from SF:67-72
         margin: '6px 0 12px',
         padding: '8px 14px',
@@ -712,12 +691,6 @@ interface PathGuardModuleLoader {
         /** Append one rule to the draft, creating the draft if needed. */
         const appendRule = (rule: Rule) => setDraft([...rows, rule])
 
-        /** Append one preset; a path already present is not duplicated. */
-        const appendPreset = (preset: Preset) => {
-          if (rows.some(row => row.path === preset.path)) return
-          setDraft([...rows, { path: preset.path, access: preset.access, note: '' }])
-        }
-
         /** Ask the Host's directory picker and put the result in one row. */
         const browseInto = (index: number) => async () => {
           if (!picker.available) return
@@ -780,14 +753,6 @@ interface PathGuardModuleLoader {
           h('div', { style: STYLE.group },
             h('h3', { style: STYLE.groupTitle }, label('rules')),
             h('p', { style: STYLE.hint }, label('rulesHint')),
-            h('p', { style: { ...STYLE.hint, margin: '0 0 6px' } }, label('presets')),
-            h('div', { style: STYLE.presets }, PRESETS.map(preset => h('button', {
-              key: preset.key,
-              type: 'button',
-              style: STYLE.chip,
-              disabled: busy || !writable,
-              onClick: () => appendPreset(preset),
-            }, label(preset.key)))),
             // Always visible: this reference documents the matching semantics the
             // page configures, so a toggle would only hide the page's own content.
             h('div', { style: STYLE.doc },
@@ -827,7 +792,7 @@ interface PathGuardModuleLoader {
                     disabled: busy || !writable,
                     onChange: (event: ChangeEvent<ValueTarget>) => updateRow(index, { note: event.target.value }),
                   })),
-                  h('td', { style: STYLE.td }, h('div', { style: STYLE.actions },
+                  h('td', { style: STYLE.actionsCell }, h('div', { style: STYLE.actions },
                     picker.available
                       ? h('button', {
                         type: 'button',
