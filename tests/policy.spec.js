@@ -449,3 +449,527 @@ test('综合：调用方用 capabilities 把命中结果落成能力位', () => 
   assert.deepEqual(decide(`${WS}/src/a.js`), { list: true, read: true, write: true });
   assert.deepEqual(decide('D:/elsewhere/a.js'), { list: false, read: false, write: false });
 });
+
+// ---------------------------------------------------------------------------
+// 12. Windows 路径模型：UNC 身份（docs/ARCHITECTURE.md §3.3）
+// ---------------------------------------------------------------------------
+
+test('12. UNC 与 POSIX 是不同身份；两种 UNC 拼写是同一身份', () => {
+  const compiled = compileWin([{ id: 'unc', path: '\\\\srv\\share\\sec', access: 'none' }]);
+  assert.equal(compiled.invalid.length, 0);
+
+  // 两种 UNC 写法（DOS 设备路径 / 正斜杠）互相命中。
+  assert.equal(match(compiled.rules, '\\\\srv\\share\\sec\\a.txt', {}).ruleId, 'unc');
+  assert.equal(match(compiled.rules, '//srv/share/sec/a.txt', {}).ruleId, 'unc');
+  // 共享根本身与其下任意深度都覆盖。
+  assert.equal(match(compiled.rules, '\\\\srv\\share\\sec', {}).ruleId, 'unc');
+  assert.equal(match(compiled.rules, '//srv/share/sec/deep/a/b.txt', {}).ruleId, 'unc');
+
+  // 关键：不得与同后缀的 POSIX 路径碰撞（旧实现把 UNC 折成 /srv/share/sec）。
+  assert.equal(match(compiled.rules, '/srv/share/sec/a.txt', {}), undefined);
+  assert.equal(match(compiled.rules, '/srv/share/sec', {}), undefined);
+
+  // 反向：POSIX 规则不命中 UNC 候选。
+  const posix = compileWin([{ id: 'posix', path: '/srv/share/sec', access: 'none' }]);
+  assert.equal(match(posix.rules, '/srv/share/sec/a.txt', {}).ruleId, 'posix');
+  assert.equal(match(posix.rules, '\\\\srv\\share\\sec\\a.txt', {}), undefined);
+  assert.equal(match(posix.rules, '//srv/share/sec/a.txt', {}), undefined);
+});
+
+test('12b. UNC 规则的祖先语义不越过 server/share 边界', () => {
+  const compiled = compileWin([{ id: 'share', path: '\\\\srv\\share', access: 'read' }]);
+  assert.equal(match(compiled.rules, '\\\\srv\\share', {}).ruleId, 'share');
+  assert.equal(match(compiled.rules, '\\\\srv\\share\\a\\b', {}).ruleId, 'share');
+  assert.equal(match(compiled.rules, '\\\\srv\\other\\a', {}), undefined);
+  assert.equal(match(compiled.rules, '\\\\other\\share\\a', {}), undefined);
+  // POSIX 同后缀同样不命中。
+  assert.equal(match(compiled.rules, '/srv/share/a', {}), undefined);
+  // 通配符在 UNC 共享下照常工作。
+  const glob = compileWin([{ id: 'g', path: '//srv/share/**', access: 'none' }]);
+  assert.equal(match(glob.rules, '\\\\srv\\share\\x\\y', {}).ruleId, 'g');
+  assert.equal(match(glob.rules, '//srv/share', {}).ruleId, 'g');
+  assert.equal(match(glob.rules, '//srv/share2/x', {}), undefined);
+});
+
+test('12c. contains 在命名空间边界上不误判', () => {
+  assert.equal(contains('//srv/share', '//srv/share/a', true), true);
+  assert.equal(contains('//srv/share', '//srv/share', true), true);
+  assert.equal(contains('//srv/share', '/srv/share/a', true), false);
+  assert.equal(contains('/srv/share', '//srv/share/a', true), false);
+  assert.equal(contains('//srv/share', '//srv/other/a', true), false);
+  assert.equal(contains('//SRV/SHARE', '//srv/share/a', true), true);
+  assert.equal(contains('//SRV/SHARE', '//srv/share/a', false), false);
+});
+
+// ---------------------------------------------------------------------------
+// 13. 扩展长度前缀 / 设备命名空间
+// ---------------------------------------------------------------------------
+
+test('13. \\\\?\\C:\\x 与 C:\\x 同一身份；\\\\?\\UNC\\… 与 UNC 同一身份', () => {
+  const plain = compileWin([{ id: 'c', path: 'C:\\x', access: 'write' }]);
+  assert.equal(match(plain.rules, '\\\\?\\C:\\x', {}).ruleId, 'c');
+  assert.equal(match(plain.rules, '\\\\?\\C:\\x\\deep\\a.txt', {}).ruleId, 'c');
+  assert.equal(match(plain.rules, 'C:\\x\\deep', {}).ruleId, 'c');
+
+  // 规则写成扩展前缀时同样命中普通写法（双向）。
+  const ext = compileWin([{ id: 'e', path: '\\\\?\\C:\\y', access: 'none' }]);
+  assert.equal(match(ext.rules, 'C:\\y', {}).ruleId, 'e');
+  assert.equal(match(ext.rules, 'C:/y/z.txt', {}).ruleId, 'e');
+
+  const extUnc = compileWin([{ id: 'u', path: '\\\\?\\UNC\\srv\\share\\x', access: 'none' }]);
+  assert.equal(match(extUnc.rules, '\\\\srv\\share\\x', {}).ruleId, 'u');
+  assert.equal(match(extUnc.rules, '//srv/share/x', {}).ruleId, 'u');
+  assert.equal(match(extUnc.rules, '/srv/share/x', {}), undefined);
+});
+
+test('13b. 设备命名空间 \\\\.\\C:\\x 不与普通路径/扩展前缀混同', () => {
+  const plain = compileWin([{ id: 'plain', path: 'C:\\x', access: 'write' }]);
+  assert.equal(match(plain.rules, '\\\\.\\C:\\x', {}), undefined);
+
+  const device = compileWin([{ id: 'dev', path: '\\\\.\\C:\\x', access: 'read' }]);
+  assert.equal(match(device.rules, '\\\\.\\C:\\x', {}).ruleId, 'dev');
+  assert.equal(match(device.rules, 'C:\\x', {}), undefined);
+  assert.equal(match(device.rules, '\\\\?\\C:\\x', {}), undefined);
+  assert.equal(contains('\\\\.\\C:', '\\\\.\\C:\\x', true), true);
+  assert.equal(contains('C:/x', '\\\\.\\C:\\x', true), false);
+});
+
+test('13c. 卷 GUID 目标保留独立命名空间，不被当成盘符', () => {
+  const volume = compileWin([{ id: 'vol', path: '\\\\?\\Volume{1a2b}\\data', access: 'none' }]);
+  assert.equal(match(volume.rules, '\\\\?\\Volume{1a2b}\\data\\x', {}).ruleId, 'vol');
+  // 词法层无法把卷 GUID 映射成盘符，因此两者绝不互相命中。
+  assert.equal(match(volume.rules, 'C:\\data\\x', {}), undefined);
+  assert.equal(match(volume.rules, '\\\\srv\\share\\data\\x', {}), undefined);
+  const drive = compileWin([{ id: 'd', path: 'C:\\data', access: 'none' }]);
+  assert.equal(match(drive.rules, '\\\\?\\Volume{1a2b}\\data\\x', {}), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// 14. 驱动器相对路径：不可判定 + fail-safe
+// ---------------------------------------------------------------------------
+
+test('14. 驱动器相对 C:foo：规则进 invalid，候选 fail-safe 拒绝', () => {
+  const compiled = compileWin([
+    { id: 'safe', path: 'C:/safe', access: 'write' },
+    { id: 'rel-drive', path: 'C:foo', access: 'write' },
+    { id: 'drive-only', path: 'C:', access: 'write' },
+  ]);
+  assert.deepEqual(compiled.rules.map((r) => r.id), ['safe']);
+  assert.deepEqual(compiled.invalid.map((i) => i.index), [1, 2]);
+  assert.match(compiled.invalid[0].reason, /drive-relative/);
+  assert.match(compiled.invalid[0].reason, /C:foo/);
+  assert.match(compiled.invalid[1].reason, /C:/);
+
+  // 候选不可判定 → 不套用任何规则、也不落到 defaultAccess，而是 fail-safe 拒绝。
+  assert.deepEqual(match(compiled.rules, 'C:foo', {}), {
+    access: 'none',
+    ruleId: '<undecidable>',
+    pattern: 'C:foo',
+  });
+  assert.equal(match(compiled.rules, 'C:', {}).access, 'none');
+  assert.equal(match(compiled.rules, 'C:', {}).ruleId, '<undecidable>');
+  // 绝对拼写照常可判定。
+  assert.equal(match(compiled.rules, 'C:/safe/x', {}).ruleId, 'safe');
+  // 空规则表也不影响 fail-safe：判定不依赖「有没有规则」。
+  assert.equal(match([], 'C:foo', {}).access, 'none');
+});
+
+test('14b. C:foo 不再被当作 workspace 相对路径（旧行为的回归测试）', () => {
+  // 旧实现：expandPath('C:foo', {workspace}) → '<workspace>/C:foo'，把盘符相对
+  // 当成了普通相对路径。现在原样回传，调用方能看到「此刻不可判定」。
+  assert.equal(expandPath('C:foo', { workspace: WS }), 'C:foo');
+  assert.equal(expandPath('C:', { workspace: WS }), 'C:');
+  assert.equal(expandPath('C:\\foo', { workspace: WS }), 'C:/foo');
+  assert.equal(expandPath('C:/foo', { workspace: WS }), 'C:/foo');
+
+  // 单字母冒号前缀在 POSIX 上也是合法文件名（`a:b`），歧义必须由调用方消解
+  // （写成 `./a:b`），策略层不替它选。
+  assert.equal(expandPath('a:b', { workspace: WS }), 'a:b');
+  assert.equal(expandPath('./a:b', { workspace: '/ws' }), '/ws/a:b');
+  // 但落在盘符命名空间下时，`a:b` 就是 `a` 的 ADS（同一个 `a`）——命名空间决定语义。
+  assert.equal(expandPath('./a:b', { workspace: WS }), `${WS}/a`);
+  const single = compileWin([{ id: 'x', path: 'a:b', access: 'read' }]);
+  assert.equal(single.isEmpty, true);
+  assert.equal(match(single.rules, 'a:b', {}).access, 'none');
+  // 显式相对写法在盘符 workspace 下与宿主文件等价（规则不会成为永不命中的死规则）。
+  const streamy = compileWin([{ id: 'sa', path: './a:b', access: 'none' }]);
+  assert.equal(match(streamy.rules, `${WS}/a`, { workspace: WS }).ruleId, 'sa');
+  assert.equal(match(streamy.rules, `${WS}/a:$DATA`, { workspace: WS }).ruleId, 'sa');
+});
+
+test('14c. 缺 share 的 UNC 与只有命名空间标记的输入 → 不可判定', () => {
+  const compiled = compileWin([
+    { id: 'bad1', path: '\\\\srv', access: 'none' },
+    { id: 'bad2', path: '//srv', access: 'none' },
+    { id: 'bad3', path: '\\\\?\\', access: 'none' },
+    { id: 'bad4', path: '\\\\.\\', access: 'none' },
+    { id: 'ok', path: '\\\\srv\\share', access: 'read' },
+  ]);
+  assert.deepEqual(compiled.rules.map((r) => r.id), ['ok']);
+  assert.deepEqual(compiled.invalid.map((i) => i.index), [0, 1, 2, 3]);
+  for (const bad of compiled.invalid) {
+    assert.match(bad.reason, /UNC|names no/);
+  }
+  assert.equal(match(compiled.rules, '\\\\srv', {}).ruleId, '<undecidable>');
+  assert.equal(match(compiled.rules, '//srv', {}).ruleId, '<undecidable>');
+});
+
+// ---------------------------------------------------------------------------
+// 15. Windows 末段尾部点/空格（含 GetFullPathNameW 实测证据）
+// ---------------------------------------------------------------------------
+
+test('15. Windows 末段尾部点/空格归一：C:\\x. ≡ C:\\x ≡ C:\\x␠', () => {
+  const compiled = compileWin([{ id: 'x', path: 'C:/x', access: 'none' }]);
+  assert.equal(match(compiled.rules, 'C:\\x.', {}).ruleId, 'x');
+  assert.equal(match(compiled.rules, 'C:\\x ', {}).ruleId, 'x');
+  assert.equal(match(compiled.rules, 'C:\\x.\\y.txt', {}).ruleId, 'x');
+  assert.equal(match(compiled.rules, 'C:/x/', {}).ruleId, 'x');
+
+  // 规则一侧同样归一化：`C:/y.` 与 `C:/y` 是同一条规则（被归一化去重合并）。
+  const dotted = compileWin([
+    { id: 'first', path: 'C:/y', access: 'read' },
+    { id: 'second', path: 'C:/y.', access: 'read' },
+  ]);
+  assert.equal(dotted.rules.length, 1);
+  assert.equal(dotted.rules[0].id, 'second');
+  assert.equal(match(dotted.rules, 'C:/y/z', {}).ruleId, 'second');
+});
+
+test('15b. 中间段只剥尾部点、不剥尾部空格（GetFullPathNameW 实测行为）', () => {
+  const compiled = compileWin([{ id: 'x', path: 'C:/x', access: 'none' }]);
+  // `C:\x.\y` → `C:\x\y`：中间段的尾部点被剥掉。
+  assert.equal(match(compiled.rules, 'C:\\x.\\y', {}).ruleId, 'x');
+  // `C:\x .\y` → `C:\x \y`：中间段的尾部空格保留，因此不落在 `C:/x` 之下。
+  assert.equal(match(compiled.rules, 'C:\\x .\\y', {}), undefined);
+  // 中间段的「点 + 空格」只剥到空格为止（`x. .` → `x. `）。
+  assert.equal(match(compiled.rules, 'C:\\x. .\\y', {}), undefined);
+
+  // 末段的点/空格混合尾一起剥掉（`x. .` → `x`，`x .` → `x`）。
+  const mixed = compileWin([{ id: 'z', path: 'C:/z', access: 'none' }]);
+  assert.equal(match(mixed.rules, 'C:\\z. .', {}).ruleId, 'z');
+  assert.equal(match(mixed.rules, 'C:\\z .', {}).ruleId, 'z');
+  assert.equal(match(mixed.rules, 'C:\\z...', {}).ruleId, 'z');
+});
+
+test('15c. POSIX 不折叠尾部点/空格（同一字符串在两套语义下不同）', () => {
+  // POSIX 文件名可以以点/空格结尾：`/x.` 与 `/x` 是两个资源。
+  const posix = compile({ rules: [{ id: 'px', path: '/x', access: 'none' }], windows: true });
+  assert.equal(match(posix.rules, '/x.', {}), undefined);
+  assert.equal(match(posix.rules, '/x ', {}), undefined);
+  assert.equal(expandPath('/x.', {}), '/x.');
+  assert.equal(expandPath('/x ', {}), '/x ');
+  // 反过来也一样：写 `/x.` 的规则只覆盖 `/x.`。
+  const dotted = compile({ rules: [{ id: 'pd', path: '/x.', access: 'none' }], windows: true });
+  assert.equal(match(dotted.rules, '/x.', {}).ruleId, 'pd');
+  assert.equal(match(dotted.rules, '/x', {}), undefined);
+});
+
+test('15d. 全点分量：中间段保留原样，末段剥空后消失', () => {
+  // 中间段 `...` 保留（`GetFullPathNameW('...\y')` → `...\y`），所以它不是空段。
+  const dottedRule = compileWin([{ id: 'dd', path: 'C:/x/.../y', access: 'read' }]);
+  assert.equal(match(dottedRule.rules, 'C:\\x\\...\\y', {}).ruleId, 'dd');
+  assert.equal(match(dottedRule.rules, 'C:\\x\\y', {}), undefined);
+
+  // 末段 `...` 剥空 → 该分量消失（`GetFullPath('...')` → 父目录）。
+  const parent = compileWin([{ id: 'x', path: 'C:/x', access: 'none' }]);
+  assert.equal(match(parent.rules, 'C:\\x\\...', {}).ruleId, 'x');
+});
+
+// ---------------------------------------------------------------------------
+// 16. ADS：file.txt:stream
+// ---------------------------------------------------------------------------
+
+test('16. ADS 决定：流折叠到宿主文件，deny 规则不会被 :stream 绕过', () => {
+  const compiled = compileWin([{ id: 'secrets', path: 'C:/secrets/token.txt', access: 'none' }]);
+  assert.equal(match(compiled.rules, 'C:/secrets/token.txt:$DATA', {}).ruleId, 'secrets');
+  assert.equal(match(compiled.rules, 'C:/secrets/token.txt:hidden', {}).ruleId, 'secrets');
+  assert.equal(match(compiled.rules, 'C:\\secrets\\token.txt:evil', {}).ruleId, 'secrets');
+  // 更长的流名与空流名（`f.txt:` 就是默认流）同样折叠。
+  assert.equal(match(compiled.rules, 'C:/secrets/token.txt:', {}).ruleId, 'secrets');
+  // `:` 出现在非末段（`token.txt:a/b`）时不折叠：Windows 不接受这种拼写，
+  // 它指向不了任何真实资源，本层保持其为独立身份（见 16b）。
+  assert.equal(match(compiled.rules, 'C:/secrets/token.txt:a/b', {}), undefined);
+
+  // 目录规则覆盖其下所有文件的流。
+  const dir = compileWin([{ id: 'dir', path: 'C:/secrets/**', access: 'none' }]);
+  assert.equal(match(dir.rules, 'C:/secrets/a/b.txt:s', {}).ruleId, 'dir');
+
+  // 规则一侧也折叠：写 `:private` 的规则等于写宿主文件（这是「同一资源」的宣告）。
+  const streamRule = compileWin([{ id: 'sr', path: 'C:/x/f.txt:private', access: 'none' }]);
+  assert.equal(match(streamRule.rules, 'C:/x/f.txt', {}).ruleId, 'sr');
+  assert.equal(match(streamRule.rules, 'C:/x/f.txt:other', {}).ruleId, 'sr');
+  // 回传给调用方的 pattern 永远是用户写的原文，不做改写。
+  assert.equal(match(streamRule.rules, 'C:/x/f.txt', {}).pattern, 'C:/x/f.txt:private');
+});
+
+test('16b. ADS 折叠只作用于 Windows 命名空间与最后一个分量', () => {
+  // POSIX 上 `:` 是普通文件名字符。
+  const posix = compile({ rules: [{ id: 'pf', path: '/x/f.txt', access: 'read' }], windows: true });
+  assert.equal(match(posix.rules, '/x/f.txt:s', {}), undefined);
+  assert.equal(expandPath('/x/f.txt:s', {}), '/x/f.txt:s');
+  const posixStream = compile({ rules: [{ id: 'ps', path: '/x/f.txt:s', access: 'read' }], windows: true });
+  assert.equal(match(posixStream.rules, '/x/f.txt:s', {}).ruleId, 'ps');
+  assert.equal(match(posixStream.rules, '/x/f.txt', {}), undefined);
+
+  // 非末段分量里的 `:` 不折叠（Windows 也不接受这种拼写），保持独立身份。
+  const mid = compileWin([{ id: 'mid', path: 'C:/a:b/c', access: 'read' }]);
+  assert.equal(match(mid.rules, 'C:/a:b/c', {}).ruleId, 'mid');
+  assert.equal(match(mid.rules, 'C:/a/c', {}), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// 17. 词法层解决不了的边界：记录，而不是假装处理
+// ---------------------------------------------------------------------------
+
+test('17. 8.3 短名/长名：词法层不统一（由 ctx.fs.resolve() 的规范化 pass 负责）', () => {
+  // 实测：`fs.realpathSync('C:\\Users\\SUSEVE~1')` 连大小写都不改写，所以只有
+  // 文件系统身份（dev+ino / realpath）能识别 8.3 别名；DSH 自己在
+  // packages/fs/fs-sandbox/src/containment.ts:46-76 就是「词法快路径 + stat 兜底」。
+  // 因此本层**不假装**能展开短名，只保证不会因为不认识就放宽判定。
+  const long = compileWin([{ id: 'long', path: 'C:/Program Files/app/config.json', access: 'none' }]);
+  assert.equal(match(long.rules, 'C:/PROGRA~1/app/config.json', {}), undefined);
+  const short = compileWin([{ id: 'short', path: 'C:/PROGRA~1/app', access: 'none' }]);
+  assert.equal(match(short.rules, 'C:/Program Files/app/config.json', {}), undefined);
+  assert.equal(contains('C:/PROGRA~1', 'C:/Program Files/app/config.json', true), false);
+
+  // 本层能做的只有大小写折叠这一件，它不能替代身份解析。
+  assert.equal(match(long.rules, 'c:/program files/app/config.json', {}).ruleId, 'long');
+});
+
+test('17b. junction/symlink 与 ADS 的真实身份同样委派给 canonical target', () => {
+  // 词法层只看拼写：`C:/link/x` 不会因为 link 指向 C:/real 就命中 `C:/real/**`。
+  const real = compileWin([{ id: 'real', path: 'C:/real/**', access: 'none' }]);
+  assert.equal(match(real.rules, 'C:/link/x', {}), undefined);
+  const link = compileWin([{ id: 'link', path: 'C:/link/**', access: 'none' }]);
+  assert.equal(match(link.rules, 'C:/real/x', {}), undefined);
+  // 这条测试是**边界记录**，不是「已处理」的声明：真实判定由 index.js 在
+  // `ctx.fs.resolve()` 之后用 canonical path 再判一次。
+});
+
+test('17c. 边界记录：POSIX 上 `\\` 仍被当作分隔符（刻意的跨平台近似）', () => {
+  // POSIX 文件名可以含 `\`（DSH 的 tool-fs-search 有专门测试记录这点）。本层为了
+  // 兼容跨平台配置在所有命名空间里都折叠 `\`：POSIX 上名为 `a\b` 的文件会被
+  // `/x/a/b` 的规则覆盖（deny 方向是收紧，allow 方向是既有的近似）。
+  const compiled = compile({ rules: [{ id: 'p', path: '/x/a/b', access: 'read' }], windows: true });
+  assert.equal(match(compiled.rules, '/x/a\\b', {}).ruleId, 'p');
+  assert.equal(expandPath('/x/a\\b', {}), '/x/a/b');
+});
+
+// ---------------------------------------------------------------------------
+// 18. 预编译匹配器（docs/ARCHITECTURE.md §3.4）
+// ---------------------------------------------------------------------------
+
+/**
+ * 测试自带的独立「逐条扫描」实现，用于给优化后的匹配器做对照。
+ * 它只用公开 API（`expandPath`）与规则对象上的公开字段，不碰实现内部。
+ */
+
+/** 独立的 glob→regex（只覆盖对照用例用到的形态：字面量、`*`、`?`、结尾 `**`）。 */
+function refGlobToRegExp(glob) {
+  let out = '';
+  for (let i = 0; i < glob.length; ) {
+    const ch = glob[i];
+    if (ch === '*') {
+      let run = 0;
+      while (glob[i + run] === '*') {
+        run += 1;
+      }
+      const nextSlash = glob[i + run] === '/';
+      if (run === 1) {
+        out += '[^/]*';
+      } else if (out.endsWith('/')) {
+        out = `${out.slice(0, -1)}${nextSlash ? '(?:/.*)?/' : '(?:/.*)?'}`;
+      } else {
+        out += nextSlash ? '(?:.*/)?' : '.*';
+      }
+      i += run;
+      if (run > 1 && nextSlash) {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '?') {
+      out += '[^/]';
+      i += 1;
+      continue;
+    }
+    out += /[.*+?^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch;
+    i += 1;
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/** 独立的祖先链：按 `/` 逐层上溯（多出的 `C:` / `//srv` 等前缀不可能是合法规则键）。 */
+function refAncestors(key) {
+  const chain = [key];
+  let current = key;
+  for (;;) {
+    const cut = current.lastIndexOf('/');
+    if (cut <= 0) {
+      return chain;
+    }
+    current = current.slice(0, cut);
+    chain.push(current);
+  }
+}
+
+/** 独立的判定：每条规则 × 每个祖先，必要时现建 regex。 */
+function refDecide(rules, path, workspace, home) {
+  const candidate = expandPath(path, { home, workspace });
+  let best;
+  for (const rule of rules) {
+    let pattern;
+    if (rule.needsWorkspace === true) {
+      if (workspace === undefined) {
+        continue;
+      }
+      pattern = expandPath(rule.pattern, { home, workspace });
+    } else {
+      pattern = rule.normalized;
+    }
+    const folded = rule.windows === true ? pattern.toLowerCase() : pattern;
+    const cand = rule.windows === true ? candidate.toLowerCase() : candidate;
+    const regex = refGlobToRegExp(folded);
+    let ancestorLength = -1;
+    for (const ancestor of refAncestors(cand)) {
+      if (regex.test(ancestor)) {
+        ancestorLength = ancestor.length;
+        break;
+      }
+    }
+    if (ancestorLength < 0) {
+      continue;
+    }
+    const hit = { rule, ancestorLength };
+    if (best === undefined) {
+      best = hit;
+      continue;
+    }
+    const moreSpecific =
+      hit.ancestorLength !== best.ancestorLength
+        ? hit.ancestorLength > best.ancestorLength
+        : hit.rule.prefixLength !== best.rule.prefixLength
+          ? hit.rule.prefixLength > best.rule.prefixLength
+          : hit.rule.wildcards !== best.rule.wildcards
+            ? hit.rule.wildcards < best.rule.wildcards
+            : hit.rule.index > best.rule.index;
+    if (moreSpecific) {
+      best = hit;
+    }
+  }
+  return best === undefined
+    ? undefined
+    : { access: best.rule.access, ruleId: best.rule.id, pattern: best.rule.pattern };
+}
+
+test('18. compile 预编译匹配物：literal / regex / workspace 各就各位', () => {
+  const compiled = compileWin([
+    { id: 'lit', path: 'D:/a/b', access: 'read' },
+    { id: 'glob', path: 'D:/a/*', access: 'list' },
+    { id: 'ws', path: '${workspace}/src/**', access: 'write' },
+  ]);
+  const [lit, glob, ws] = compiled.rules;
+  assert.equal(lit.literal, 'd:/a/b');
+  assert.equal(lit.regex, null);
+  assert.equal(glob.literal, null);
+  assert.ok(glob.regex instanceof RegExp);
+  // `RegExp#source` 会把分隔符 `/` 转义，这是标准的 source 拼写。
+  assert.equal(glob.regex.source, '^d:\\/a\\/[^/]*$');
+  assert.equal(ws.literal, null);
+  assert.equal(ws.regex, null); // workspace 规则在 match 期按 workspace 编译并缓存
+  assert.equal(ws.normalized, '${workspace}/src/**');
+  assert.equal(ws.needsWorkspace, true);
+
+  // 反复判定结果稳定（workspace 缓存不会串味，多 workspace 交替也一致）。
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(match(compiled.rules, 'D:/a/b/c', { workspace: WS }).ruleId, 'lit');
+    assert.equal(match(compiled.rules, `${WS}/src/x.js`, { workspace: WS }).ruleId, 'ws');
+    assert.equal(match(compiled.rules, 'D:/w2/src/x.js', { workspace: 'D:/w2' }).ruleId, 'ws');
+    assert.equal(match(compiled.rules, `${WS}/src/x.js`, { workspace: 'D:/other' }), undefined);
+    assert.equal(match(compiled.rules, `${WS}/src/x.js`, {}), undefined);
+  }
+});
+
+test('18b. 200 规则 × 1000 路径：与逐条扫描一致，且总耗时 < 300ms', () => {
+  const PERF_HOME = '/home/perf';
+  const PERF_WS = 'D:/perf';
+  const ACCESSES = ['none', 'list', 'read', 'write'];
+
+  const perfRules = [];
+  for (let i = 0; i < 200; i += 1) {
+    const access = ACCESSES[i % ACCESSES.length];
+    switch (i % 5) {
+      case 0:
+        perfRules.push({ id: `lit-${i}`, path: `D:/perf/t${i}/sub/file.txt`, access });
+        break;
+      case 1:
+        perfRules.push({ id: `star-${i}`, path: `D:/perf/t${i}/*`, access });
+        break;
+      case 2:
+        perfRules.push({ id: `gs-${i}`, path: `D:/perf/t${i}/**`, access });
+        break;
+      case 3:
+        perfRules.push({ id: `ws-${i}`, path: `\${workspace}/src/t${i}/**`, access });
+        break;
+      default:
+        perfRules.push({ id: `home-${i}`, path: `~/.perf/t${i}/**`, access });
+        break;
+    }
+  }
+
+  const perfPaths = [];
+  for (let n = 0; n < 1000; n += 1) {
+    const i = n % 200;
+    switch (n % 5) {
+      case 0:
+        perfPaths.push(`D:/perf/t${i}/sub/file.txt`);
+        break;
+      case 1:
+        perfPaths.push(`D:/perf/t${i}/child.txt`);
+        break;
+      case 2:
+        perfPaths.push(`D:/perf/t${i}/deep/a/b.txt`);
+        break;
+      case 3:
+        perfPaths.push(`D:/perf/src/t${i}/x/y.js`);
+        break;
+      default:
+        perfPaths.push(`/home/perf/.perf/t${i}/notes.md`);
+        break;
+    }
+  }
+
+  const compiled = compile({ rules: perfRules, home: PERF_HOME, windows: true });
+  assert.equal(compiled.invalid.length, 0);
+  assert.equal(compiled.rules.length, 200);
+
+  // 1) 正确性：与逐条扫描逐项一致（每一条路径都必须有决定，避免「两边都是 undefined」的假通过）。
+  let decided = 0;
+  for (const path of perfPaths) {
+    const actual = match(compiled.rules, path, { workspace: PERF_WS });
+    const expected = refDecide(compiled.rules, path, PERF_WS, PERF_HOME);
+    assert.deepEqual(actual, expected, path);
+    if (actual !== undefined) {
+      decided += 1;
+    }
+  }
+  assert.equal(decided, perfPaths.length);
+
+  // 2) 性能：用一份**新的** compile 产物计时，让 workspace 缓存也是冷的（最坏情况）。
+  const cold = compile({ rules: perfRules, home: PERF_HOME, windows: true });
+  const started = performance.now();
+  for (const path of perfPaths) {
+    match(cold.rules, path, { workspace: PERF_WS });
+  }
+  const elapsed = performance.now() - started;
+  const warmStarted = performance.now();
+  for (const path of perfPaths) {
+    match(cold.rules, path, { workspace: PERF_WS });
+  }
+  const warmElapsed = performance.now() - warmStarted;
+  console.log(
+    `[perf] 200 规则 × 1000 路径：冷 ${elapsed.toFixed(1)}ms / 热 ${warmElapsed.toFixed(1)}ms（上限 300ms）`,
+  );
+  // 宽松上限：容忍慢机器与 CI 抖动，只拦住「回到了每次重建 regex」的退化。
+  assert.ok(elapsed < 300, `200 规则 × 1000 路径耗时 ${elapsed.toFixed(1)}ms，超过 300ms 上限`);
+});
