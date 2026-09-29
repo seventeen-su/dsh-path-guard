@@ -99,13 +99,14 @@ type DenialHit = {
 
 /**
  * 工具调用对象。结构镜像自 DSH `packages/core/tools/src/index.ts` 的 `ToolExecution`，
- * 只列出本插件真正读取的字段（`name` / `arguments` / `signal` / `agent.session.header.cwd`）。
+ * 只列出本插件真正读取的字段（`name` / `arguments` / `signal` /
+ * `agent.session.header.cwd` / `agent.session.header.id`）。
  */
 type ToolExecution = {
   name: string
   arguments: Record<string, unknown>
   signal?: unknown
-  agent?: { session: { header: { cwd: string } } } | undefined
+  agent?: { session: { header: { cwd: string; id?: string } } } | undefined
 }
 
 /**
@@ -394,6 +395,26 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
           + `要完全信任它，请在「设置 → 插件 → 路径守卫 → 工具信任」里加上 ${suggestion}`
           + (prefix === undefined ? '。' : ' —— 这会一次信任该插件的全部工具（含它以后新增的）。'),
         urgency: 'low',
+        // Clicking leads to where the FIX lives, not to the session: the user's
+        // next action is to add a trust entry, and that is on this plugin's page.
+        //
+        // `page:plugins` is the sidebar's Plugins panel — the page the user asked
+        // for (`layout.selectPanel('plugins')`, dsh-desktop-notify src/client.ts
+        // openPluginsPanel). Note the peer's own quirk: it prefers
+        // `pluginNavigation.openBundle('dsh-desktop-notify')` over the plain
+        // `selectPanel`, and that bundle name is HARDCODED (client.ts:163), so the
+        // panel opens on the notify plugin's own page rather than the list. That
+        // is the peer's bug, not a target we can correct from here — the wire
+        // format's page whitelist is the bare pair
+        // `['settings-plugins', 'plugins']`, with no bundle parameter.
+        //
+        // `page:settings-plugins` would reach the plugins LIST in Settings, which
+        // is a different page and not what was asked for.
+        click: { type: 'page', page: 'plugins' },
+        // Deliberately NO `sessionId`. `push` silences a notification while the
+        // user is looking at that very session, and this notice exists for exactly
+        // that moment — the tool call that raised it happened in the session on
+        // screen, so a session-gated notice would never be seen at all.
       })
     } catch (error) {
       ctx.logger.debug('path-guard: trust-suggestion notification failed: %s', String(error))
@@ -905,6 +926,22 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
   })
 
   /**
+   * The session a call belongs to, as the notification peer wants it.
+   *
+   * The plain id is preferred over the session object: the id is what the click
+   * target is built from (`session:<id>`), and handing over a string removes any
+   * dependence on the peer normalizing an object shape it may change.
+   * @param {ToolExecution} exec - the running call.
+   * @returns {unknown} the session id, the session object, or undefined.
+   */
+  const sessionOf = (exec: ToolExecution): unknown => {
+    const session = exec.agent?.session
+    if (session === undefined || session === null) return undefined
+    const id = session.header?.id
+    return typeof id === 'string' && id !== '' ? id : session
+  }
+
+  /**
    * Record a refusal: one log line, plus a desktop notification when enabled.
    * @param {import('@deepseek-ai/dsh-tools').ToolExecution} exec - the refused call.
    * @param {{reason: string, target?: string, access?: string, rulePath?: string, ruleId?: string}} hit - the verdict.
@@ -914,6 +951,7 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
     ctx.logger.warn('path-guard: denied %s — %s', exec.name, String(hit.reason).split('\n')[0])
     const mode = read('notify')
     if (mode === 'off') return
+    const session = sessionOf(exec)
     notifier.denial({
       kind,
       toolName: exec.name,
@@ -921,7 +959,7 @@ export function apply(ctx: CordisContext, config: Record<string, unknown>) {
       ...(hit.access === undefined ? {} : { access: hit.access }),
       ...(hit.rulePath === undefined ? {} : { rulePath: hit.rulePath }),
       ...(hit.ruleId === undefined ? {} : { ruleId: hit.ruleId }),
-      ...(exec.agent?.session === undefined ? {} : { sessionId: exec.agent.session }),
+      ...(session === undefined ? {} : { sessionId: session }),
       always: mode === 'always',
     })
   }

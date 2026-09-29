@@ -47,6 +47,8 @@ interface PushedItem {
   message: string
   urgency?: string | undefined
   sessionId?: unknown
+  /** Click target. `sessionId` gates; THIS is what makes a toast clickable. */
+  click?: { type: 'session'; sessionId: unknown } | { type: 'page'; page: string } | undefined
 }
 /** What the tests read off the fake beyond the plugin's own ctx contract. */
 interface FakeCtxExtra {
@@ -698,6 +700,16 @@ test('the first sighting of an unmodelled tool notifies once, naming the prefix 
   assert.equal((await preExecute(ctx, probe)).kind, 'allow')
   assert.equal(ctx.pushed.length, 1, 'a first sighting notifies')
   assert.ok(ctx.pushed[0]!.message.includes('notes_*'), 'the suggestion must be the prefix form, not just the tool name')
+
+  // Clicking leads to where the FIX lives: the sidebar's Plugins panel, not the
+  // session. The peer requires an explicit `click` (no `click` ⇒ not clickable).
+  assert.deepEqual(ctx.pushed[0]!.click, { type: 'page', page: 'plugins' })
+
+  // Deliberately NOT session-gated. `push` silences a notification while the user
+  // is looking at that very session, and this notice exists for exactly that
+  // moment — the tool call that raised it happened in the session on screen. With
+  // a `sessionId` this notification would essentially never be seen.
+  assert.ok(!('sessionId' in ctx.pushed[0]!), 'the trust suggestion must not be session-gated')
 
   // Once per TOOL, not once per call: `unmodelledSeen` is the dedup, so this can
   // never turn into a stream of notifications.

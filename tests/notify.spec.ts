@@ -34,6 +34,8 @@ interface NotifyItem {
   message: string
   urgency: string
   sessionId?: unknown
+  /** Click target. `sessionId` gates; THIS is what makes a toast clickable. */
+  click?: { type: 'session'; sessionId: unknown }
 }
 
 /** The slice of `desktopNotify` this test fakes. */
@@ -120,7 +122,10 @@ const PATH_DENIAL = {
 }
 
 /** Payload keys a denial may carry; anything else would be surface we do not own. */
-const ALLOWED_PAYLOAD_KEYS = ['message', 'sessionId', 'title', 'urgency']
+// `click` is part of the allowed surface: the peer requires it to be EXPLICIT
+// (dsh-desktop-notify 1.6.0+), and a payload without one produces a toast that
+// cannot be clicked at all.
+const ALLOWED_PAYLOAD_KEYS = ['click', 'message', 'sessionId', 'title', 'urgency']
 
 // ---------------------------------------------------------------------------
 // 1. The optional service is absent
@@ -187,6 +192,10 @@ describe('2. normal path', () => {
     assert.match(payload.message, /deny/, 'carries the tier')
     assert.equal(payload.urgency, 'normal')
     assert.equal(payload.sessionId, 'session-1')
+    // `sessionId` only drives the peer's focus gate. Clicking is a SEPARATE field,
+    // and omitting it makes the toast unclickable — the user gets a popup about a
+    // refused call and no way to reach it.
+    assert.deepEqual(payload.click, { type: 'session', sessionId: 'session-1' })
     assert.deepEqual(Object.keys(payload).sort(), ALLOWED_PAYLOAD_KEYS)
     assert.deepEqual(h.warns, [])
     assert.equal(h.notifier.tracked(), 1)
@@ -267,6 +276,11 @@ describe('4. sessionId', () => {
       assert.equal(h.notifier.denial({ ...PATH_DENIAL, sessionId }), true)
       const payload = fake.calls.push[0]!
       assert.ok(!('sessionId' in payload), `sessionId ${JSON.stringify(sessionId)} must not create a field`)
+      // No session ⇒ no click target either. A notification we cannot attribute
+      // stays unclickable rather than carrying a target the peer would reject as
+      // an unrecognized shape (which it treats as "not clickable" anyway — this
+      // just keeps the payload honest).
+      assert.ok(!('click' in payload), 'an unattributed notification must not carry a click target')
       assert.deepEqual(Object.keys(payload).sort(), ['message', 'title', 'urgency'])
     }
   })

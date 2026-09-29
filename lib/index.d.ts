@@ -33,7 +33,8 @@
 import { Config } from './config.ts';
 /**
  * 工具调用对象。结构镜像自 DSH `packages/core/tools/src/index.ts` 的 `ToolExecution`，
- * 只列出本插件真正读取的字段（`name` / `arguments` / `signal` / `agent.session.header.cwd`）。
+ * 只列出本插件真正读取的字段（`name` / `arguments` / `signal` /
+ * `agent.session.header.cwd` / `agent.session.header.id`）。
  */
 type ToolExecution = {
     name: string;
@@ -43,6 +44,7 @@ type ToolExecution = {
         session: {
             header: {
                 cwd: string;
+                id?: string;
             };
         };
     } | undefined;

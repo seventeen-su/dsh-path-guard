@@ -375,15 +375,29 @@ export function createNotifier(deps?: {
       ? clipField(fields.target, Math.max(MIN_TARGET_BUDGET, Math.min(FIELD_LIMITS.target, budget)))
       : ''
     const body = `${head}${target ? `，目标 ${target}` : ''}${tail}`
-    const payload: { title: string; message: string; urgency: string; sessionId?: unknown } = {
+    const payload: {
+      title: string
+      message: string
+      urgency: string
+      sessionId?: unknown
+      click?: { type: 'session'; sessionId: unknown }
+    } = {
       title: truncateText(DENIAL_TITLE, MAX_TITLE),
       message: truncateText(body, MAX_MESSAGE),
       urgency: KIND_URGENCY.get(fields.kind) ?? 'normal',
     }
     // Absent session ⇒ the field must not be present at all: the peer treats an
     // empty list as "attribution unknown" and pushes, and a stray `undefined`
-    // key would be needless surface.
-    if (fields.hasSession) payload.sessionId = fields.sessionId
+    // key would needless surface.
+    if (fields.hasSession) {
+      payload.sessionId = fields.sessionId
+      // `sessionId` drives the FOCUS GATE only; the click target is a separate,
+      // explicit field, and omitting it makes the toast silently unclickable
+      // (dsh-desktop-notify 1.6.0+). A denial the user cannot act on is half a
+      // notification: the whole point of the popup is to take them to the call
+      // that was refused.
+      payload.click = { type: 'session', sessionId: fields.sessionId }
+    }
     return payload
   }
 
