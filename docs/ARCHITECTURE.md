@@ -124,6 +124,23 @@ profile composition → validate → path-guard row 必须存在
 
 ## 4. 迭代优先级（用户给定）
 
+### 4.0 两项已拍板（2026-09-30）
+
+**① 不接管 `ctx.fs`（用户明确决定）。** 因此 §2.1 只做到「写侧权威」：
+`fs/write-intent` / `fs/edit-intent` 是写侧的最终权威层，`tools/pre-execute` 在上层做快速策略检查。
+**读侧没有对应的 intent 事件**，所以读侧 TOCTOU 保持「上层快速检查」的定位——这不是遗漏，而是一个
+被明确接受的边界：读侧防护依赖 `ctx.fs.resolve()` 给出的 canonical 身份，而不是「检查与使用之间没有窗口」。
+README 的「挡不住」表必须写明这一条。
+
+**② opaque 通道（shell / workflow / terminal）：不在插件侧继续加复杂度，但也不能现在就交给 sandbox
+（Lead 决策）。** 事实依据：DSH 的沙箱策略词表只有 `mode` + 一个 `workspaceRoot` + 可选 `sessionId`
+（`packages/sandbox/sandbox/src/index.ts:40-73`），**没有路径 deny 列表**，因此
+「shell → sandbox executor + path deny policy」这条路上**当前没有可表达的接口**。决定：
+- 保留 scanner 作为**明确标注为 best-effort 的辅助层**（不再改造成半吊子 parser，也不再扩充语法支持）；
+- 把「DSH 需要为 sandbox policy 增加 path deny 能力」记为**上游前置条件**，待其具备后再把
+  shell/workflow 的路径约束迁过去；
+- 期间 `shell: deny` 是唯一真正堵住该通道的档位，配置页文案已如此表述。
+
 1. **Resource Identity Policy**（对应 2.2）：`tool → operation → resource identity → capability decision`
 2. **canonical target 成为策略核心对象**（对应 2.1）：
    `raw path → ctx.fs.resolve() → FsTarget → PolicyEngine.authorize(target, operation)`
