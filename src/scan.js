@@ -18,6 +18,13 @@ import { expandPath } from './policy.js'
 /** Needles shorter than this are too generic to be evidence of anything. */
 const MIN_NEEDLE = 4
 
+/**
+ * Prefix marking a BY-FILENAME rule (`name:readme.md`) in `policy.js`. Such a
+ * rule constrains a basename, which a whole-path substring scanner cannot
+ * express, so `scan.js` reports it as uncovered rather than approximating it.
+ */
+const NAME_RULE_PREFIX = 'name:'
+
 /** Environment-variable spellings of a home directory, per shell dialect. */
 const HOME_FORMS = ['~', '$HOME', '${HOME}', '$env:USERPROFILE', '%USERPROFILE%']
 
@@ -65,6 +72,15 @@ export function unscannablePatterns(rules) {
     if (rule === null || typeof rule !== 'object') continue
     const pattern = typeof rule.path === 'string' ? rule.path.trim() : ''
     if (pattern === '') continue
+    // A `name:` rule constrains a BASENAME, and the substring scanner works on
+    // whole paths. `literalNeedlePrefix('name:id_rsa')` happily returns the whole
+    // string, so without this branch a deny-direction name rule would be neither
+    // enforced nor reported — the same silent fail-open §1.1 of
+    // docs/ARCHITECTURE.md was written to kill. Report it instead.
+    if (pattern.startsWith(NAME_RULE_PREFIX)) {
+      out.push(pattern)
+      continue
+    }
     if (literalNeedlePrefix(pattern) === undefined) out.push(pattern)
   }
   return out
@@ -96,6 +112,12 @@ export function buildNeedles(rules, ctx) {
     // Reduce the pattern to its literal prefix FIRST: expanding `~/.ssh/**`
     // yields a needle with a literal `**` in it, which no command ever contains,
     // so the rule would be silently unenforced in every spelling.
+    // A `name:` rule is not a path: expanding it would treat `name:readme.md` as
+    // a path (and on Windows the ADS folding then turns it into `D:/proj/name`),
+    // producing a short, over-broad needle that denies commands merely mentioning
+    // that text. Report it as unscannable instead — the bare basename is far too
+    // common in ordinary commands to be a usable needle.
+    if (pattern.startsWith(NAME_RULE_PREFIX)) continue
     const literal = literalNeedlePrefix(pattern)
     if (literal === undefined || literal === '') continue
     const absolute = expandPath(literal, { home, workspace })

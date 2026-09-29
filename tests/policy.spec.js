@@ -973,3 +973,236 @@ test('18b. 200 规则 × 1000 路径：与逐条扫描一致，且总耗时 < 30
   // 宽松上限：容忍慢机器与 CI 抖动，只拦住「回到了每次重建 regex」的退化。
   assert.ok(elapsed < 300, `200 规则 × 1000 路径耗时 ${elapsed.toFixed(1)}ms，超过 300ms 上限`);
 });
+
+// ---------------------------------------------------------------------------
+// 19. 按文件名匹配的规则（name:）—— 基本语义
+// ---------------------------------------------------------------------------
+
+test('19. name: 规则按 basename 匹配任何位置，且跨命名空间', () => {
+  const compiled = compileWin([{ id: 'readme', path: 'name:readme.md', access: 'read' }]);
+  assert.equal(compiled.invalid.length, 0);
+  const rule = compiled.rules[0];
+  assert.equal(rule.kind, 'name');
+  assert.equal(rule.namePattern, 'readme.md');
+  assert.equal(rule.needsWorkspace, false);
+  assert.equal(rule.literal, 'readme.md');
+  assert.equal(rule.regex, null);
+  // 调用方看到的仍是用户写的原文（配置页/拒绝信息里要能对上）。
+  assert.equal(rule.pattern, 'name:readme.md');
+
+  // 任何位置：不同深度、不同命名空间。
+  assert.equal(match(compiled.rules, '/readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, '/home/u/docs/deep/readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, 'D:/a/b/readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, '\\\\srv\\share\\readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, '//srv/share/readme.md', {})?.ruleId, 'readme');
+  // 相对候选同样按 basename 命中（match 的入参可以是相对路径）。
+  assert.equal(match(compiled.rules, 'docs/readme.md', {})?.ruleId, 'readme');
+
+  // 只匹配**自身**的 basename：别的名字、以及「同名目录的后代」都不命中。
+  assert.equal(match(compiled.rules, '/docs/readme.md.bak', {}), undefined);
+  assert.equal(match(compiled.rules, '/docs/not-readme.md', {}), undefined);
+  assert.equal(match(compiled.rules, '/home/u/readme.md/sub/file.txt', {}), undefined);
+  // 命名空间根没有 basename。
+  assert.equal(match(compiled.rules, '/', {}), undefined);
+  assert.equal(match(compiled.rules, 'C:/', {}), undefined);
+});
+
+test('19b. name: 支持单分量 glob，且同样预编译', () => {
+  const compiled = compileWin([{ id: 'md', path: 'name:*.md', access: 'read' }]);
+  const rule = compiled.rules[0];
+  assert.equal(rule.kind, 'name');
+  assert.equal(rule.literal, null);
+  assert.ok(rule.regex instanceof RegExp);
+  assert.equal(rule.wildcards, 1);
+  assert.equal(rule.prefixLength, 0);
+  assert.equal(match(compiled.rules, '/a/notes.md', {})?.ruleId, 'md');
+  assert.equal(match(compiled.rules, '/a/notes.txt', {}), undefined);
+  // basename 里不会有分隔符，所以 `*` 自然不会跨段。
+  assert.equal(match(compiled.rules, '/a/b/notes.md/x.txt', {}), undefined);
+
+  const question = compileWin([{ id: 'q', path: 'name:README?', access: 'read' }]);
+  assert.equal(match(question.rules, '/x/README1', {})?.ruleId, 'q');
+  assert.equal(match(question.rules, '/x/README12', {}), undefined);
+});
+
+test('19c. 大小写：windows=true 时 readme.md / Readme.MD / README.md 等价；POSIX 语义下敏感', () => {
+  const win = compileWin([{ id: 'r', path: 'name:readme.md', access: 'read' }]);
+  for (const spelling of ['readme.md', 'Readme.MD', 'README.md', 'rEaDmE.mD']) {
+    assert.equal(match(win.rules, `/docs/${spelling}`, {})?.ruleId, 'r', spelling);
+  }
+  // 规则一侧同样折叠：写大写的名称规则在 windows 语义下与前一条是同一条（去重）。
+  const upper = compileWin([
+    { id: 'first', path: 'name:readme.md', access: 'read' },
+    { id: 'second', path: 'name:README.MD', access: 'read' },
+  ]);
+  assert.equal(upper.rules.length, 1);
+  assert.equal(upper.rules[0].id, 'second');
+
+  // POSIX 比较语义下保持大小写敏感：在大小写敏感的盘上它们是**不同文件**，
+  // 折叠等于放行另一个文件。这是「大小写智能匹配」的边界，不是遗漏。
+  const posix = compile({ rules: [{ id: 'r', path: 'name:readme.md', access: 'read' }], windows: false });
+  assert.equal(match(posix.rules, '/docs/readme.md', {})?.ruleId, 'r');
+  assert.equal(match(posix.rules, '/docs/README.md', {}), undefined);
+  assert.equal(match(posix.rules, '/docs/Readme.MD', {}), undefined);
+
+  // 路径规则既有的大小写语义没有被新通道改变。
+  const paths = compile({ rules: [{ id: 'p', path: '/docs/A', access: 'read' }], windows: false });
+  assert.equal(match(paths.rules, '/docs/A/x', {})?.ruleId, 'p');
+  assert.equal(match(paths.rules, '/docs/a/x', {}), undefined);
+});
+
+test('19d. 非法的 name: 模式进 invalid（不静默变成匹配不到任何东西的死规则）', () => {
+  const compiled = compileWin([
+    { id: 'empty', path: 'name:', access: 'read' },
+    { id: 'blank', path: 'name:   ', access: 'read' },
+    { id: 'sep', path: 'name:a/b', access: 'read' },
+    { id: 'backsep', path: 'name:a\\b', access: 'read' },
+    { id: 'dot', path: 'name:.', access: 'read' },
+    { id: 'dotdot', path: 'name:..', access: 'read' },
+    { id: 'ok', path: 'name:notes.txt', access: 'read' },
+  ]);
+  assert.deepEqual(compiled.rules.map((r) => r.id), ['ok']);
+  assert.deepEqual(compiled.invalid.map((i) => i.index), [0, 1, 2, 3, 4, 5]);
+  for (const bad of compiled.invalid) {
+    assert.ok(typeof bad.reason === 'string' && bad.reason.length > 0);
+  }
+  assert.match(compiled.invalid[0].reason, /empty file name/);
+  assert.match(compiled.invalid[2].reason, /single path component/);
+  assert.match(compiled.invalid[4].reason, /not a file name/);
+
+  // 前缀必须精确小写：`Name:` 是普通路径，不是名称规则（保留前缀不做大小写折叠）。
+  const upperPrefix = compileWin([{ id: 'u', path: 'Name:readme.md', access: 'read' }]);
+  assert.equal(upperPrefix.invalid.length, 0);
+  assert.equal(upperPrefix.rules[0].kind, 'path');
+  assert.equal(match(upperPrefix.rules, '/docs/readme.md', {}), undefined);
+});
+
+test('19e. 名称模式不做 ~ / ${workspace} 展开（它们是文件名字符）', () => {
+  const tilde = compileWin([{ id: 'tilde', path: 'name:~', access: 'read' }]);
+  assert.equal(tilde.invalid.length, 0);
+  assert.equal(match(tilde.rules, '/docs/~', {})?.ruleId, 'tilde');
+  assert.equal(match(tilde.rules, '/home/u', {}), undefined);
+
+  const token = compileWin([{ id: 'tok', path: 'name:${workspace}', access: 'read' }]);
+  assert.equal(token.invalid.length, 0);
+  assert.equal(token.rules[0].needsWorkspace, false);
+  assert.equal(match(token.rules, '/docs/${workspace}', {})?.ruleId, 'tok');
+  assert.equal(match(token.rules, '/docs/D:/proj', {}), undefined);
+  assert.equal(match(token.rules, '/docs/D:/proj', { workspace: 'D:/proj' }), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// 20. name: 规则与具体性排序的交互
+// ---------------------------------------------------------------------------
+
+test('20. 典型用例：父目录完全禁止 + name:readme.md 豁免为可读', () => {
+  const compiled = compileWin([
+    { id: 'secrets', path: 'D:/secrets', access: 'none' },
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+  ]);
+  // 目录整体被禁止，但其中的 readme.md（含更深层、各种大小写）可读。
+  assert.equal(match(compiled.rules, 'D:/secrets/readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, 'D:/secrets/README.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, 'D:/secrets/deep/nested/Readme.MD', {})?.ruleId, 'readme');
+  // 其它内容仍然被禁止。
+  assert.equal(match(compiled.rules, 'D:/secrets/id_rsa', {})?.ruleId, 'secrets');
+  assert.equal(match(compiled.rules, 'D:/secrets/deep/notes.txt', {})?.ruleId, 'secrets');
+  // 名称规则是全局的：被禁目录之外也生效。
+  assert.equal(match(compiled.rules, '/etc/readme.md', {})?.ruleId, 'readme');
+
+  // 最初 `.ssh` + `.ssh/README.md` 场景的通用化：一条名称规则取代逐路径豁免。
+  const ssh = compile({
+    rules: [
+      { id: 'ssh-dir', path: '~/.ssh', access: 'list' },
+      { id: 'ssh-readme', path: 'name:README.md', access: 'read' },
+    ],
+    home: HOME,
+    windows: true,
+  });
+  assert.equal(match(ssh.rules, `${HOME}/.ssh/README.md`, {})?.ruleId, 'ssh-readme');
+  assert.equal(match(ssh.rules, `${HOME}/.ssh/deep/README.md`, {})?.ruleId, 'ssh-readme');
+  assert.equal(match(ssh.rules, `${HOME}/.ssh/id_rsa`, {})?.ruleId, 'ssh-dir');
+});
+
+test('20b. 与候选同路径的规则仍然最具体（名称规则不会压过它）', () => {
+  const compiled = compileWin([
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+    { id: 'exact', path: 'D:/secrets/readme.md', access: 'none' },
+  ]);
+  assert.equal(match(compiled.rules, 'D:/secrets/readme.md', {})?.ruleId, 'exact');
+  assert.equal(match(compiled.rules, 'D:/secrets/other/readme.md', {})?.ruleId, 'readme');
+  // 顺序无关。
+  const reordered = compileWin([
+    { id: 'exact', path: 'D:/secrets/readme.md', access: 'none' },
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+  ]);
+  assert.equal(match(reordered.rules, 'D:/secrets/readme.md', {})?.ruleId, 'exact');
+  // 覆盖同路径的通配路径规则同样如此：第 1 键打平，靠第 2 键（字面量前缀更长）取胜。
+  const glob = compileWin([
+    { id: 'any-md', path: 'D:/secrets/*.md', access: 'none' },
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+  ]);
+  assert.equal(match(glob.rules, 'D:/secrets/readme.md', {})?.ruleId, 'any-md');
+  assert.equal(match(glob.rules, 'D:/secrets/sub/readme.md', {})?.ruleId, 'readme');
+});
+
+test('20c. 名称规则之间：字面量赢 glob，同键时下标大者胜', () => {
+  const compiled = compileWin([
+    { id: 'glob', path: 'name:*.md', access: 'list' },
+    { id: 'literal', path: 'name:readme.md', access: 'read' },
+  ]);
+  assert.equal(match(compiled.rules, '/x/readme.md', {})?.ruleId, 'literal');
+  assert.equal(match(compiled.rules, '/x/other.md', {})?.ruleId, 'glob');
+
+  // 同模式同档位 → 归一化去重保留最后一条（与路径规则一致）。
+  const dup = compileWin([
+    { id: 'first', path: 'name:readme.md', access: 'read' },
+    { id: 'second', path: 'name:readme.md', access: 'read' },
+  ]);
+  assert.equal(dup.rules.length, 1);
+  assert.equal(dup.rules[0].id, 'second');
+
+  // 同模式不同档位：第 4 键（下标降序）决定。
+  const accessTie = compileWin([
+    { id: 'read', path: 'name:notes.txt', access: 'read' },
+    { id: 'none', path: 'name:notes.txt', access: 'none' },
+  ]);
+  assert.equal(accessTie.rules.length, 2);
+  assert.equal(match(accessTie.rules, '/x/notes.txt', {})?.ruleId, 'none');
+
+  // 名称规则与路径规则不会互相污染去重（下标不同、类型不同）。
+  const mixed = compileWin([
+    { id: 'byName', path: 'name:readme.md', access: 'read' },
+    { id: 'byPath', path: 'D:/a/b', access: 'read' },
+  ]);
+  assert.equal(mixed.rules.length, 2);
+  assert.deepEqual(mixed.rules.map((r) => r.kind), ['name', 'path']);
+});
+
+test('20d. 命中深度定义：名称规则胜过任意深度的祖先规则，输给同路径规则', () => {
+  // 祖先路径规则再深也只是一个祖先，名称规则约束的是候选自身 → 名称规则胜。
+  const compiled = compileWin([
+    { id: 'deep-deny', path: 'D:/a/b/c/d/e/f', access: 'none' },
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+  ]);
+  assert.equal(match(compiled.rules, 'D:/a/b/c/d/e/f/g/readme.md', {})?.ruleId, 'readme');
+  // 同一目录下的其它文件仍由深规则兜住。
+  assert.equal(match(compiled.rules, 'D:/a/b/c/d/e/f/g/other.txt', {})?.ruleId, 'deep-deny');
+});
+
+test('20e. 名称规则不改变不可判定候选的 fail-safe', () => {
+  const compiled = compileWin([
+    { id: 'readme', path: 'name:readme.md', access: 'read' },
+    { id: 'any', path: 'name:*', access: 'write' },
+  ]);
+  // 不可判定判定发生在任何规则求值之前：再宽的名称规则也不能让它变成可命中。
+  assert.deepEqual(match(compiled.rules, 'C:foo', {}), {
+    access: 'none',
+    ruleId: '<undecidable>',
+    pattern: 'C:foo',
+  });
+  // 正常拼写仍然照常命中（`name:*` 是最宽的规则）。
+  assert.equal(match(compiled.rules, 'D:/x/readme.md', {})?.ruleId, 'readme');
+  assert.equal(match(compiled.rules, 'D:/x/anything.txt', {})?.ruleId, 'any');
+});

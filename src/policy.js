@@ -113,6 +113,62 @@
  * （按 `windows` 标志做至多两个变体），规则循环里没有字符串归一化、没有
  * `RegExp` 构造。判定结果与旧的「每条规则 × 每个祖先重建 regex」实现逐项一致
  * （见 `tests/policy.spec.js` 的 200 规则 × 1000 路径对照测试）。
+ *
+ * ## 3. 按文件名匹配的规则（`name:`）
+ *
+ * 路径规则表达「某个位置及其后代」，`name:` 规则表达「**任何位置**下叫这个名字的
+ * 资源」。语法是规则 `path` 以 `name:` 开头，其余部分是**单个路径分量**的模式：
+ *
+ * ```yaml
+ * rules:
+ *   - path: D:/secrets        # 目录整体禁止
+ *     access: none
+ *   - path: name:readme.md    # 但任何位置下的 readme.md 可读（含上面那个目录里）
+ *     access: read
+ * ```
+ *
+ * 语义边界（每条都有测试）：
+ * - **只匹配候选资源自身，不匹配它的祖先**：`name:readme.md` 不会因为某个*目录*
+ *   叫 `readme.md` 就把整棵子树放行。本层是纯词法的、分不出文件与目录，所以更
+ *   不能靠名字去猜子树。
+ * - **跨命名空间生效**：POSIX、盘符、UNC、设备路径下同名的资源都命中——这正是
+ *   「任何位置」的含义。
+ * - **模式是单分量 glob**：`name:*.md`、`name:README?` 可用；出现 `/`、`\`
+ *   则判为非法（那是路径规则的事）；`.` / `..` / 全空白也非法。
+ * - **模式内不做展开**：`~` 与 `${workspace}` 在名称模式里是普通文件名字符。
+ * - **大小写**：与路径规则共用同一套比较期折叠（`foldCase`）。`windows: true`
+ *   （Windows 宿主）时 `readme.md` / `Readme.MD` / `README.md` 等价；POSIX 宿主
+ *   上保持大小写敏感——在大小写敏感的盘上它们是**不同文件**，折叠等于放行另一个
+ *   文件。这是「大小写智能匹配」的边界，不是遗漏（见测试 19c）。
+ *
+ * ### `name:` 规则在具体性排序里怎么参与
+ *
+ * `match()` 的四个裁决键对两类规则是统一的，只是取值来源不同：
+ *
+ * | 键 | 路径规则 | `name:` 规则 |
+ * |----|----------|--------------|
+ * | 1 命中深度（越长越具体） | 命中的那个祖先的长度 | **候选路径自身的长度** |
+ * | 2 字面量前缀长度（越长越具体） | 路径模式第一个通配符之前 | 名称模式第一个通配符之前 |
+ * | 3 通配符数量（越少越具体） | 路径模式 | 名称模式 |
+ * | 4 规则下标（越大越优先） | 同左 | 同左 |
+ *
+ * 第 1 键是关键：名称规则约束的是「就是这个资源」，而不是「某个祖先之下」，所以
+ * 命中深度记为候选自身。由此得到三条可预期的性质（测试 20/20b/20c）：
+ *
+ * 1. **名称规则胜过任何只命中祖先的路径规则**——父目录整体 `none` 也能被逐名豁免，
+ *    这就是用户要的主用例。
+ * 2. **与候选完全同路径的规则仍然最具体**：`D:/secrets/readme.md → none` 与
+ *    `name:readme.md → read` 在第 1 键打平，前者靠第 2 键（字面量前缀是整个路径，
+ *    必然长于 basename）胜出。
+ * 3. **名称模式内部的 specificity 照常生效**：`name:readme.md`（前缀 9、通配符 0）
+ *    胜过 `name:*.md`（前缀 0、通配符 1），靠的是第 2/3 键。
+ *
+ * 名称规则是**全局**的：它在所有目录生效，包括被更严规则覆盖的目录。若不希望某个
+ * 目录被豁免，用一条与该候选同路径的规则压过它（性质 2）。
+ *
+ * > 给配置页/文档的措辞：**「按文件名豁免（任何位置）：填写 `name:文件名`，
+ * > 例如 `name:readme.md`；支持 `*`、`?` 通配符，不要写路径。大小写按当前平台的
+ * > 比较语义处理（Windows 下不区分）。」**
  */
 
 /**
@@ -126,6 +182,17 @@ const WILDCARDS = '*?';
 
 /** 只能在 match 期展开的 workspace 占位符。 */
 const WORKSPACE_TOKEN = '${workspace}';
+
+/**
+ * 文件名规则的显式前缀：`name:readme.md` = 「任何位置下名为 readme.md 的资源」。
+ * 只有出现在模式**开头**时才是名称规则；它是保留前缀，因此不存在「文件名恰好
+ * 叫 `name:...`」的路径规则写法（那种写法过去只会匹配到一个字面量文件名，
+ * 实际配置里不可能出现）。
+ */
+const NAME_PREFIX = 'name:';
+
+/** CompiledRule.kind 的取值。 */
+const RULE_KIND = Object.freeze({ PATH: 'path', NAME: 'name' });
 
 /**
  * 不可判定路径的 fail-safe 决定所用的伪规则 id。
@@ -439,6 +506,17 @@ function ancestorChain(key) {
 }
 
 /**
+ * 身份键的最后一个分量（basename）：`name:` 规则就是拿它做匹配的。
+ * 命名空间根（`/`、`C:/`）没有 basename，返回 `''`。
+ * @param {string} key 已归一化的身份键
+ * @returns {string}
+ */
+function basenameOf(key) {
+  const cut = key.lastIndexOf('/');
+  return cut < 0 ? key : key.slice(cut + 1);
+}
+
+/**
  * `path` 是否等于 `root` 或位于 `root` 之下（分量边界处比较，不接受前缀字符串匹配）。
  * @param {string} path
  * @param {string} root
@@ -696,13 +774,41 @@ export function expandPath(template, ctx) {
 // ---------------------------------------------------------------------------
 
 /**
+ * 校验名称模式（`name:` 之后的部分），返回拒绝原因或 undefined。
+ *
+ * 名称模式必须是一个**路径分量**的模式：不允许分隔符（那是路径规则），也不允许
+ * `.` / `..`（它们不是文件名）。空白不做 trim：文件名可以以空格结尾（POSIX），
+ * 只拒绝「全是空白」。
+ * @param {string} namePattern
+ * @returns {string | undefined}
+ */
+function nameRuleProblem(namePattern) {
+  if (namePattern.trim() === '') {
+    return 'name rule has an empty file name: write name:<file name>';
+  }
+  if (/[\\/]/u.test(namePattern)) {
+    return `name rule "${namePattern}" must be a single path component (no separators);`
+      + ' use a path pattern for anything with directories';
+  }
+  if (namePattern === '.' || namePattern === '..') {
+    return `name rule "${namePattern}" is not a file name`;
+  }
+  return undefined;
+}
+
+/**
  * 编译规则表。非法规则不抛出，收集进 `invalid` 并跳过：
  * 空/空白 path、access 不在 ACCESS_LEVELS 内、展开后无法构成可用模式、
- * 以及**不可判定**的路径（驱动器相对 `C:foo`、缺 share 的 UNC）——
- * 后者宁可报错也不猜一个可能指向别处的身份。
+ * **不可判定**的路径（驱动器相对 `C:foo`、缺 share 的 UNC）、以及非法的
+ * `name:` 名称模式（空名、含分隔符、`.`/`..`）——
+ * 前者宁可报错也不猜一个可能指向别处的身份，后者宁可报错也不静默变成一条
+ * 匹配不到任何东西的死规则。
  *
- * 归一化去重：展开后模式 + access + workspace 后缀完全相同的规则只保留最后一条
- * （不影响语义，只是省内存）。
+ * `path` 以 `name:` 开头的是**文件名规则**（任何位置下叫这个名字的资源，
+ * 见模块头 §3）；其余是路径规则。
+ *
+ * 归一化去重：规则类型 + 展开后模式 + access + workspace 后缀完全相同的规则只
+ * 保留最后一条（不影响语义，只是省内存）。
  *
  * 每条产出的规则都带**预编译**匹配物（`literal` 或 `regex`），match 期不再构造 regex。
  *
@@ -726,6 +832,22 @@ export function compile(input) {
   /** @type {Map<string, number>} */
   const dedupe = new Map();
 
+  /**
+   * 写入编译结果：同一个去重键只保留最后一条（last-wins，与具体性排序的第 4 键一致）。
+   * @param {CompiledRule} rule 已编译规则
+   * @param {string} key 去重键（含规则类型）
+   * @returns {void}
+   */
+  const emit = (rule, key) => {
+    const previous = dedupe.get(key);
+    if (previous === undefined) {
+      dedupe.set(key, compiledRules.length);
+      compiledRules.push(rule);
+    } else {
+      compiledRules[previous] = rule; // 保留最后一条
+    }
+  };
+
   for (let index = 0; index < rawRules.length; index += 1) {
     const raw = rawRules[index];
     if (raw == null || typeof raw !== 'object') {
@@ -740,6 +862,43 @@ export function compile(input) {
     const access = typeof raw.access === 'string' ? raw.access : '';
     if (!ACCESS_LEVELS.includes(access)) {
       invalid.push({ index, path: rawPath, reason: `unknown access level: ${access}` });
+      continue;
+    }
+
+    const ruleId = typeof raw.id === 'string' && raw.id !== '' ? raw.id : `#${index}`;
+    const note = typeof raw.note === 'string' ? raw.note : undefined;
+
+    if (rawPath.startsWith(NAME_PREFIX)) {
+      // ---- 文件名规则：任何位置下叫这个名字的资源（模块头 §3）----
+      const problem = nameRuleProblem(rawPath.slice(NAME_PREFIX.length));
+      if (problem !== undefined) {
+        invalid.push({ index, path: rawPath, reason: problem });
+        continue;
+      }
+      // 名称模式与路径模式用同一套指标（字面量前缀长度 + 通配符数），这样它就能
+      // 直接参与既有排序键的第 2/3 位；第 1 位（命中深度）在 match 期取候选长度。
+      const namePattern = foldCase(rawPath.slice(NAME_PREFIX.length), windows);
+      const nameMetrics = patternMetrics(namePattern, false);
+      /** @type {CompiledRule} */
+      const nameRule = {
+        index,
+        id: ruleId,
+        pattern: rawPath,
+        access,
+        note,
+        kind: RULE_KIND.NAME,
+        namePattern,
+        // 对名称规则，`normalized` 就是折叠后的名称模式：去重键、日志与
+        // compareHits 的兜底比较都用它。
+        normalized: namePattern,
+        prefixLength: nameMetrics.prefixLength,
+        wildcards: nameMetrics.wildcards,
+        needsWorkspace: false,
+        windows,
+        literal: nameMetrics.wildcards === 0 ? namePattern : null,
+        regex: nameMetrics.wildcards > 0 ? globToRegExp(namePattern) : null,
+      };
+      emit(nameRule, `${RULE_KIND.NAME}\u0000${namePattern}\u0000${access}`);
       continue;
     }
 
@@ -790,10 +949,12 @@ export function compile(input) {
     /** @type {CompiledRule} */
     const rule = {
       index,
-      id: typeof raw.id === 'string' && raw.id !== '' ? raw.id : `#${index}`,
+      id: ruleId,
       pattern: rawPath,
       access,
-      note: typeof raw.note === 'string' ? raw.note : undefined,
+      note,
+      kind: RULE_KIND.PATH,
+      namePattern: null,
       normalized,
       prefixLength: metrics.prefixLength,
       wildcards: metrics.wildcards,
@@ -806,15 +967,12 @@ export function compile(input) {
     };
 
     // 去重键必须带 needsWorkspace：`~/.ssh` 与 `${workspace}/.ssh` 在缺 home 时
-    // 归一化结果可能相同，但可用性完全不同，绝不能合并。
-    const key = `${rule.normalized}\u0000${access}\u0000${needsWorkspace ? 'w' : 's'}`;
-    const previous = dedupe.get(key);
-    if (previous === undefined) {
-      dedupe.set(key, compiledRules.length);
-      compiledRules.push(rule);
-    } else {
-      compiledRules[previous] = rule; // 保留最后一条
-    }
+    // 归一化结果可能相同，但可用性完全不同，绝不能合并。规则类型同样要带：
+    // 名称规则 `name:x` 与路径规则不可能共享模式，但带上更不容易出错。
+    emit(
+      rule,
+      `${RULE_KIND.PATH}\u0000${rule.normalized}\u0000${access}\u0000${needsWorkspace ? 'w' : 's'}`,
+    );
   }
 
   return { rules: compiledRules, isEmpty: compiledRules.length === 0, invalid };
@@ -928,12 +1086,18 @@ function candidateIdentity(value) {
  *    `pattern` 为调用方给的那个原始拼写（没有任何用户规则参与，所以三者都不会
  *    指向某条真实规则）——这类拼写在 Windows 上指向哪个对象取决于盘符当前目录，
  *    词法层无法知道，放行就等于把判定权交给一个猜测；
- * 2. 生成祖先链 P, dirname(P), … 直到命名空间根（每次调用只算一次；
+ * 2. 生成候选的身份键、祖先链与 basename（每次调用只算一次；
  *    按 `windows` 标志至多两个变体）；
- * 3. 对每条规则：`literal` 规则直接做一次分量边界的 `startsWith`；
- *    其余用 compile 期（或按 workspace 缓存的）regex 在祖先链上由深到浅测试；
+ * 3. 对每条规则：
+ *    - `name:` 规则：只把 basename 与名称模式比较（字面量相等或名称 regex），
+ *      命中深度记为候选自身；
+ *    - 路径 `literal` 规则：对候选键做一次分量边界的 `startsWith`（命中的祖先只
+ *      可能是字面量自身，无需遍历祖先链、无需 regex）；
+ *    - 路径通配符规则：用 compile 期（或按 workspace 缓存的）regex 在祖先链上
+ *      由深到浅测试；
  * 4. 在命中规则中选最具体的一条，排序键依次为
- *    命中祖先长度降序 → 字面量前缀长度降序 → 通配符数量升序 → 下标降序（last-wins）。
+ *    命中深度降序（路径规则=命中的祖先长度，`name:` 规则=候选长度）→
+ *    字面量前缀长度降序 → 通配符数量升序 → 下标降序（last-wins）。
  *
  * 无规则命中时返回 `undefined`，由调用方套用 defaultAccess。
  *
@@ -962,15 +1126,15 @@ export function match(compiled, absolutePath, opts) {
     opts && typeof opts.workspace === 'string' && opts.workspace !== '' ? opts.workspace : undefined;
   const workspaceRegexes = workspace === undefined ? undefined : workspaceStore(compiled, workspace);
 
-  /** @type {Map<boolean, {key: string, ancestors: string[]}>} */
+  /** @type {Map<boolean, {key: string, ancestors: string[], base: string}>} */
   const variants = new Map();
   let lastFlag;
-  /** @type {{key: string, ancestors: string[]} | undefined} */
+  /** @type {{key: string, ancestors: string[], base: string} | undefined} */
   let lastVariant;
   /**
-   * 取某个大小写折叠标志下的候选键与祖先链（每次 match 只算一次）。
+   * 取某个大小写折叠标志下的候选键、祖先链与 basename（每次 match 只算一次）。
    * @param {boolean} windows
-   * @returns {{key: string, ancestors: string[]}}
+   * @returns {{key: string, ancestors: string[], base: string}}
    */
   const variantOf = (windows) => {
     if (lastVariant !== undefined && lastFlag === windows) {
@@ -979,7 +1143,7 @@ export function match(compiled, absolutePath, opts) {
     let variant = variants.get(windows);
     if (variant === undefined) {
       const key = foldCase(candidate.key, windows);
-      variant = { key, ancestors: ancestorChain(key) };
+      variant = { key, ancestors: ancestorChain(key), base: basenameOf(key) };
       variants.set(windows, variant);
     }
     lastFlag = windows;
@@ -998,7 +1162,27 @@ export function match(compiled, absolutePath, opts) {
     const windows = rule.windows === true;
     let ancestorLength = -1;
 
-    if (rule.needsWorkspace === true) {
+    if (rule.kind === RULE_KIND.NAME) {
+      // 文件名规则：只测候选自身的 basename，不看祖先（见模块头 §3）。
+      // 命中深度记为**候选自身**：它约束的是「就是这个资源」，胜过任何只命中
+      // 祖先的路径规则；与候选完全同路径的路径规则则靠第 2 键取胜。
+      const variant = variantOf(windows);
+      if (variant.base !== '') {
+        if (typeof rule.literal === 'string') {
+          if (variant.base === rule.literal) {
+            ancestorLength = variant.key.length;
+          }
+        } else {
+          const regex =
+            rule.regex instanceof RegExp
+              ? rule.regex
+              : globToRegExp(String(rule.namePattern ?? rule.normalized));
+          if (regex.test(variant.base)) {
+            ancestorLength = variant.key.length;
+          }
+        }
+      }
+    } else if (rule.needsWorkspace === true) {
       // workspace 缺省 → 该条规则不生效（绝不当成空字符串去匹配）。
       const regex = workspaceRegexes === undefined ? null : workspaceRegexes[i];
       if (regex == null) {
@@ -1125,14 +1309,19 @@ export function contains(root, candidate, windows) {
  * @typedef {object} CompiledRule
  * @property {number} index 规则在原始数组中的下标
  * @property {string} id 规则 id（缺省为 `#<index>`）
- * @property {string} pattern 原始路径模板（用于回报给调用方）
+ * @property {string} pattern 原始路径模板（用于回报给调用方，`name:` 前缀保留）
  * @property {string} access 访问档位
  * @property {string | undefined} note 备注
- * @property {string} normalized compile 期归一化后的模式，可能仍含 `${workspace}`
+ * @property {'path' | 'name'} kind 路径规则还是文件名规则
+ * @property {string | null} namePattern 文件名规则的名称模式（已按 `windows` 折叠）；
+ *   路径规则为 null
+ * @property {string} normalized 归一化后的模式：路径规则是身份键（可能仍含
+ *   `${workspace}`），文件名规则是折叠后的名称模式
  * @property {number} prefixLength 字面量前缀长度（第一个通配符之前）
  * @property {number} wildcards 通配符数量
- * @property {boolean} needsWorkspace 是否必须在 match 期用 workspace 展开
+ * @property {boolean} needsWorkspace 是否必须在 match 期用 workspace 展开（名称规则恒为 false）
  * @property {boolean} windows 该规则是否按 Windows 大小写不敏感语义比较
- * @property {string | null} literal 预编译的字面量模式（无通配符且不需要 workspace 时非空）
+ * @property {string | null} literal 预编译的字面量模式（无通配符时非空：路径规则是路径键，
+ *   名称规则是文件名）
  * @property {RegExp | null} regex 预编译的匹配正则（有通配符且不需要 workspace 时非空）
  */

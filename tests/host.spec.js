@@ -460,6 +460,20 @@ test('tool-fields helpers behave', () => {
   assert.equal(commandOf({}), undefined)
 })
 
+test('name: rules are reported as uncovered instead of producing a bogus needle', () => {
+  // Regression found by the path-model teammate: `literalNeedlePrefix` treats the
+  // whole `name:readme.md` string as a literal, so a deny-direction name rule was
+  // neither enforced on the shell channel nor reported — and expanding it as a
+  // path made Windows ADS folding emit the over-broad needle `D:/proj/name`.
+  assert.deepEqual(unscannablePatterns([{ path: 'name:id_rsa' }]), ['name:id_rsa'])
+  assert.deepEqual(unscannablePatterns([{ path: 'name:*.md' }]), ['name:*.md'])
+  const needles = buildNeedles(
+    [{ path: 'name:id_rsa', access: 'none' }, { path: 'name:*.md', access: 'none' }],
+    { home: HOME, workspace: join(tmpdir(), 'pg-proj'), windows: true },
+  )
+  assert.deepEqual(needles, [], 'a basename is too common to serve as a substring needle')
+})
+
 test('a trailing-glob rule still produces a usable shell needle', () => {
   // Regression: expanding the pattern as written put a literal `**` in the
   // needle, which no command ever contains — so `~/.ssh/**` was silently
