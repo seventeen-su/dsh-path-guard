@@ -33,25 +33,47 @@ interface NotifyItem {
   title: string
   message: string
   urgency: string
+  /** Declared peer protocol version. The peer ignores unknown fields, so this is free. */
+  v?: string
   sessionId?: unknown
   /** Click target. `sessionId` gates; THIS is what makes a toast clickable. */
   click?: { type: 'session'; sessionId: unknown }
+}
+
+/** The structured outcome the peer's `notify()` returns (protocol v1.0.0). */
+interface NotifyOutcome {
+  ok: boolean
+  queued: boolean
+  silenced: boolean
+  reason: string
+  apiVersion: string
+  unsupportedVersion: boolean
 }
 
 /** The slice of `desktopNotify` this test fakes. */
 interface NotifyService {
   push: (item: NotifyItem) => boolean
   pushAlways: (item: NotifyItem) => boolean
+  /** Optional: peers from 1.7.0 on expose it, older ones do not. */
+  notify?: (item: NotifyItem) => NotifyOutcome
+  apiVersion?: string
+  capabilities?: readonly string[]
 }
 
 /**
  * A recording fake of the `desktopNotify` service: both methods return `true`
  * (as the real one does when the notification is genuinely enqueued).
- * @param overrides - replaces `push` / `pushAlways`
+ *
+ * `notify` is installed only when a test asks for it (`{ structured: true }`), so
+ * every pre-existing test keeps exercising the pre-1.7.0 fallback path — its mere
+ * presence changes which method the notifier prefers.
+ * @param overrides - replaces `push` / `pushAlways` / `notify`
+ * @param options - `structured: true` exposes the recording `notify`
  */
-function fakeService(overrides: Partial<NotifyService> = {}) {
-  const calls: { push: NotifyItem[]; pushAlways: NotifyItem[] } = { push: [], pushAlways: [] }
-  const service = {
+function fakeService(overrides: Partial<NotifyService> = {}, options: { structured?: boolean } = {}) {
+  const calls: { push: NotifyItem[]; pushAlways: NotifyItem[]; notify: NotifyItem[] } =
+    { push: [], pushAlways: [], notify: [] }
+  const service: Record<string, unknown> = {
     push(item: NotifyItem) {
       calls.push.push(item)
       return true
@@ -60,9 +82,14 @@ function fakeService(overrides: Partial<NotifyService> = {}) {
       calls.pushAlways.push(item)
       return true
     },
+    notify(item: NotifyItem): NotifyOutcome {
+      calls.notify.push(item)
+      return { ok: true, queued: true, silenced: false, reason: '', apiVersion: '1.0.0', unsupportedVersion: false }
+    },
     ...overrides,
   }
-  return { calls, service, pushed: () => calls.push.length + calls.pushAlways.length }
+  if (options.structured !== true && overrides.notify === undefined) delete service.notify
+  return { calls, service: service as unknown as NotifyService, pushed: () => calls.push.length + calls.pushAlways.length + calls.notify.length }
 }
 
 /** Dependency-injection options the harness lets a test override. */
@@ -71,7 +98,11 @@ interface SetupOptions {
   maxTracked?: number | undefined
   startAt?: number | undefined
   resolve?: (() => NotifyService | null | undefined) | undefined
-  logger?: { warn?: (...args: unknown[]) => unknown; error?: (...args: unknown[]) => unknown } | null | undefined
+  logger?: {
+    warn?: (...args: unknown[]) => unknown
+    error?: (...args: unknown[]) => unknown
+    info?: (...args: unknown[]) => unknown
+  } | null | undefined
 }
 
 /**
@@ -82,6 +113,7 @@ interface SetupOptions {
 function setup(options: SetupOptions = {}) {
   const warns: string[] = []
   const errors: string[] = []
+  const infos: string[] = []
   let clock = options.startAt ?? 1000000
   const slot: { service: NotifyService | null | undefined } = { service: undefined }
   const notifier = createNotifier({
@@ -93,6 +125,9 @@ function setup(options: SetupOptions = {}) {
       error: (message: unknown) => {
         errors.push(String(message))
       },
+      info: (message: unknown) => {
+        infos.push(String(message))
+      },
     },
     now: () => clock,
     throttleMs: options.throttleMs,
@@ -102,6 +137,7 @@ function setup(options: SetupOptions = {}) {
     notifier,
     warns,
     errors,
+    infos,
     slot,
     /** Advance the injected clock by `ms`. */
     advance: (ms: number) => {
@@ -124,8 +160,13 @@ const PATH_DENIAL = {
 /** Payload keys a denial may carry; anything else would be surface we do not own. */
 // `click` is part of the allowed surface: the peer requires it to be EXPLICIT
 // (dsh-desktop-notify 1.6.0+), and a payload without one produces a toast that
-// cannot be clicked at all.
-const ALLOWED_PAYLOAD_KEYS = ['click', 'message', 'sessionId', 'title', 'urgency']
+// cannot be clicked at all. `v` declares the protocol version we were written
+// against — free, because the peer ignores unknown fields and never rejects a
+// payload for carrying it.
+const ALLOWED_PAYLOAD_KEYS = ['click', 'message', 'sessionId', 'title', 'urgency', 'v']
+
+/** The protocol version this plugin declares on every payload. */
+const DECLARED_API_VERSION = '1.0.0'
 
 // ---------------------------------------------------------------------------
 // 1. The optional service is absent
@@ -192,6 +233,9 @@ describe('2. normal path', () => {
     assert.match(payload.message, /deny/, 'carries the tier')
     assert.equal(payload.urgency, 'normal')
     assert.equal(payload.sessionId, 'session-1')
+    // Declares the protocol version we were written against. The peer ignores
+    // unknown fields, so this can never cost a delivery.
+    assert.equal(payload.v, DECLARED_API_VERSION)
     // `sessionId` only drives the peer's focus gate. Clicking is a SEPARATE field,
     // and omitting it makes the toast unclickable — the user gets a popup about a
     // refused call and no way to reach it.
@@ -281,7 +325,7 @@ describe('4. sessionId', () => {
       // an unrecognized shape (which it treats as "not clickable" anyway — this
       // just keeps the payload honest).
       assert.ok(!('click' in payload), 'an unattributed notification must not carry a click target')
-      assert.deepEqual(Object.keys(payload).sort(), ['message', 'title', 'urgency'])
+      assert.deepEqual(Object.keys(payload).sort(), ['message', 'title', 'urgency', 'v'])
     }
   })
 
@@ -689,5 +733,102 @@ describe('10. malfunction', () => {
     assert.equal(h.notifier.malfunction('tools/pre-execute'), false)
     assert.deepEqual(h.warns, [])
     assert.equal(h.notifier.tracked(), 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 10. peer protocol (desktopNotify baseline v1.0.0)
+// ---------------------------------------------------------------------------
+
+describe('10. peer protocol', () => {
+  it('prefers the structured notify() over push() when the peer exposes it', () => {
+    const h = setup()
+    const fake = fakeService({}, { structured: true })
+    h.slot.service = fake.service
+    assert.equal(h.notifier.denial(PATH_DENIAL), true)
+    assert.equal(fake.calls.notify.length, 1, 'the gated path uses the structured method')
+    assert.equal(fake.calls.push.length, 0)
+    // The item is identical either way: only the RESULT is richer.
+    assert.equal(fake.calls.notify[0]!.v, DECLARED_API_VERSION)
+  })
+
+  it('reports a peer-silenced notification as not queued instead of as a failure', () => {
+    // The whole reason `notify()` exists. Without the structured result, "the user
+    // was already looking at that session" and "this platform has no notification
+    // backend" are indistinguishable — both are just `false`.
+    const h = setup()
+    const fake = fakeService({
+      notify: (item) => {
+        fake.calls.notify.push(item)
+        return { ok: true, queued: false, silenced: true, reason: 'silenced', apiVersion: '1.0.0', unsupportedVersion: false }
+      },
+    })
+    h.slot.service = fake.service
+    assert.equal(h.notifier.denial(PATH_DENIAL), false, 'silenced is not queued')
+    assert.deepEqual(h.warns, [], 'a deliberate silence is not a warning')
+  })
+
+  it('warns when the peer rejects the payload outright', () => {
+    const h = setup()
+    const fake = fakeService({
+      notify: (item) => {
+        fake.calls.notify.push(item)
+        return { ok: false, queued: false, silenced: false, reason: 'invalid-payload', apiVersion: '1.0.0', unsupportedVersion: false }
+      },
+    })
+    h.slot.service = fake.service
+    h.notifier.denial({ ...PATH_DENIAL, toolName: '' })
+    assert.ok(
+      h.warns.some(line => line.includes('invalid-payload')),
+      'a rejected payload must be visible; it means OUR item is malformed',
+    )
+  })
+
+  it('keeps using pushAlways for the ungated path, even when notify() exists', () => {
+    // `notify()` is the gated path and has no ungated twin, so `always` must not
+    // silently lose its "bypass the gate" meaning.
+    const h = setup()
+    const fake = fakeService({}, { structured: true })
+    h.slot.service = fake.service
+    assert.equal(h.notifier.denial({ ...PATH_DENIAL, always: true }), true)
+    assert.equal(fake.calls.pushAlways.length, 1)
+    assert.equal(fake.calls.notify.length, 0)
+  })
+
+  it('probes the peer capabilities once, not per push', () => {
+    // The peer publishes `apiVersion` and `capabilities` precisely so a caller
+    // does not infer a version from behaviour; saying so once is enough.
+    const h = setup()
+    const fake = fakeService({
+      apiVersion: '1.0.0',
+      capabilities: ['push', 'notify', 'click.session', 'click.page'],
+    })
+    h.slot.service = fake.service
+    h.notifier.denial(PATH_DENIAL)
+    h.notifier.denial({ ...PATH_DENIAL, toolName: 'write', target: 'D:/other' })
+    const probes = h.infos.filter(line => line.includes('desktopNotify apiVersion'))
+    assert.equal(probes.length, 1, 'the probe is logged once per notifier')
+    assert.match(probes[0]!, /apiVersion=1\.0\.0/)
+    assert.match(probes[0]!, /click\.session/)
+  })
+
+  it('survives a peer that reports no capabilities at all', () => {
+    // Older peers (pre-1.7.0) expose push/pushAlways and nothing else. They must
+    // still receive notifications, and the probe must not crash on the absence.
+    const h = setup()
+    const fake = fakeService()
+    h.slot.service = fake.service
+    assert.equal(h.notifier.denial(PATH_DENIAL), true)
+    assert.match(h.infos.join('\n'), /\(not reported\)|\(none reported\)/)
+    assert.deepEqual(h.warns, [])
+  })
+
+  it('keeps falling back to push() when the peer has no notify()', () => {
+    const h = setup()
+    const fake = fakeService()
+    h.slot.service = fake.service
+    assert.equal(h.notifier.denial(PATH_DENIAL), true)
+    assert.equal(fake.calls.push.length, 1)
+    assert.equal(fake.calls.notify.length, 0)
   })
 })

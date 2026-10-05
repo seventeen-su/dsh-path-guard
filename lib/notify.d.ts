@@ -69,6 +69,18 @@
  * with an injected clock and a fake service.
  */
 /**
+ * The peer protocol version this plugin speaks, declared on every payload as `v`.
+ *
+ * The peer's contract is explicit about forward compatibility: unknown payload
+ * fields are ignored rather than rejected, and a payload declaring a HIGHER major
+ * version is still pushed (the result comes back with `unsupportedVersion: true`).
+ * Declaring the version is therefore free insurance — it never costs a delivery,
+ * and it lets a future peer see which contract we were written against.
+ */
+declare const NOTIFY_API_VERSION = "1.0.0";
+/** Exported so the other push site declares the same version this module does. */
+export { NOTIFY_API_VERSION };
+/**
  * Create the interception-event notifier. Never throws, never depends on Cordis.
  *
  * @param {{
@@ -99,6 +111,7 @@ export declare function createNotifier(deps?: {
     resolveService?: unknown;
     logger?: {
         warn?: (...args: unknown[]) => unknown;
+        info?: (...args: unknown[]) => unknown;
     } | null;
     now?: (() => number) | undefined;
     throttleMs?: number | undefined;
