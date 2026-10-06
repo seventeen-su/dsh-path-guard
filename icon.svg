@@ -1,6 +1,121 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Path Guard">
-  <path d="M32 5 55 13v19c0 14.2-9.3 24.6-23 27C18.3 56.6 9 46.2 9 32V13L32 5Z"
-        fill="none" stroke="#247bbf" stroke-width="4" stroke-linejoin="round"/>
-  <path d="M21 31h22v16H21z" fill="none" stroke="#247bbf" stroke-width="4" stroke-linejoin="round"/>
-  <path d="M26 31v-5a6 6 0 0 1 12 0v5" fill="none" stroke="#247bbf" stroke-width="4" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Path Guard">
+  <!-- A blue folder whose own tab is the ACTIVE tab, two DEEPER inactive tabs
+       behind it, and a warning triangle on the body.
+
+       THE TAB EDGE is steep: it drops 3.5 units over 3.0 across, about 49° from
+       horizontal, where earlier revisions used 25°. A shallow edge made the tabs
+       look like sheets sliding out sideways; a steep one reads as tabs.
+
+       WHY THERE IS NO SEAM: each inactive tab's edges are the very lines the tab
+       in front ends on, and every tab is pushed 0.6 units under its neighbour as
+       well. Two fills that merely touch still show a hairline, because each
+       edge is antialiased against the background independently; overlapping
+       removes it, and since the front shape is painted later the overlap is
+       invisible. The first tab is tucked under the folder for the same reason.
+
+       INACTIVE MEANS DEEPER, not lighter: the two back tabs run #3A54E4 to
+       #2740C9 and #2C46D2 to #1B2FB0, i.e. the same blue family driven down in
+       value, while the active tab keeps the folder's own #5B74F2 to #3B55E8.
+
+       WHY A TRIANGLE: the folder is asymmetric (its tab sits top left), and a
+       shield is itself top-heavy, so a shield never looked centred on it. A
+       triangle is symmetric about its vertical axis.
+
+       HOW THE MARK IS CENTRED: low of the triangle's bounding box, on purpose.
+       Area centroids put it lowest (5.2 units above the bar, 0.85 below the
+       dot); centring its bounding box put it highest (3.50 and 3.45). The eye
+       wants something between, because the triangle narrows upward: it sits at
+       4.60 above the bar and 2.35 below the dot.
+
+       GRADIENTS run diagonally from the upper left to the lower right, the way
+       DSH's own plugin artwork grades its blues and greens
+       (ui-primitives/src/plugin-artwork.tsx: #69B9FF to #324DE2, #45E7A4 to
+       #05909D, both on diagonal vectors).
+
+       WHY AN EXPLICIT COLOUR (never `currentColor`): the host inlines this file
+       as a `data:image/svg+xml;base64,…` URI (boot/app-boot/src/package-meta.ts:38-40)
+       and renders it through `<img src=…>` (ui-plugin-manager/src/client/PluginManagerPage.tsx:148).
+       Per svg-authoring §9 that is an independent document in secure mode, so
+       page CSS and inheritance never reach it — an inherited colour resolves to
+       the initial black and disappears on the dark theme. Both references carry
+       literal colours for the same reason.
+
+       WHY FILLS ONLY, NO `stroke`: a stroke scales with the icon (fuzzy at 16px,
+       fat at 48px) — svg-authoring §7.
+
+       CONTRAST (WCAG 2.2 SC 1.4.11 wants 3:1), relative luminances, each
+       gradient quoted over its range because the ends are what land against a
+       background:
+         folder  #5B74F2 to #3B55E8   0.2118 to 0.1344
+                 vs white 4.01:1 to 5.69:1 · vs dark bg 4.55:1 to 3.20:1
+         warning #FFE27A to #F7C22A   0.7706 to 0.5790
+                 vs the folder 3.37:1 to 4.30:1
+         mark    #464C55 to #000000   0.0730 to 0.0000
+                 vs the warning 10.1:1 to 15.5:1
+       The inactive tabs are decoration — the active tab is the one the folder's
+       own outline draws — so their contrast is not load bearing; the deepest end
+       still measures 7.71:1 against a white page.
+       The black mark is the strongest pair in the file and the same one the ISO
+       warning sign uses. For the record, the alternatives measured on this
+       yellow: red 1.50:1 to 2.92:1, white 1.28:1 to 1.65:1, grey-white evenly
+       worse, which is why white was dropped.
+
+       GEOMETRY (viewBox 0 0 48 48, ~4 units of optical padding at the sides):
+         folder  x 4..43.5, y 12.5..39.5, corners r 4.5 except the top left,
+                 which stays square so the tab sits flush; tab top edge at y 9
+                 from x 7 to 14.08, then a 2-unit corner into the steep edge,
+                 which meets the body's top edge at (18.92,12.5)
+         tabs    two narrow inactive tabs, their sides parallel to the folder's
+                 edge (4.4 of drop buys 3.77 across), tops at y 9, bottoms at
+                 y 13.4 where the body hides them. The front tab's top edge
+                 starts at x 13.8, left of where the folder's corner arc leaves
+                 the top line, so the wedge that arc cuts out is filled by the
+                 tab instead of showing page; the rearmost tab's top right corner
+                 carries a 1.4-unit arc, so the outermost silhouette ends round
+                 like the folder's own. Every other corner stays square.
+         triangle vertices (24,16.5), (14,33.5), (34,33.5) — 20 wide, 17 tall,
+                 every corner rounded with a 2-unit arc whose tangent points sit
+                 3.46 units along each edge
+         mark    a 1.9-unit rounded bar (y 23.05..28.05) over a 1-unit dot
+                 (cy 30.15), painted with a black gradient: #464C55 to #000000.
+                 The first attempt ran #2A2D31 to #000000, which is a gradient on
+                 paper but measured only a 32-level channel spread across the
+                 whole mark, i.e. it read as flat black; the top stop is lifted
+                 until the ramp is visible at 48px while the mark still reads as
+                 black rather than grey.
+       No doubled hyphen appears anywhere in this file, comments included: XML
+       forbids it inside a comment, and a parser that enforces the rule rejects
+       the whole document, leaving the icon blank rather than merely imperfect. -->
+  <defs>
+    <linearGradient id="pgFolder" gradientUnits="userSpaceOnUse" x1="6" y1="6" x2="41" y2="39">
+      <stop offset="0" stop-color="#5B74F2"/>
+      <stop offset="1" stop-color="#3B55E8"/>
+    </linearGradient>
+    <linearGradient id="pgTab1" gradientUnits="userSpaceOnUse" x1="14.4" y1="9" x2="22.2" y2="13.4">
+      <stop offset="0" stop-color="#3A54E4"/>
+      <stop offset="1" stop-color="#2740C9"/>
+    </linearGradient>
+    <linearGradient id="pgTab2" gradientUnits="userSpaceOnUse" x1="17.8" y1="9" x2="25.6" y2="13.4">
+      <stop offset="0" stop-color="#2C46D2"/>
+      <stop offset="1" stop-color="#1B2FB0"/>
+    </linearGradient>
+    <linearGradient id="pgWarning" gradientUnits="userSpaceOnUse" x1="17" y1="17.5" x2="31" y2="33.5">
+      <stop offset="0" stop-color="#FFE27A"/>
+      <stop offset="1" stop-color="#F7C22A"/>
+    </linearGradient>
+    <linearGradient id="pgMark" gradientUnits="userSpaceOnUse" x1="22.5" y1="22.5" x2="25.5" y2="31.7">
+      <stop offset="0" stop-color="#464C55"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#pgTab2)"
+        d="M17.8 9H21.156A1.4 1.4 0 0 1 22.219 9.489L25.57 13.4H21.57Z"/>
+  <path fill="url(#pgTab1)"
+        d="M13.8 9H18.4L22.17 13.4H17.57Z"/>
+  <path fill="url(#pgFolder)"
+        d="M7 9H14.08A2 2 0 0 1 15.6 9.7L17.4 11.8A2 2 0 0 0 18.92 12.5H39A4.5 4.5 0 0 1 43.5 17V35A4.5 4.5 0 0 1 39 39.5H8.5A4.5 4.5 0 0 1 4 35V12A3 3 0 0 1 7 9Z"/>
+  <path fill="url(#pgWarning)"
+        d="M25.76 19.49L32.24 30.51A2 2 0 0 1 30.54 33.5H17.46A2 2 0 0 1 15.76 30.51L22.24 19.49A2 2 0 0 1 25.76 19.49Z"/>
+  <rect x="23.05" y="23.05" width="1.9" height="5" rx="0.95" fill="url(#pgMark)"/>
+  <circle cx="24" cy="30.15" r="1" fill="url(#pgMark)"/>
 </svg>
