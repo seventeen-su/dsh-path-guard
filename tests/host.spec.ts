@@ -8,19 +8,47 @@
  * @module dsh-path-guard/tests/host
  */
 
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, Config, inject, name, unwrap } from '../src/index.ts'
 import { opForCommand, collectPaths, isExoticTool } from '../src/tool-fields.ts'
 import { buildNeedles, scanCommand, commandOf, literalNeedlePrefix, unscannablePatterns } from '../src/scan.ts'
+import { TRACKED_TOOLS_MAX } from '../src/tracking.ts'
 
 // `~` rules are expanded with the real home directory by the plugin, so the
 // tests must use the same anchor or they would exercise an unmatched rule.
 const HOME = homedir()
 const WORKSPACE = join(tmpdir(), 'pg-ws')
+
+// Tool tracking persists into `<DSH_PROFILE_DIR>/path-guard-tools.json`. The
+// suite must never write into the developer's real profile, and must not
+// inherit records from an earlier run — either would make these tests
+// order-dependent. The persistence case below points the variable at its own
+// temporary directory and puts back what is saved here.
+const PROFILE_DIR_BEFORE_TESTS = process.env.DSH_PROFILE_DIR
+delete process.env.DSH_PROFILE_DIR
+after(() => {
+  if (PROFILE_DIR_BEFORE_TESTS === undefined) delete process.env.DSH_PROFILE_DIR
+  else process.env.DSH_PROFILE_DIR = PROFILE_DIR_BEFORE_TESTS
+})
+
+/**
+ * Poll until a condition holds — used for the registry's debounced write.
+ * @param predicate - the condition to wait for.
+ * @param timeoutMs - how long to wait before failing.
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.fail('condition not met before the timeout')
+}
 
 /** The plugin's own ctx contract, derived from `apply` so the fake cannot drift from it. */
 type PluginCtx = Parameters<typeof apply>[0]
@@ -50,6 +78,20 @@ interface PushedItem {
   /** Click target. `sessionId` gates; THIS is what makes a toast clickable. */
   click?: { type: 'session'; sessionId: unknown } | { type: 'page'; page: string } | undefined
 }
+/** A response the fake route handler wrote to. */
+interface FakeResponse {
+  status?: number | undefined
+  headers?: Record<string, string> | undefined
+  body?: string | undefined
+  writeHead: (status: number, headers?: Record<string, string>) => void
+  end: (body?: string) => void
+}
+/** One route the plugin registered on the fake web server. */
+interface FakeRoute {
+  kind: string
+  path: string
+  handler: (req: unknown, res: FakeResponse) => unknown
+}
 /** What the tests read off the fake beyond the plugin's own ctx contract. */
 interface FakeCtxExtra {
   guards: GuardFn[]
@@ -57,6 +99,8 @@ interface FakeCtxExtra {
   logs: unknown[][]
   pushed: PushedItem[]
   pushedAlways: PushedItem[]
+  /** Routes registered on the fake `webServer` (empty unless it was requested). */
+  routes: FakeRoute[]
 }
 /** Overrides `fakeCtx` accepts (documented `canonical` plus per-case service wiring). */
 interface FakeCtxOptions {
@@ -64,6 +108,8 @@ interface FakeCtxOptions {
   notifyService?: Record<string, unknown> | undefined
   services?: Record<string, unknown> | undefined
   readText?: ((displayPath: string) => string) | undefined
+  /** Provide a fake `webServer` so route registrations can be observed. */
+  webServer?: boolean | undefined
 }
 
 /**
@@ -77,6 +123,7 @@ function fakeCtx(options: FakeCtxOptions = {}): PluginCtx & FakeCtxExtra {
   const logs: unknown[][] = []
   const pushed: PushedItem[] = []
   const pushedAlways: PushedItem[] = []
+  const routes: FakeRoute[] = []
   const canonical = options.canonical ?? ((raw: string) => raw)
   const service = options.notifyService === undefined
     ? undefined
@@ -91,12 +138,28 @@ function fakeCtx(options: FakeCtxOptions = {}): PluginCtx & FakeCtxExtra {
     logs,
     pushed,
     pushedAlways,
+    routes,
     logger: {
       info: (...args: unknown[]) => logs.push(['info', ...args]),
       warn: (...args: unknown[]) => logs.push(['warn', ...args]),
       error: (...args: unknown[]) => logs.push(['error', ...args]),
       debug: (...args: unknown[]) => logs.push(['debug', ...args]),
     },
+    // Runs the callback now and hands back its disposer, like the real effect.
+    effect: (callback: () => unknown) => {
+      const disposer = callback()
+      return () => { if (typeof disposer === 'function') (disposer as () => void)() }
+    },
+    ...(options.webServer === true
+      ? {
+        webServer: {
+          register: (route: FakeRoute) => {
+            routes.push(route)
+            return () => { routes.splice(routes.indexOf(route), 1) }
+          },
+        },
+      }
+      : {}),
     get(name: string) {
       if (name === 'desktopNotify') return service
       return options.services === undefined ? undefined : options.services[name]
@@ -689,6 +752,150 @@ test('a denial notifies through desktopNotify when it is mounted', async () => {
   assert.ok(ctx.pushed[0]!.message.length > 0)
 })
 
+// ---------------------------------------------------------------------------
+// The tracked-tools route the client's trust editor reads
+// ---------------------------------------------------------------------------
+
+/**
+ * Invoke one registered route with a fake response sink.
+ * @param ctx - the fake context that captured the registrations.
+ * @param path - the route path.
+ * @param req - the request handed to the admission check.
+ */
+async function callRoute(ctx: PluginCtx & FakeCtxExtra, path: string, req: unknown = {}) {
+  const route = ctx.routes.find(candidate => candidate.path === path)
+  assert.ok(route !== undefined, `route ${path} must be registered`)
+  const res: FakeResponse = {
+    writeHead(status, headers) { this.status = status; this.headers = headers },
+    end(body) { this.body = body },
+  }
+  await route.handler(req, res)
+  return res
+}
+
+test('DSH bookkeeping tools are never path-judged, but third-party tools still are', async () => {
+  // Reproduced live before this was written: a task list whose TEXT was a
+  // protected path got refused, with the rule's own message, for a tool that
+  // only writes a task list. `todo_write` never opens a file, so the refusal
+  // protected nothing and broke the tool.
+  const protectedPath = join(tmpdir(), 'pg-secrets', 'k.txt')
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+
+  const todo = await preExecute(ctx, {
+    name: 'todo_write',
+    arguments: { todos: [{ content: protectedPath, status: 'pending' }] },
+  })
+  assert.equal(todo.kind, 'allow', 'a bookkeeping tool must not be judged by its prose')
+
+  // Same for the rest of the verified table, through the two shapes that used to
+  // trip the heuristic: a bare protected path and a covered path named in prose.
+  for (const name of ['job_list', 'schedule_list', 'web_search', 'send_message', 'create_goal']) {
+    const decision = await preExecute(ctx, { name, arguments: { query: protectedPath, prompt: protectedPath } })
+    assert.equal(decision.kind, 'allow', `${name} touches no file and must not be refused`)
+  }
+
+  // NEGATIVE CONTROL. The fix is a verified per-tool table, NOT a blanket
+  // exemption for anything that looks like an orchestration tool: an unmodelled
+  // third-party tool naming the same path is still refused.
+  const thirdParty = await preExecute(ctx, {
+    name: 'notes_search',
+    arguments: { query: protectedPath },
+  })
+  assert.equal(thirdParty.kind, 'deny', 'the table must not widen into a blanket exemption')
+
+  // …and a covered path in the TOOL'S OWN path argument is still refused, which is
+  // the behaviour the table must not weaken.
+  const covered = await preExecute(ctx, { name: 'read', arguments: { file_path: protectedPath } })
+  assert.equal(covered.kind, 'deny')
+})
+
+test('the tracked-tools route serves the tools this plugin has seen', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  assert.equal(ctx.routes.length, 1, 'exactly one route is mounted')
+  assert.equal(ctx.routes[0]!.path, '/path-guard/tools')
+  assert.equal(ctx.routes[0]!.kind, 'exact')
+
+  // Nothing seen yet: the editor gets an empty suggestion list, not an error.
+  const empty = await callRoute(ctx, '/path-guard/tools')
+  assert.equal(empty.status, 200)
+  const blank = JSON.parse(String(empty.body)) as { tools: string[]; lastUnmodelledAt: number | null; records: unknown[] }
+  assert.deepEqual(
+    { tools: blank.tools, lastUnmodelledAt: blank.lastUnmodelledAt },
+    { tools: [], lastUnmodelledAt: null },
+    'the legacy shape the client reads is unchanged',
+  )
+  assert.deepEqual(blank.records, [], 'the additive record view starts empty too')
+
+  // Two unmodelled tools, seen through the normal path so the registration is
+  // exercising the same code the running plugin does.
+  const uncovered = { query: join(tmpdir(), 'pg-uncovered', 'k.txt') }
+  const before = Date.now()
+  await preExecute(ctx, { name: 'notes_search', arguments: uncovered })
+  await preExecute(ctx, { name: 'acme_list', arguments: uncovered })
+
+  const filled = await callRoute(ctx, '/path-guard/tools')
+  assert.equal(filled.status, 200)
+  assert.equal(filled.headers?.['cache-control'], 'no-store', 'runtime state must not be cached')
+  const payload = JSON.parse(String(filled.body)) as { tools: string[]; lastUnmodelledAt: number | null }
+  assert.deepEqual(payload.tools, ['acme_list', 'notes_search'], 'sorted, deduped, and only what was actually seen')
+  // The client uses this timestamp to correct a click the peer lands on the wrong
+  // bundle page (see `lastUnmodelledAt` in src/index.ts). It must be a real
+  // sighting time, not something the route invents.
+  assert.equal(typeof payload.lastUnmodelledAt, 'number', 'a sighting must be timestamped')
+  assert.ok(
+    payload.lastUnmodelledAt !== null && payload.lastUnmodelledAt >= before && payload.lastUnmodelledAt <= Date.now(),
+    'the timestamp must come from the sighting itself',
+  )
+
+  // A tool whose arguments look like NOTHING must still be remembered. The editor
+  // suggests from this list, and a list that only held tools which already
+  // tripped a heuristic would be empty exactly when the user goes looking for
+  // what to trust.
+  const quiet = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(quiet, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  const benign = await preExecute(quiet, { name: 'acme_status', arguments: { format: 'json' } })
+  assert.equal(benign.kind, 'allow')
+  const listed = JSON.parse(String((await callRoute(quiet, '/path-guard/tools')).body)) as { tools: string[] }
+  assert.deepEqual(listed.tools, ['acme_status'], 'a benign unmodelled tool is still offered for trust')
+})
+
+test('the tracked-tools route reveals nothing without admission', async () => {
+  // The list is runtime state. An unauthenticated or cross-origin caller must not
+  // learn the tool names, or even that the plugin is installed.
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => ({ rejection: 401 }) } } })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  await preExecute(ctx, {
+    name: 'notes_search',
+    arguments: { query: join(tmpdir(), 'pg-uncovered', 'k.txt') },
+  })
+
+  const res = await callRoute(ctx, '/path-guard/tools')
+  assert.equal(res.status, 401)
+  assert.ok(!String(res.body).includes('notes_search'), 'a rejected request learns no tool names')
+})
+
+test('no web server means no route, and the plugin still arms', async () => {
+  // The endpoint is a convenience for the trust editor. A profile without a web
+  // server (or without the connection fence) must lose only the suggestions —
+  // declaring `webServer` in `inject` would park activation instead.
+  const ctx = fakeCtx()
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  assert.deepEqual(ctx.routes, [], 'nothing is registered without a web server')
+  // …and the guard still works, which is the part that matters.
+  assert.match(
+    ctx.guards[0]!({ name: 'pwsh', arguments: { command: `Get-Content '${join(tmpdir(), 'pg-secrets', 'k.txt')}'` } })!,
+    /访问被拒绝/,
+  )
+
+  // A web server WITHOUT the admission fence must also skip: serving runtime
+  // state with no way to authenticate the caller is worse than no suggestions.
+  const unfenced = fakeCtx({ webServer: true })
+  apply(unfenced, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  assert.deepEqual(unfenced.routes, [], 'no admission check, no route')
+})
+
 test('the first sighting of an unmodelled tool notifies once, naming the prefix to trust', async () => {
   const ctx = fakeCtx({ notifyService: {} })
   apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
@@ -711,8 +918,8 @@ test('the first sighting of an unmodelled tool notifies once, naming the prefix 
   // a `sessionId` this notification would essentially never be seen.
   assert.ok(!('sessionId' in ctx.pushed[0]!), 'the trust suggestion must not be session-gated')
 
-  // Once per TOOL, not once per call: `unmodelledSeen` is the dedup, so this can
-  // never turn into a stream of notifications.
+  // Once per TOOL, not once per call: the registry's `notified` flag is the
+  // dedup, so this can never turn into a stream of notifications.
   await preExecute(ctx, probe)
   await preExecute(ctx, { name: 'notes_search', arguments: { query: join(tmpdir(), 'pg-uncovered', 'other.txt') } })
   assert.equal(ctx.pushed.length, 1, 'the suggestion must not repeat for the same tool')
@@ -990,6 +1197,65 @@ test('a trusted tool is judged before the policy, so a broken config cannot deny
   )
 })
 
+test('trust silences the shell/script/exotic legs of governs — but never plugin_manager', () => {
+  // The residual this pins. `governs` used to read
+  //     !isTrustedTool(n) && isGoverned(n)
+  //       || SHELL_TOOLS.has(n) || isScriptTool(n) || isExoticTool(n) || n === 'plugin_manager'
+  // and `&&` binds tighter than `||`, so it parsed as
+  //     (!trusted && isGoverned) || SHELL || SCRIPT || EXOTIC || plugin_manager
+  // Trust therefore suppressed ONLY the name-shape leg: a trusted `pwsh`,
+  // `workflow` or `mcp__*` still hit its own leg and was failed closed when this
+  // plugin had an internal error — the exact opposite of what `governs`'s own
+  // comment promises ("a bug of ours must not take it away").
+  const boom = Object.freeze({
+    get: () => {
+      throw new Error('boom')
+    },
+    [VOLATILE_WRITE]: () => {},
+  })
+
+  // A trusted tool of each affected leg survives an internal error.
+  for (const name of ['pwsh', 'workflow', 'mcp__fs__read_file']) {
+    const ctx = fakeCtx()
+    apply(ctx, {
+      enabled: boom, rules: [], defaultAccess: 'allow', selfProtection: true,
+      trustedTools: [{ match: name, note: '' }],
+    })
+    assert.equal(
+      ctx.guards[0]!({ name, arguments: { command: 'x' } }),
+      undefined,
+      `a trusted ${name} must not be failed closed by our own bug`,
+    )
+  }
+
+  // …and the SAME call without trust still fails closed, so the assertion above
+  // measures trust rather than a guard that stopped working.
+  for (const name of ['pwsh', 'workflow', 'mcp__fs__read_file']) {
+    const ctx = fakeCtx()
+    apply(ctx, { enabled: boom, rules: [], defaultAccess: 'allow', selfProtection: true })
+    assert.match(
+      String(ctx.guards[0]!({ name, arguments: { command: 'x' } })),
+      /出错/,
+      `an untrusted ${name} must still fail closed`,
+    )
+  }
+
+  // THE EXCEPTION. Self-protection outranks trust (V-11), and that has to hold in
+  // BOTH directions: here it means a trusted `plugin_manager` stays this plugin's
+  // business, so an internal error fails closed on it instead of letting the
+  // composition change slip through on a bug.
+  const selfCtx = fakeCtx()
+  apply(selfCtx, {
+    enabled: boom, rules: [], defaultAccess: 'allow', selfProtection: true,
+    trustedTools: [{ match: 'plugin_manager', note: '' }],
+  })
+  assert.match(
+    String(selfCtx.guards[0]!({ name: 'plugin_manager', arguments: { action: 'set_bundle', target: 'x' } })),
+    /出错/,
+    'trusting plugin_manager must not make self-protection fail OPEN on an internal error',
+  )
+})
+
 test('V-11: a trusted tool cannot switch off self-protection', () => {
   // Trust is a statement about a tool's FILE ACCESS. Letting it defeat the guard's
   // own integrity would mean one config line hands the AI the ability to disable
@@ -1138,4 +1404,375 @@ test('trustedTools skips the plugin entirely, by exact name or by prefix', async
     trustedTools: [{ match: '', note: '' }, null, { note: 'no match field' }],
   })
   assert.equal((await preExecute(malformed, { name: 'other_tool', arguments: probe })).kind, 'deny')
+})
+
+// ---------------------------------------------------------------------------
+// tool tracking: continuous detection, self-learning, family, persistence
+// ---------------------------------------------------------------------------
+
+/** One record as the tracked-tools route reports it. */
+interface TrackedRecord {
+  name: string
+  firstSeenAt: number
+  lastSeenAt: number
+  seen: number
+  refused: number
+  fields: string[]
+  capabilities?: Record<string, string>
+  notified?: boolean
+}
+
+/** Read the additive `records` view off the tracked-tools route. */
+async function trackedRecords(ctx: PluginCtx & FakeCtxExtra): Promise<TrackedRecord[]> {
+  const body = JSON.parse(String((await callRoute(ctx, '/path-guard/tools')).body)) as { records?: TrackedRecord[] }
+  return body.records ?? []
+}
+
+test('the registry counts every sighting and reports it on the tracked-tools route', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+
+  const uncovered = join(tmpdir(), 'pg-uncovered', 'k.txt')
+  await preExecute(ctx, { name: 'notes_search', arguments: { query: uncovered } })
+  await preExecute(ctx, { name: 'notes_search', arguments: { query: join(tmpdir(), 'pg-uncovered', 'other.txt') } })
+
+  const records = await trackedRecords(ctx)
+  assert.equal(records.length, 1)
+  const record = records[0]!
+  assert.equal(record.name, 'notes_search')
+  assert.equal(record.seen, 2, 'continuous detection counts every call, not just the first')
+  assert.ok(record.lastSeenAt >= record.firstSeenAt)
+  assert.equal(record.refused, 0)
+  assert.deepEqual(record.fields, [], 'nothing has been refused yet')
+  assert.equal(record.notified, true, 'the first sighting told the user')
+
+  // The legacy view the client reads is unchanged by any of this.
+  const payload = JSON.parse(String((await callRoute(ctx, '/path-guard/tools')).body)) as { tools: string[] }
+  assert.deepEqual(payload.tools, ['notes_search'])
+})
+
+test('a refusal teaches the field, and the next call is judged by NAME', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  // `defaultAccess: none` is what makes the difference visible: the learned
+  // field makes the value CHECKABLE, and every checkable path is refused here.
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+
+  // 1. A path-shaped value under a rule-covered path: refused, and the field
+  //    that carried it is learned.
+  const covered = join(tmpdir(), 'pg-secrets', 'k.txt')
+  assert.equal((await preExecute(ctx, { name: 'notes_read', arguments: { file_path: covered } })).kind, 'deny')
+  const record = (await trackedRecords(ctx)).find(entry => entry.name === 'notes_read')
+  assert.deepEqual(record?.fields, ['file_path'], 'the refused field is remembered')
+  assert.equal(record?.refused, 1)
+
+  // 2. The SAME tool with a value that looks like nothing at all is now refused:
+  //    a learned field is judged by name instead of by value shape.
+  const second = await preExecute(ctx, { name: 'notes_read', arguments: { file_path: 'notes' } })
+  assert.equal(second.kind, 'deny', 'the learned field is judged by name')
+
+  // CONTROL: another tool that was never refused is still only NOTED, so the
+  // denial above really is the learned knowledge and not `defaultAccess`.
+  const control = fakeCtx()
+  apply(control, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+  assert.equal((await preExecute(control, { name: 'acme_read', arguments: { file_path: 'notes' } })).kind, 'allow')
+})
+
+test('one refusal generalizes to the already-tracked tools of the same family', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+
+  // The sibling is tracked FIRST: family knowledge is stamped onto the tools
+  // that are already in the registry when the refusal happens.
+  assert.equal((await preExecute(ctx, { name: 'mcp__fs__stat', arguments: { format: 'json' } })).kind, 'allow')
+
+  const covered = join(tmpdir(), 'pg-secrets', 'k.txt')
+  assert.equal((await preExecute(ctx, { name: 'mcp__fs__read_file', arguments: { path: covered } })).kind, 'deny')
+
+  const sibling = (await trackedRecords(ctx)).find(entry => entry.name === 'mcp__fs__stat')
+  assert.deepEqual(sibling?.fields, ['path'], 'the sibling inherited the learned field')
+  assert.equal(sibling?.refused, 0, 'inheriting is not being refused')
+
+  const inherited = await preExecute(ctx, { name: 'mcp__fs__stat', arguments: { path: 'notes' } })
+  assert.equal(inherited.kind, 'deny', 'the sibling is now judged by the inherited field name')
+
+  // A different MCP server is a different family and stays unaffected.
+  const other = await preExecute(ctx, { name: 'mcp__git__status', arguments: { path: 'notes' } })
+  assert.equal(other.kind, 'allow')
+})
+
+test('the registry persists into the profile directory and survives a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pg-track-'))
+  const previous = process.env.DSH_PROFILE_DIR
+  process.env.DSH_PROFILE_DIR = dir
+  try {
+    const covered = join(tmpdir(), 'pg-secrets', 'k.txt')
+    const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+    apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+    assert.equal((await preExecute(ctx, { name: 'notes_read', arguments: { file_path: covered } })).kind, 'deny')
+
+    const file = join(dir, 'path-guard-tools.json')
+    await waitFor(() => existsSync(file))
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as { version: number; records: TrackedRecord[] }
+    assert.equal(saved.version, 1)
+    assert.deepEqual(saved.records.find(entry => entry.name === 'notes_read')?.fields, ['file_path'])
+
+    // A fresh activation is what a restart looks like: it must read the file
+    // back and keep judging by the learned field, with no new refusal in this
+    // process to teach it again.
+    const restarted = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+    apply(restarted, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+    const learned = await preExecute(restarted, { name: 'notes_read', arguments: { file_path: 'notes' } })
+    assert.equal(learned.kind, 'deny', 'the learned field came back from disk')
+    assert.equal(
+      (await trackedRecords(restarted))[0]?.seen,
+      2,
+      'one sighting was loaded from the file, and the call above added the second',
+    )
+  } finally {
+    if (previous === undefined) delete process.env.DSH_PROFILE_DIR
+    else process.env.DSH_PROFILE_DIR = previous
+  }
+})
+
+test('unreadable tracking state costs the convenience, never the guard', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pg-track-bad-'))
+  const previous = process.env.DSH_PROFILE_DIR
+  process.env.DSH_PROFILE_DIR = dir
+  try {
+    // Garbage in the file must not stop activation, and must not throw.
+    writeFileSync(join(dir, 'path-guard-tools.json'), '{ this is not json')
+    const ctx = fakeCtx()
+    assert.doesNotThrow(() => apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false }))
+    assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })).kind, 'deny')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_PROFILE_DIR
+    else process.env.DSH_PROFILE_DIR = previous
+  }
+})
+
+/** Run `body` with `DSH_PROFILE_DIR` pointed at a fresh temporary directory. */
+async function withProfileDir<T>(body: (dir: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), 'pg-track-fix-'))
+  const previous = process.env.DSH_PROFILE_DIR
+  process.env.DSH_PROFILE_DIR = dir
+  try {
+    return await body(dir)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_PROFILE_DIR
+    else process.env.DSH_PROFILE_DIR = previous
+  }
+}
+
+// ---------------------------------------------------------------------------
+// R1: the tracking file is AI-writable state the plugin trusts — it must not be
+// ---------------------------------------------------------------------------
+
+test('R1a: self-protection refuses writes to the tracking file, and allows reads', async () => {
+  await withProfileDir(async dir => {
+    const ctx = fakeCtx()
+    apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: true })
+    const file = join(dir, 'path-guard-tools.json')
+    // Readable on purpose: the `read` tier is what the other profile files get,
+    // and the AI may legitimately want to see what it has been accused of.
+    assert.equal((await preExecute(ctx, { name: 'read', arguments: { file_path: file } })).kind, 'allow')
+    assert.equal(
+      (await preExecute(ctx, { name: 'write', arguments: { file_path: file, content: '{}' } })).kind,
+      'deny',
+      'the agent must not be able to author its own tracking file',
+    )
+    assert.equal(
+      (await preExecute(ctx, { name: 'edit', arguments: { file_path: file, old_string: 'a', new_string: 'b' } })).kind,
+      'deny',
+    )
+    // The rest of the profile set keeps working (no regression in the rule list).
+    assert.equal(
+      (await preExecute(ctx, { name: 'write', arguments: { file_path: join(dir, 'cordis.patch.yml'), content: '' } })).kind,
+      'deny',
+    )
+  })
+})
+
+test('R1b: a pre-seeded weak capability cannot downgrade a refusal into an allow', async () => {
+  await withProfileDir(async dir => {
+    // The audit's X8c, verbatim: `{'path':'list'}` under a `list`-tier rule made
+    // a read the rules refuse come back as ALLOW.
+    const secret = join(dir, 'pg-secrets')
+    writeFileSync(join(dir, 'path-guard-tools.json'), JSON.stringify({
+      version: 1,
+      records: [{
+        name: 'mcp__acme__read',
+        seen: 5,
+        refused: 1,
+        fields: ['path'],
+        capabilities: { path: 'list' },
+        notified: true,
+      }],
+    }))
+    const ctx = fakeCtx()
+    apply(ctx, {
+      enabled: true,
+      rules: [{ id: 'sec', path: secret, access: 'list', note: '' }],
+      defaultAccess: 'allow',
+      selfProtection: false,
+    })
+    const decision = await preExecute(ctx, { name: 'mcp__acme__read', arguments: { path: join(secret, 'k.txt') } })
+    assert.equal(decision.kind, 'deny', 'a learned field needs WRITE, so a list-tier rule cannot permit it')
+  })
+})
+
+test('R1c: a notification bit with no sighting behind it cannot silence the notice', async () => {
+  await withProfileDir(async dir => {
+    const file = join(dir, 'path-guard-tools.json')
+    const probe = { name: 'notes_search', arguments: { query: join(tmpdir(), 'pg-uncovered', 'k.txt') } }
+
+    // Hand-written, no observation evidence: the gate drops the bit.
+    writeFileSync(file, JSON.stringify({ version: 1, records: [{ name: 'notes_search', notified: true }] }))
+    const forged = fakeCtx({ notifyService: {} })
+    apply(forged, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+    await preExecute(forged, probe)
+    assert.equal(forged.pushed.length, 1, 'the first-sighting notice must still fire')
+
+    // The organic case still holds: a record with a real sighting keeps its bit.
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      records: [{ name: 'notes_search', seen: 1, lastSeenAt: Date.now(), notified: true }],
+    }))
+    const organic = fakeCtx({ notifyService: {} })
+    apply(organic, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+    await preExecute(organic, probe)
+    assert.equal(organic.pushed.length, 0, 'a tool the user was already told about stays quiet')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// R3: the dedup survives eviction, so a loop of tool names cannot re-notify
+// ---------------------------------------------------------------------------
+
+test('R3: the notice stays once per tool even after 200+ other tools evict it', async () => {
+  const ctx = fakeCtx({ notifyService: {} })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'allow', selfProtection: false })
+  const probe = { query: join(tmpdir(), 'pg-uncovered', 'k.txt') }
+  const total = TRACKED_TOOLS_MAX + 30
+  for (let index = 0; index < total; index += 1) {
+    await preExecute(ctx, { name: `acme_tool_${index}`, arguments: probe })
+  }
+  assert.equal(ctx.pushed.length, total, 'every new tool is announced once')
+  // The first tool's RECORD is long gone; its dedup bit is not.
+  await preExecute(ctx, { name: 'acme_tool_0', arguments: probe })
+  assert.equal(ctx.pushed.length, total, 'an evicted tool must not be announced again')
+})
+
+// ---------------------------------------------------------------------------
+// R4: family is a name convention — but resource-free tools never enter at all
+// ---------------------------------------------------------------------------
+
+test('R4: tools verified to touch no file never enter the registry', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'allow', selfProtection: false })
+  // `list_agents` shares the `list_` prefix with other DSH tools, and `todo_write`
+  // takes prose that can contain a path — both are resource-free by table, so
+  // neither may be tracked, and neither may be family-joined with anything.
+  for (const toolName of ['list_agents', 'todo_write', 'web_search', 'team_task_list']) {
+    const decision = await preExecute(ctx, { name: toolName, arguments: { query: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+    assert.equal(decision.kind, 'allow', toolName)
+  }
+  assert.deepEqual(await trackedRecords(ctx), [], 'the registry stays empty for resource-free tools')
+})
+
+test('R4: malformed MCP names neither generalize nor inherit', async () => {
+  const ctx = fakeCtx({ webServer: true, services: { connection: { admit: () => undefined } } })
+  apply(ctx, { enabled: true, rules: [], defaultAccess: 'none', selfProtection: false })
+  // Both are malformed (`mcp__` with no server), so they are NOT siblings of each
+  // other even though a naive prefix rule would join them.
+  await preExecute(ctx, { name: 'mcp__read_file', arguments: { path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+  assert.equal(
+    (await preExecute(ctx, { name: 'mcp__stat_file', arguments: { path: 'plain-name' } })).kind,
+    'allow',
+    'a malformed MCP name must not inherit a sibling\'s learning',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// R5: the write is atomic
+// ---------------------------------------------------------------------------
+
+test('R5: the registry write leaves a complete file and no temporary behind', async () => {
+  await withProfileDir(async dir => {
+    const ctx = fakeCtx()
+    apply(ctx, { enabled: true, rules: RULES, defaultAccess: 'none', selfProtection: false })
+    await preExecute(ctx, { name: 'notes_read', arguments: { file_path: join(tmpdir(), 'pg-secrets', 'k.txt') } })
+    const file = join(dir, 'path-guard-tools.json')
+    await waitFor(() => existsSync(file))
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { records?: unknown[] }
+    assert.equal(Array.isArray(parsed.records), true, 'the file is always complete JSON')
+    assert.deepEqual(
+      readdirSync(dir).filter(entry => entry.includes('.tmp')),
+      [],
+      'the rename consumes the temporary file',
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E1: the needle cache — hits are reused, and every real change invalidates
+// ---------------------------------------------------------------------------
+
+test('E1: needles are reused while the rule snapshot is unchanged', () => {
+  const secretA = join(tmpdir(), 'pg-cache-a')
+  const secretB = join(tmpdir(), 'pg-cache-b')
+  const config = {
+    enabled: true,
+    rules: [{ id: 'a', path: secretA, access: 'none', note: '' }],
+    defaultAccess: 'allow',
+    selfProtection: false,
+    shell: 'scan',
+  }
+  const ctx = fakeCtx()
+  apply(ctx, config)
+  const guard = ctx.guards[0]!
+  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(secretA, 'k.txt')}'` } })!, /访问被拒绝/)
+
+  // CACHE HIT, observed through the contract: the memo is keyed on the rule
+  // snapshot's IDENTITY (exactly like `policy()`), and an in-place mutation is
+  // not a supported update — the volatile protocol replaces the snapshot. If the
+  // needles were rebuilt per call, the mutated rule would already be in force.
+  config.rules[0]!.path = secretB
+  assert.equal(
+    guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(secretB, 'k.txt')}'` } }),
+    undefined,
+    'the cached needles are reused while the snapshot identity is unchanged',
+  )
+
+  // INVALIDATION: replacing the snapshot is what a settings save does.
+  config.rules = [{ id: 'b', path: secretB, access: 'none', note: '' }]
+  assert.match(guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(secretB, 'k.txt')}'` } })!, /访问被拒绝/)
+  assert.equal(
+    guard({ name: 'pwsh', arguments: { command: `Get-Content '${join(secretA, 'k.txt')}'` } }),
+    undefined,
+    'and the old needle is gone',
+  )
+})
+
+test('E1: the session workspace is part of the cache key', () => {
+  const one = join(tmpdir(), 'pg-ws-one')
+  const two = join(tmpdir(), 'pg-ws-two')
+  const ctx = fakeCtx()
+  apply(ctx, {
+    enabled: true,
+    rules: [{ id: 'w', path: '${workspace}/secret', access: 'none', note: '' }],
+    defaultAccess: 'allow',
+    selfProtection: false,
+    shell: 'scan',
+  })
+  const guard = ctx.guards[0]!
+  const probe = (workspace: string) => ({
+    name: 'pwsh',
+    arguments: { command: `Get-Content '${join(workspace, 'secret', 'k.txt')}'` },
+    agent: { session: { header: { cwd: workspace } } },
+  })
+  assert.match(guard(probe(one))!, /访问被拒绝/)
+  // A stale cache that ignored the workspace would let the second session read
+  // its own protected path.
+  assert.match(guard(probe(two))!, /访问被拒绝/, 'each session is judged with its own needles')
+  assert.match(guard(probe(one))!, /访问被拒绝/)
 })

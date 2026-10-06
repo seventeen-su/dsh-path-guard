@@ -89,6 +89,20 @@ interface KnownTool {
     search?: string;
 }
 /**
+ * A field name learned from a previous refusal (`src/tracking.ts`).
+ *
+ * `capability` is a plain string on purpose: this value round-trips through a
+ * persisted file, so it is untrusted input at this boundary, and anything
+ * unrecognised becomes WRITE — the strictest rung — inside
+ * {@link learnedCapabilityOf} rather than being trusted because it was written
+ * down once.
+ */
+interface LearnedField {
+    field: string;
+    /** Written as `| undefined` on purpose: a hand-edited or corrupt file may carry an explicit null-ish capability, and that is exactly what must be tolerated. */
+    capability?: string | undefined;
+}
+/**
  * The modelled tool table, keyed by tool name.
  *
  * The explicit key list keeps literal access (`KNOWN_TOOLS.glob.paths`)
@@ -151,17 +165,46 @@ export declare const KNOWN_TOOLS: KnownToolTable;
  */
 export declare const OPAQUE_TOOLS: Set<string>;
 /**
+ * DSH's own built-in tools that have been CHECKED to take no filesystem path.
+ *
+ * This is a modelling statement, not a vendor exemption: the reason these tools
+ * are listed is that every one of them was read and none of them names a file.
+ * Their arguments are prose or identifiers — a task's text, a job id, a search
+ * query, an agent's prompt — and prose routinely CONTAINS something that looks
+ * like a path.
+ *
+ * The failure that produced this list, reproduced live before it was written:
+ * `todo_write({ todos: [{ content: 'C:/Users/…/.ssh/config' }] })` was REFUSED
+ * with the `~/.ssh` rule's own message. `todo_write` writes a task list; it never
+ * opens a file, so refusing it protected nothing and simply broke the tool.
+ *
+ * The unmodelled heuristic cannot tell "a path argument" from "prose that is a
+ * path" — only the field NAME could, and this list is the honest version of that
+ * judgement: verified per tool, rather than guessed per value shape. A tool that
+ * genuinely touches the filesystem belongs in {@link KNOWN_TOOLS} with its path
+ * fields instead.
+ *
+ * Known limits: it is static, so a future DSH built-in is unmodelled until it is
+ * added (it then behaves like any other third-party tool, and `trustedTools`
+ * covers it). A tool that later GROWS a path argument must move to
+ * {@link KNOWN_TOOLS} — this table says "checked", not "trusted".
+ */
+export declare const RESOURCE_FREE_TOOLS: ReadonlySet<string>;
+/**
  * Resolve a modelled tool's resources, or heuristically resolve an unmodelled
  * one. Never throws for non-object arguments.
  * @param {string} toolName - the model-facing tool name.
- * @param {unknown} args - the parsed, deep-frozen tool arguments.
+ * @param {unknown} args - the parsed tool arguments.
+ * @param {ReadonlyArray<LearnedField>} [learned] - fields earlier refusals taught
+ *   about this tool (`src/tracking.ts`). Only unmodelled tools consult them: a
+ *   modelled tool already knows exactly which of its fields are paths.
  * @returns {Resolution} the resolution. `reason` present means the call MUST be refused; `note` is informational only.
  *
  * `toolName` is typed `unknown` on purpose: the guard below is the contract, and
  * callers really do hand over non-strings (the specs pin that down). Widening it
  * from `string` is type-only — the runtime is unchanged.
  */
-export declare function resolveResources(toolName: unknown, args: unknown): Resolution;
+export declare function resolveResources(toolName: unknown, args: unknown, learned?: ReadonlyArray<LearnedField>): Resolution;
 /**
  * Whether this plugin is responsible for judging a tool call.
  *

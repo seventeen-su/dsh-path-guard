@@ -76,6 +76,24 @@ type CordisContext = {
     } | undefined;
     on: (...args: unknown[]) => unknown;
     get: (name: string) => unknown;
+    /**
+     * Loader-managed effect: whatever the callback returns is disposed with the
+     * plugin. Used to tie the web route's registration to this plugin's lifetime.
+     */
+    effect?: ((callback: () => unknown, label?: string) => unknown) | undefined;
+    /** The Host web server. Optional: a profile without one must still arm. */
+    webServer?: {
+        register: (route: {
+            kind: 'exact' | 'prefix';
+            path: string;
+            handler: (req: unknown, res: HttpResponse) => unknown;
+        }) => unknown;
+    } | undefined;
+};
+/** The slice of `ServerResponse` this plugin writes to. Mirrors `node:http`. */
+type HttpResponse = {
+    writeHead: (status: number, headers?: Record<string, string>) => unknown;
+    end: (body?: string) => unknown;
 };
 /** Cordis plugin name used by loader diagnostics. */
 export declare const name = "path-guard";

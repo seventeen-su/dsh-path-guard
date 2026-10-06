@@ -564,3 +564,104 @@ test('P1. every capability projects onto the policy ladder', () => {
   assert.equal(policyAccessFor('nonsense'), 'write')
   assert.equal(policyAccessFor(undefined), 'write')
 })
+
+// ---------------------------------------------------------------------------
+// learned fields (the third argument: what a refusal taught the registry)
+// ---------------------------------------------------------------------------
+
+test('L1. a learned field is judged by NAME, not by the value shape', () => {
+  // `plain-name` is not path-shaped by any heuristic — without the learned
+  // field this call is only NOTED (the name leg), never actionable evidence.
+  const blind = resolveResources('acme_read', deepFreeze({ file_path: 'plain-name' }))
+  assert.deepEqual(blind.actionable, [], 'the name leg alone is not evidence')
+  assert.equal(blind.reason, undefined)
+  assert.deepEqual(blind.resources, [{ value: 'plain-name', capability: CAPABILITY.WRITE, field: 'file_path' }])
+
+  const taught = resolveResources('acme_read', deepFreeze({ file_path: 'plain-name' }), [
+    { field: 'file_path', capability: CAPABILITY.READ },
+  ])
+  assert.equal(taught.known, false)
+  assert.deepEqual(taught.resources, [
+    { value: 'plain-name', capability: CAPABILITY.WRITE, field: 'file_path' },
+  ])
+  assert.deepEqual(taught.actionable, taught.resources, 'a learned hit IS actionable evidence')
+  assert.equal(taught.capability, CAPABILITY.WRITE, 'the file\'s "read" is ignored: learned fields are always WRITE')
+  assert.match(taught.reason!, /此前从拒绝中学到/)
+})
+
+test('L2. a compound notation teaches the field it ends with', () => {
+  // `files[].path` is what a resource was reported under; the argument key a
+  // later call uses is the last segment, `path`. The stored capability is
+  // irrelevant to the rung — see L3.
+  const result = resolveResources('acme_present', deepFreeze({ files: [{ path: 'notes' }] }), [
+    { field: 'files[].path', capability: CAPABILITY.EXPORT },
+  ])
+  assert.deepEqual(result.resources, [
+    { value: 'notes', capability: CAPABILITY.WRITE, field: 'files[].path' },
+  ])
+  const deep = resolveResources('acme_read', deepFreeze({ config: { output: { path: 'notes' } } }), [
+    { field: 'config.output.path', capability: CAPABILITY.READ },
+  ])
+  assert.deepEqual(deep.resources, [
+    { value: 'notes', capability: CAPABILITY.WRITE, field: 'config.output.path' },
+  ])
+})
+
+test('L3. a persisted capability can only ever tighten: the learned rung is always WRITE', () => {
+  // The cast is the point: this value comes from a file, so the resolver must
+  // cope with anything a hand-edited or corrupt file holds. The VALID weaker
+  // enum members are the dangerous ones — `list` here would downgrade a refusal
+  // into an allow — so they are asserted alongside the junk.
+  const values = ['nonsense', '', undefined, 42, null, 'list', 'read', 'export', 'enumerate', 'execute', 'write']
+  for (const capability of values as unknown as Array<string | undefined>) {
+    const result = resolveResources('acme_read', deepFreeze({ path: 'notes' }), [{ field: 'path', capability }])
+    assert.equal(result.capability, CAPABILITY.WRITE, `capability ${String(capability)} must not soften the rung`)
+    assert.equal(result.resources[0]?.capability, CAPABILITY.WRITE, String(capability))
+  }
+})
+
+test('L4. learned and heuristic evidence merge under the strictest capability', () => {
+  const result = resolveResources(
+    'acme_read',
+    deepFreeze({ file_path: 'notes', target: 'C:/elsewhere' }),
+    [{ field: 'file_path', capability: CAPABILITY.READ }],
+  )
+  assert.equal(result.capability, CAPABILITY.WRITE)
+  assert.deepEqual(
+    result.resources.map(resource => [resource.field, resource.capability]),
+    [['file_path', CAPABILITY.WRITE], ['target', CAPABILITY.WRITE]],
+  )
+  assert.deepEqual(result.actionable, result.resources)
+})
+
+test('L5. malformed learned entries are ignored, not fatal', () => {
+  const learned = [null, 42, 'path', {}, { field: '' }, { field: 7 }] as unknown as Array<{ field: string }>
+  const result = resolveResources('acme_read', deepFreeze({ path: 'notes' }), learned)
+  assert.deepEqual(result.actionable, [], 'none of those names a usable field, so nothing is evidence')
+  assert.equal(result.reason, undefined)
+  assert.doesNotThrow(() => resolveResources('acme_read', null, learned))
+})
+
+test('L6. an empty learned list leaves the heuristics exactly as they were', () => {
+  const withEmpty = resolveResources('third_party_tool', deepFreeze({ query: 'hello' }), [])
+  const without = resolveResources('third_party_tool', deepFreeze({ query: 'hello' }))
+  assert.deepEqual(withEmpty, without)
+})
+
+test('L7. learned fields never change a MODELLED tool', () => {
+  // `read` knows its own field: a learned `file_path` must not add a second
+  // resource, and a learned field it does not have must not invent one.
+  const result = resolveResources('read', deepFreeze({ file_path: 'D:/x' }), [
+    { field: 'file_path', capability: CAPABILITY.WRITE },
+    { field: 'other', capability: CAPABILITY.WRITE },
+  ])
+  assert.deepEqual(result.resources, [{ value: 'D:/x', capability: CAPABILITY.READ, field: 'file_path' }])
+  assert.equal(result.known, true)
+  assert.equal(result.capability, CAPABILITY.READ)
+})
+
+test('L8. the shape-leg wording survives when nothing was learned', () => {
+  const result = resolveResources('third_party_tool', deepFreeze({ path: 'C:/x' }))
+  assert.match(result.reason!, /的取值形态是路径/)
+  assert.equal(result.reason!.includes('此前从拒绝中学到'), false)
+})

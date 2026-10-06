@@ -1,6 +1,6 @@
 {
   "name": "dsh-path-guard",
-  "version": "0.2.4",
+  "version": "0.2.10",
   "private": true,
   "type": "module",
   "description": "Path-level access control for AI file access, effective even under danger-full-access.",
@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "node --test tests/policy.spec.ts tests/resource.spec.ts tests/fs-guard.spec.ts tests/host.spec.ts tests/redact.spec.ts tests/notify.spec.ts tests/build.spec.ts"
+    "test": "node --test tests/policy.spec.ts tests/resource.spec.ts tests/fs-guard.spec.ts tests/host.spec.ts tests/redact.spec.ts tests/notify.spec.ts tests/tracking.spec.ts tests/build.spec.ts"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"

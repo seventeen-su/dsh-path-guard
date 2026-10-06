@@ -232,8 +232,21 @@ export function redactTextBlocks(content: unknown, needles: Needle[], windows: b
   const next = content.map((block) => {
     if (block === null || typeof block !== 'object') return block
     if (block.type !== 'text' || typeof block.text !== 'string') return block
+    const text = block.text as string
+    // Whole-block gate (audit A2). It is a pure SKIP, never a decision:
+    //   - a line is a substring of its block, so a needle inside a line is
+    //     inside the block;
+    //   - the `\\` -> `\` collapse is LINE-LOCAL: a backslash pair cannot
+    //     straddle the `\n` between two lines, so collapse(block) is exactly
+    //     collapse(l1) + '\n' + … + collapse(ln), keeping every collapsed line a
+    //     substring of the collapsed block.
+    // A clean block therefore proves every line clean, and the per-line work —
+    // split + a toLowerCase + one includes per needle PER LINE — is skipped.
+    // A block that does hit falls through to the unchanged per-line loop, so the
+    // gate can never withhold something the old code would have kept.
+    if (scanCommand(text, needles, windows) === undefined) return block
     let blockChanged = false
-    const kept = (block.text as string).split('\n').map((line: string) => {
+    const kept = text.split('\n').map((line: string) => {
       if (scanCommand(line, needles, windows) === undefined) return line
       blockChanged = true
       return WITHHELD_LINE

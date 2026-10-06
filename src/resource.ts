@@ -114,6 +114,21 @@ interface KnownTool {
 }
 
 /**
+ * A field name learned from a previous refusal (`src/tracking.ts`).
+ *
+ * `capability` is a plain string on purpose: this value round-trips through a
+ * persisted file, so it is untrusted input at this boundary, and anything
+ * unrecognised becomes WRITE — the strictest rung — inside
+ * {@link learnedCapabilityOf} rather than being trusted because it was written
+ * down once.
+ */
+interface LearnedField {
+  field: string
+  /** Written as `| undefined` on purpose: a hand-edited or corrupt file may carry an explicit null-ish capability, and that is exactly what must be tolerated. */
+  capability?: string | undefined
+}
+
+/**
  * The modelled tool table, keyed by tool name.
  *
  * The explicit key list keeps literal access (`KNOWN_TOOLS.glob.paths`)
@@ -154,6 +169,8 @@ interface ScanResult {
   resources: Resource[]
   actionable: Resource[]
   noted: Resource[]
+  /** The subset of `actionable` that matched a LEARNED field name. */
+  learnedHits: Resource[]
   opaque: boolean
   truncated: boolean
 }
@@ -212,6 +229,53 @@ export const KNOWN_TOOLS: KnownToolTable = Object.freeze({
  * scan channel instead of guessing.
  */
 export const OPAQUE_TOOLS = new Set(['bash', 'pwsh', 'terminal_open', 'terminal_send', 'workflow'])
+
+/**
+ * DSH's own built-in tools that have been CHECKED to take no filesystem path.
+ *
+ * This is a modelling statement, not a vendor exemption: the reason these tools
+ * are listed is that every one of them was read and none of them names a file.
+ * Their arguments are prose or identifiers — a task's text, a job id, a search
+ * query, an agent's prompt — and prose routinely CONTAINS something that looks
+ * like a path.
+ *
+ * The failure that produced this list, reproduced live before it was written:
+ * `todo_write({ todos: [{ content: 'C:/Users/…/.ssh/config' }] })` was REFUSED
+ * with the `~/.ssh` rule's own message. `todo_write` writes a task list; it never
+ * opens a file, so refusing it protected nothing and simply broke the tool.
+ *
+ * The unmodelled heuristic cannot tell "a path argument" from "prose that is a
+ * path" — only the field NAME could, and this list is the honest version of that
+ * judgement: verified per tool, rather than guessed per value shape. A tool that
+ * genuinely touches the filesystem belongs in {@link KNOWN_TOOLS} with its path
+ * fields instead.
+ *
+ * Known limits: it is static, so a future DSH built-in is unmodelled until it is
+ * added (it then behaves like any other third-party tool, and `trustedTools`
+ * covers it). A tool that later GROWS a path argument must move to
+ * {@link KNOWN_TOOLS} — this table says "checked", not "trusted".
+ */
+export const RESOURCE_FREE_TOOLS: ReadonlySet<string> = new Set([
+  // Task bookkeeping: text and status only.
+  'todo_write',
+  // Background jobs: ids, never paths.
+  'job_output', 'job_list', 'job_kill',
+  // Reminders: text plus timings.
+  'schedule_list', 'schedule_delete', 'schedule_update', 'schedule_create',
+  // Network, not the filesystem. A URL is not a path this plugin protects.
+  'web_search', 'web_fetch',
+  // A skill NAME (`skill-filesystem` and friends are the tool's own fixtures).
+  'skill',
+  // Conversation and planning surfaces: prose in, prose out.
+  'ask_user_question', 'exit_plan_mode', 'create_goal', 'get_goal', 'update_goal',
+  // Team and subagent orchestration. The CHILD's tool calls are governed by this
+  // same guard, so the parent's prompt text needs no path judgement. (`team_task_*`
+  // carries advisory `write_scopes`; a task-board write touches no file, and the
+  // actual write is caught where it happens.)
+  'list_agents', 'wait_agent', 'send_message', 'spawn_teammate', 'interrupt_agent',
+  'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update',
+  'subagent', 'subagent_fork',
+])
 
 /**
  * Tools that reach the filesystem through a process or loop this plugin can
@@ -318,6 +382,47 @@ function inferCapability(name: unknown): Capability {
   if (tokens.some(token => WRITE_HINTS.has(token))) return CAPABILITY.WRITE
   if (tokens.some(token => READ_HINTS.has(token))) return CAPABILITY.READ
   if (tokens.some(token => LIST_HINTS.has(token))) return CAPABILITY.LIST
+  return CAPABILITY.WRITE
+}
+
+/**
+ * The lookup key a LEARNED field is matched under.
+ *
+ * A learned field arrives in the accessor notation a resource was reported
+ * under — `file_path`, `files[].path`, `config.output.path`, `args.0` — so the
+ * key is its LAST dot-segment with array markers stripped: all three compound
+ * forms above key on `path`/`0`. That is what turns "this tool was refused for
+ * `files[].path`" into "the `path` argument of this tool carries paths", without
+ * inventing a rule per notation.
+ *
+ * Matching is case-insensitive, mirroring the Windows comparison semantics the
+ * rest of the plugin uses for paths.
+ * @param {unknown} notation - a learned field notation.
+ * @returns {string} the lowercase key, or `''` when there is nothing to match.
+ */
+function learnedKeyOf(notation: unknown): string {
+  if (typeof notation !== 'string') return ''
+  const segments = notation.split('.').filter(segment => segment !== '')
+  const last = segments[segments.length - 1] ?? ''
+  return last.replace(/\[\]/g, '').trim().toLowerCase()
+}
+
+/**
+ * Read a capability that came from persisted learned data.
+ *
+ * ALWAYS `write`, whatever the file says. A learned field exists because a rule
+ * refused a path the field carried, so the strictest rung is the only value the
+ * evidence supports. Accepting a weaker value — `list` is a perfectly valid enum
+ * member — let a hand-written `path-guard-tools.json` DOWNGRADE a refusal into
+ * an allow, which is exactly backwards for a file the model can write. A file we
+ * cannot vouch for may only ever make the plugin stricter.
+ * @param {unknown} value - the persisted capability (deliberately ignored).
+ * @returns {Capability} always {@link CAPABILITY.WRITE}.
+ */
+function learnedCapabilityOf(value: unknown): Capability {
+  // The parameter is kept so the call sites read clearly and a future "learned
+  // from a genuinely weaker operation" case has an obvious place to branch.
+  void value
   return CAPABILITY.WRITE
 }
 
@@ -518,14 +623,25 @@ function resolveKnown(spec: KnownTool, args: unknown): Resolution {
  * Walk an unmodelled tool's arguments and collect the resources the heuristics
  * can see, plus whether any argument is an opaque program.
  * @param {unknown} args - the parsed tool arguments.
+ * @param {ReadonlyArray<LearnedField>} [learned] - fields earlier refusals taught.
  * @returns {ScanResult} what was found.
  */
-function scanUnknownArgs(args: unknown): ScanResult {
+function scanUnknownArgs(args: unknown, learned?: ReadonlyArray<LearnedField>): ScanResult {
   const resources: Resource[] = []
   /** Values whose SHAPE is a path: real evidence, safe to refuse on. */
   const actionable: Resource[] = []
   /** Values collected on the field-NAME leg alone: reported, never a ground to refuse. */
   const noted: Resource[] = []
+  /** The actionable subset that matched a LEARNED field name. */
+  const learnedHits: Resource[] = []
+  // Learned fields are keyed by their last segment (see `learnedKeyOf`), so a
+  // refusal of `files[].path` also teaches the plain `path` argument.
+  const learnedTable = new Map<string, Capability>()
+  for (const entry of learned ?? []) {
+    if (entry === null || typeof entry !== 'object') continue
+    const key = learnedKeyOf(entry.field)
+    if (key !== '') learnedTable.set(key, learnedCapabilityOf(entry.capability))
+  }
   const seen = new WeakSet<object>()
   let opaque = false
   let truncated = false
@@ -544,6 +660,18 @@ function scanUnknownArgs(args: unknown): ScanResult {
   const visit = (raw: string, field: string, key: string) => {
     const trimmed = raw.trim()
     if (trimmed === '') return
+    // A field this plugin has already LEARNED about (from a refusal) is judged
+    // by NAME: every non-empty string in it is a path, whatever its shape. That
+    // is what the registry buys — precise knowledge for this field instead of
+    // the value-shape guess below.
+    const learnedCapability = learnedTable.get(key.trim().toLowerCase())
+    if (learnedCapability !== undefined) {
+      const taught: Resource = { value: trimmed, capability: learnedCapability, field }
+      resources.push(taught)
+      actionable.push(taught)
+      learnedHits.push(taught)
+      return
+    }
     const named = looksLikePathName(key)
     const valueShaped = looksLikePathValue(trimmed)
     if (!named && looksLikeProgramField(key, trimmed)) opaque = true
@@ -594,31 +722,42 @@ function scanUnknownArgs(args: unknown): ScanResult {
   }
 
   walk(args, '', '', 0)
-  return { resources, actionable, noted, opaque, truncated }
+  return { resources, actionable, noted, learnedHits, opaque, truncated }
 }
 
 /**
  * Resolve a modelled tool's resources, or heuristically resolve an unmodelled
  * one. Never throws for non-object arguments.
  * @param {string} toolName - the model-facing tool name.
- * @param {unknown} args - the parsed, deep-frozen tool arguments.
+ * @param {unknown} args - the parsed tool arguments.
+ * @param {ReadonlyArray<LearnedField>} [learned] - fields earlier refusals taught
+ *   about this tool (`src/tracking.ts`). Only unmodelled tools consult them: a
+ *   modelled tool already knows exactly which of its fields are paths.
  * @returns {Resolution} the resolution. `reason` present means the call MUST be refused; `note` is informational only.
  *
  * `toolName` is typed `unknown` on purpose: the guard below is the contract, and
  * callers really do hand over non-strings (the specs pin that down). Widening it
  * from `string` is type-only — the runtime is unchanged.
  */
-export function resolveResources(toolName: unknown, args: unknown): Resolution {
+export function resolveResources(toolName: unknown, args: unknown, learned?: ReadonlyArray<LearnedField>): Resolution {
   const name = typeof toolName === 'string' ? toolName : ''
 
   if (OPAQUE_TOOLS.has(name)) {
     return { known: true, capability: CAPABILITY.EXECUTE, resources: [], opaque: true }
   }
 
+  // Checked to touch nothing: `known: true` with an empty resource list IS that
+  // statement, and it short-circuits the unmodelled heuristics below — which is
+  // the point, because those heuristics judge argument TEXT and prose contains
+  // path-shaped words.
+  if (RESOURCE_FREE_TOOLS.has(name)) {
+    return { known: true, capability: CAPABILITY.EXECUTE, resources: [], opaque: false }
+  }
+
   const spec = KNOWN_TOOLS[name]
   if (spec !== undefined) return resolveKnown(spec, args)
 
-  const { resources, actionable, noted, opaque, truncated } = scanUnknownArgs(args)
+  const { resources, actionable, noted, learnedHits, opaque, truncated } = scanUnknownArgs(args, learned)
   const capabilities: Capability[] = resources.map(resource => resource.capability)
   if (opaque) capabilities.push(CAPABILITY.EXECUTE)
 
@@ -633,7 +772,18 @@ export function resolveResources(toolName: unknown, args: unknown): Resolution {
 
   // The caller needs the grounds for a fail-closed decision, not just the list.
   if (actionable.length > 0) {
-    result.reason = `工具 \`${name}\` 未被建模，但参数 ${fieldsOf(actionable)} 的取值形态是路径；`
+    // Say which leg produced the evidence. A refusal on a LEARNED field is not
+    // "the value looked like a path" — it is knowledge carried over from an
+    // earlier refusal, and a message claiming otherwise would mislead the user
+    // who has to decide whether to trust the tool.
+    const shaped = fieldsOf(actionable.filter(resource => !learnedHits.includes(resource)))
+    const taught = fieldsOf(learnedHits)
+    const grounds = taught === ''
+      ? `但参数 ${fieldsOf(actionable)} 的取值形态是路径；`
+      : shaped === ''
+        ? `但参数 ${taught} 是此前从拒绝中学到的路径字段；`
+        : `但参数 ${shaped} 的取值形态是路径，参数 ${taught} 是此前从拒绝中学到的路径字段；`
+    result.reason = `工具 \`${name}\` 未被建模，${grounds}`
       + `按最严能力「${result.capability}」处理（fail-closed）。`
     if (truncated) {
       result.reason += ` 另有参数嵌套超过 ${MAX_ARG_DEPTH} 层，未能确认其中是否含路径。`
@@ -676,6 +826,11 @@ export function resolveResources(toolName: unknown, args: unknown): Resolution {
 export function isGoverned(toolName: unknown): boolean {
   const name = typeof toolName === 'string' ? toolName : ''
   if (name === '') return false
+  // A tool this plugin has verified touches no file is NOT its business — so an
+  // internal error must not fail closed on it. Without this line the entry above
+  // would make `isGoverned` say "yes" and a plugin bug would take `todo_write`
+  // away, which is the exact inverse of the fix.
+  if (RESOURCE_FREE_TOOLS.has(name)) return false
   if (KNOWN_TOOLS[name] !== undefined) return true
   if (OPAQUE_TOOLS.has(name)) return true
   if (EXOTIC_TOOLS.has(name)) return true

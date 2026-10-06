@@ -20,6 +20,8 @@ import {
   redactGlobValue,
   redactGrepValue,
 } from '../src/redact.ts'
+import { redactTextBlocks, scanCommand } from '../src/scan.ts'
+import type { Needle } from '../src/scan.ts'
 
 /** The declared `glob` value shape (glob.ts:321-329). */
 interface GlobValue {
@@ -515,5 +517,342 @@ describe('search-result redaction end to end (value shapes as the runtime hands 
     // `list` file names stay visible to glob but their CONTENT must not survive grep.
     assert.equal(globResult.value.paths.includes('package.json'), true)
     assert.equal(JSON.stringify(grepResult.value).includes('package.json'), false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// `redactTextBlocks` — whole-block no-hit gate (reports/audit-efficiency.md A2)
+//
+// The gate returns the block untouched as soon as ONE whole-block scan finds
+// nothing, instead of splitting it and scanning every line. Equivalence rests on
+// two facts, and these tests check both rather than assuming them:
+//
+//   1. every line is a substring of its block, so a needle inside a line is
+//      inside the block;
+//   2. the `\\` -> `\` collapse is LINE-LOCAL — a pair of backslashes can never
+//      straddle the `\n` between two lines, so
+//      `collapse(block) === collapse(l1) + '\n' + … + collapse(ln)`
+//      and each collapsed line is a substring of the collapsed block.
+//
+// Fact 2 is the one that is easy to get wrong, so it is exercised by an
+// exhaustive sweep over a `{a, b, \, \n}` alphabet (every string up to length 7),
+// not only by hand-picked cases. The oracle is a VERBATIM copy of the original
+// per-line implementation, never the optimized function against itself.
+// ---------------------------------------------------------------------------
+
+/**
+ * The withheld-line marker, read from the implementation once via a probe.
+ * Taking it from a probe instead of repeating the literal keeps the oracle an
+ * ALGORITHM copy: a marker change cannot silently desync the two.
+ */
+const WITHHELD_LINE: string = (() => {
+  const probe: Needle = { needle: 'NEEDLE-TEXT', pattern: 'probe', access: 'none' }
+  const result = redactTextBlocks([{ type: 'text', text: 'x NEEDLE-TEXT y' }], [probe], false)
+  const first = (result.content as Array<{ text?: unknown }>)[0]
+  assert.equal(typeof first?.text, 'string', 'probe: a matching line must be withheld')
+  return (first as { text: string }).text
+})()
+
+/**
+ * The ORIGINAL per-line `redactTextBlocks`, copied verbatim (src/scan.ts:229-246
+ * before the A2 gate) and used as the equivalence oracle.
+ */
+function redactTextBlocksReference(content: unknown, needles: Needle[], windows: boolean): { changed: boolean, content: unknown } {
+  if (!Array.isArray(content) || needles.length === 0) return { changed: false, content }
+  let changed = false
+  const next = content.map((block) => {
+    if (block === null || typeof block !== 'object') return block
+    if (block.type !== 'text' || typeof block.text !== 'string') return block
+    let blockChanged = false
+    const kept = (block.text as string).split('\n').map((line: string) => {
+      if (scanCommand(line, needles, windows) === undefined) return line
+      blockChanged = true
+      return WITHHELD_LINE
+    })
+    if (!blockChanged) return block
+    changed = true
+    return { ...block, text: kept.join('\n') }
+  })
+  return changed ? { changed: true, content: next } : { changed: false, content }
+}
+
+/** The audit's needle shape: 28 protected paths x {forward, back} slash spellings = 56 needles. */
+function auditNeedles(): Needle[] {
+  return Array.from({ length: 28 }, (_, i) => `D:/proj/secret-area-${i}/vault`)
+    .flatMap((base) => [
+      { needle: base, pattern: `${base}/**`, access: 'none' },
+      { needle: base.replaceAll('/', '\\'), pattern: `${base}/**`, access: 'none' },
+    ])
+}
+
+/** One line of ordinary tool output that mentions no needle. */
+function cleanLine(i: number): string {
+  return `  at step ${i}: compiled src/module-${i % 17}/index.ts -> dist/chunk-${i}.js in ${100 + (i % 900)}ms`
+}
+
+/** `count` clean lines starting at `from`, joined by `\n`. */
+function cleanText(from = 0, count = 40): string {
+  return Array.from({ length: count }, (_, i) => cleanLine(from + i)).join('\n')
+}
+
+/** A raw forward-slash hit, a single-backslash hit, and a hit that needs the collapse pass. */
+const HIT_RAW = 'cat "D:/proj/secret-area-3/vault/keys.txt"'
+const HIT_BACK = 'type D:\\proj\\secret-area-11\\vault\\notes.txt'
+const HIT_ESCAPED = 'readFileSync("D:\\\\proj\\\\secret-area-7\\\\vault\\\\id_rsa")'
+
+/** Class 1 — every block clean (the common case the gate must skip). */
+function cleanContent(): unknown {
+  return Array.from({ length: 6 }, (_, b) => ({ type: 'text', text: cleanText(b * 40) }))
+}
+
+/** Class 2 — some blocks hit, some clean, hits at first/middle/last line. */
+function mixedContent(): unknown {
+  return [
+    { type: 'text', text: cleanText(0) },
+    { type: 'text', text: `${cleanText(40, 20)}\n${HIT_RAW}\n${cleanText(60, 19)}` },
+    { type: 'text', text: cleanText(80) },
+    { type: 'text', text: `${HIT_RAW}\n${cleanText(120, 38)}\n${HIT_BACK}` },
+    { type: 'text', text: 'no newline and no needle at all' },
+    { type: 'text', text: HIT_RAW },
+  ]
+}
+
+/** Class 3 — escaped (doubled) backslashes, the collapse pass, CRLF, and odd/even runs. */
+function escapedContent(): unknown {
+  return [
+    // Only the COLLAPSED spelling matches, so the gate must not skip this block.
+    { type: 'text', text: `${HIT_ESCAPED}\n${cleanText(0, 39)}` },
+    // Doubled backslashes but no needle: the collapse pass runs and finds nothing.
+    { type: 'text', text: Array.from({ length: 20 }, (_, i) => `  json{"p":"D:\\\\logs\\\\app-${i}.log"}`).join('\n') },
+    // A backslash pair split by the line boundary: it must NOT be collapsed across it.
+    { type: 'text', text: 'tail\\\n\\head\nplain\\\n\\plain' },
+    // Odd runs at both ends of a line, next to the boundary.
+    { type: 'text', text: `odd\\\n\\\\\n${HIT_BACK}\r\n${cleanText(80, 20)}` },
+  ]
+}
+
+/**
+ * Assert the optimized function is indistinguishable from the oracle: same
+ * `changed`, same input-reference reuse, same structure, same JSON bytes, and
+ * same bytes for every rewritten block text.
+ */
+function assertSameAsReference(label: string, content: unknown, needles: Needle[], windows: boolean): { changed: boolean, content: unknown } {
+  const expected = redactTextBlocksReference(content, needles, windows)
+  const actual = redactTextBlocks(content, needles, windows)
+
+  assert.equal(actual.changed, expected.changed, `${label}: changed flag`)
+  assert.equal(actual.content === content, expected.content === content, `${label}: input-reference reuse`)
+  assert.deepEqual(actual.content, expected.content, `${label}: structure`)
+  assert.equal(JSON.stringify(actual), JSON.stringify(expected), `${label}: JSON bytes`)
+
+  const texts = (result: { content: unknown }): string[] =>
+    (Array.isArray(result.content) ? result.content : []).map((block) =>
+      block !== null && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+        ? (block as { text: string }).text
+        : '')
+  const actualTexts = texts(actual)
+  const expectedTexts = texts(expected)
+  assert.equal(actualTexts.length, expectedTexts.length, `${label}: block count`)
+  for (let i = 0; i < actualTexts.length; i += 1) {
+    assert.ok(
+      Buffer.from(actualTexts[i] as string, 'utf8').equals(Buffer.from(expectedTexts[i] as string, 'utf8')),
+      `${label}: block ${i} is not byte-identical`,
+    )
+  }
+  return actual
+}
+
+/** Every string over `alphabet` up to and including `maxLen` ('' first). */
+function allStringsOver(alphabet: string[], maxLen: number): string[] {
+  const out: string[] = ['']
+  let frontier: string[] = ['']
+  for (let len = 1; len <= maxLen; len += 1) {
+    const next: string[] = []
+    for (const prefix of frontier) for (const char of alphabet) next.push(prefix + char)
+    out.push(...next)
+    frontier = next
+  }
+  return out
+}
+
+/** Needles chosen to be sensitive to the `\\` -> `\` collapse. */
+const FUZZ_NEEDLES: Needle[] = [
+  { needle: 'ab', pattern: 'fuzz', access: 'none' },
+  { needle: 'a\\b', pattern: 'fuzz', access: 'none' },
+  { needle: 'a\\\\b', pattern: 'fuzz', access: 'none' },
+  { needle: '\\\\', pattern: 'fuzz', access: 'none' },
+  { needle: 'a\\', pattern: 'fuzz', access: 'none' },
+  { needle: '\\b', pattern: 'fuzz', access: 'none' },
+]
+
+describe('redactTextBlocks: whole-block gate (A2)', () => {
+  const needles = auditNeedles()
+
+  it('uses the audit needle shape (56 needles)', () => {
+    assert.equal(needles.length, 56)
+    assert.equal(new Set(needles.map((n) => n.needle)).size, 56)
+  })
+
+  it('is byte-identical to the per-line oracle on clean, mixed and escaped inputs', () => {
+    const clean = assertSameAsReference('clean', cleanContent(), needles, false)
+    const mixed = assertSameAsReference('mixed', mixedContent(), needles, false)
+    const escaped = assertSameAsReference('escaped', escapedContent(), needles, false)
+
+    assert.equal(clean.changed, false, 'clean input must report no change')
+    assert.equal(mixed.changed, true, 'mixed input must report a change')
+    assert.equal(escaped.changed, true, 'escaped input must report a change')
+  })
+
+  it('is byte-identical to the per-line oracle with case-insensitive matching', () => {
+    const upper = [{ type: 'text', text: `CAT "D:/PROJ/SECRET-AREA-3/VAULT/KEYS.TXT"\n${cleanText(0, 20)}` }]
+    const result = assertSameAsReference('windows', upper, needles, true)
+    assert.equal(result.changed, true)
+    assert.equal(assertSameAsReference('windows-clean', cleanContent(), needles, true).changed, false)
+  })
+
+  it('agrees with the oracle on the sharp line-boundary backslash cases', () => {
+    const cases = [
+      'a\\\nb',            // 1 + 1 backslashes split by the boundary: no pair either side
+      'a\\\\\nb',          // a collapsed pair before the boundary
+      'a\n\\\\b',          // a collapsed pair after the boundary
+      'a\\\n\\\\b',        // odd before, even after
+      'a\\\\\n\\\\b',      // even before, even after
+      'a\\\\\\\nb',        // three backslashes: greedy left-to-right pairing
+      'a\\\\\\\n\\\\\\b',  // three and three
+      'a\\\\b\na\\\\b',    // the same collapsed hit on two lines
+      'a\\b\r\na\\\\b',    // CRLF between two spellings
+      '\\\\',              // a bare pair
+      '\\',                // a bare single backslash
+      '\n\n\\\n\n',        // empty lines around a backslash
+    ]
+    for (const text of cases) {
+      assertSameAsReference(`boundary ${JSON.stringify(text)}`, [{ type: 'text', text }], FUZZ_NEEDLES, false)
+    }
+  })
+
+  it('agrees with the oracle on an exhaustive {a, b, \\, \\n} sweep up to length 7', () => {
+    const cases = allStringsOver(['a', 'b', '\\', '\n'], 7)
+    assert.ok(cases.length >= 21_000, `sweep should cover a real input space, got ${cases.length}`)
+    const mismatches: string[] = []
+    for (const text of cases) {
+      const content = [{ type: 'text', text }]
+      const expected = redactTextBlocksReference(content, FUZZ_NEEDLES, false)
+      const actual = redactTextBlocks(content, FUZZ_NEEDLES, false)
+      if (actual.changed !== expected.changed || JSON.stringify(actual) !== JSON.stringify(expected)) {
+        mismatches.push(JSON.stringify(text))
+        if (mismatches.length >= 5) break
+      }
+    }
+    assert.deepEqual(mismatches, [], `exhaustive sweep disagreed on ${cases.length} inputs (first 5 shown)`)
+  })
+
+  it('agrees with the oracle on an exhaustive sweep with case folding enabled', () => {
+    const cases = allStringsOver(['A', 'b', '\\', '\n'], 5)
+    const mismatches: string[] = []
+    for (const text of cases) {
+      const content = [{ type: 'text', text }]
+      const expected = redactTextBlocksReference(content, FUZZ_NEEDLES, true)
+      const actual = redactTextBlocks(content, FUZZ_NEEDLES, true)
+      if (actual.changed !== expected.changed || JSON.stringify(actual) !== JSON.stringify(expected)) {
+        mismatches.push(JSON.stringify(text))
+        if (mismatches.length >= 5) break
+      }
+    }
+    assert.deepEqual(mismatches, [], `case-folding sweep disagreed (first 5 of ${cases.length})`)
+  })
+
+  it('agrees with the oracle on empty, non-text, needle-less and non-array inputs', () => {
+    const shapes: Array<[string, unknown]> = [
+      ['empty array', []],
+      ['not an array', 'nope'],
+      ['null', null],
+      ['empty text block', [{ type: 'text', text: '' }]],
+      ['trailing newline', [{ type: 'text', text: 'a\n' }]],
+      ['leading newline', [{ type: 'text', text: '\na' }]],
+      ['only newlines', [{ type: 'text', text: '\n\n\n' }]],
+      ['non-text block', [{ type: 'image', text: HIT_RAW }]],
+      ['text is not a string', [{ type: 'text', text: 42 }]],
+      ['null block', [null]],
+      ['string block', ['raw']],
+      ['mixed shapes', [null, 'raw', { type: 'image' }, { type: 'text', text: HIT_RAW }]],
+    ]
+    for (const [label, content] of shapes) {
+      assertSameAsReference(label, content, needles, false)
+      // A needle-less rule set short-circuits in both implementations.
+      assertSameAsReference(`${label} (no needles)`, content, [], false)
+    }
+  })
+
+  it('skips the per-line pass entirely for a clean block (needle reads)', () => {
+    let reads = 0
+    const counting: Needle[] = Array.from({ length: 56 }, (_, i) => ({
+      get needle() { reads += 1; return `D:/proj/never-${i}/vault` },
+      pattern: `D:/proj/never-${i}/vault/**`,
+      access: 'none',
+    }))
+
+    // 100 clean lines: the old per-line code reads all 56 needles per LINE (5600);
+    // the gate makes it exactly one whole-block scan (56).
+    const clean = [{ type: 'text', text: cleanText(0, 100) }]
+    const before = reads
+    const cleanResult = redactTextBlocks(clean, counting, false)
+    assert.equal(cleanResult.changed, false)
+    assert.equal(reads - before, 56, 'a clean block must cost exactly one whole-block scan')
+
+    // A hit on the LAST line still falls back to the per-line pass, so the reads
+    // must be far above one whole-block scan.
+    const countingHit = 'cat "D:/proj/never-0/vault/keys.txt"'
+    const dirty = [{ type: 'text', text: `${cleanText(0, 99)}\n${countingHit}` }]
+    const dirtyBefore = reads
+    const dirtyResult = redactTextBlocks(dirty, counting, false)
+    assert.equal(dirtyResult.changed, true)
+    assert.ok(reads - dirtyBefore > 56 * 50, `a hit must still scan per line, got ${reads - dirtyBefore} reads`)
+  })
+
+  it('still withholds per line when the block has a hit', () => {
+    const text = `${cleanText(0, 3)}\n${HIT_RAW}\n${cleanText(10, 2)}`
+    const input = [{ type: 'text', text }]
+    const result = redactTextBlocks(input, needles, false)
+
+    assert.equal(result.changed, true)
+    const blocks = result.content as Array<{ text: string }>
+    assert.notEqual(blocks, input, 'a changed result must be a new array')
+    const lines = blocks[0]!.text.split('\n')
+    assert.equal(lines.length, 6)
+    assert.deepEqual(lines[3], WITHHELD_LINE, 'the offending line is replaced by the marker')
+    assert.deepEqual(lines.slice(0, 3), cleanText(0, 3).split('\n'), 'clean lines are untouched')
+    assert.deepEqual(lines.slice(4), cleanText(10, 2).split('\n'), 'clean lines after the hit are untouched')
+  })
+
+  it('keeps untouched blocks identical and only rebuilds matching blocks', () => {
+    const input = [
+      { type: 'text', text: cleanText(0) },
+      { type: 'text', text: HIT_RAW },
+      { type: 'image', source: 'x' },
+      { type: 'text', text: cleanText(80) },
+    ]
+    const result = redactTextBlocks(input, needles, false)
+    const blocks = result.content as unknown[]
+
+    assert.equal(result.changed, true)
+    assert.equal(blocks[0], input[0], 'a clean block keeps its object identity')
+    assert.notEqual(blocks[1], input[1], 'the matching block is rebuilt')
+    assert.equal(blocks[2], input[2], 'a non-text block keeps its object identity')
+    assert.equal(blocks[3], input[3], 'a clean block keeps its object identity')
+  })
+
+  it('is skip-only: a gate hit whose per-line pass finds nothing changes nothing', () => {
+    // A needle spanning a newline can never be inside a LINE (the documented
+    // limit, src/scan.ts:219-222). The whole-block gate DOES see it, so this is
+    // exactly the case where the gate fires and the per-line pass still decides.
+    const spanning: Needle = { needle: 'alpha\nbeta', pattern: 'spanning', access: 'none' }
+    const content = [{ type: 'text', text: 'alpha\nbeta\ngamma' }]
+    const expected = redactTextBlocksReference(content, [spanning], false)
+    const actual = redactTextBlocks(content, [spanning], false)
+
+    assert.equal(expected.changed, false)
+    assert.equal(actual.changed, false, 'the gate must not withhold on its own')
+    assert.equal(actual.content, content, 'nothing changed, so the input is returned as-is')
+    assert.equal(JSON.stringify(actual), JSON.stringify(expected))
   })
 })

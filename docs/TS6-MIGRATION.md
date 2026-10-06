@@ -1,6 +1,9 @@
 # TS 6.0.3 迁移：状态与续做配方
 
-> 本文件是**进行中**迁移的交接文档。基线：迁移前 `node --test` 六个 spec = **239 pass / 0 fail**。
+> **状态：已完成（2026-10-06）。** `npm run typecheck` 三套 tsconfig **零错误**；
+> `npm test` = **301 pass / 0 fail**（8 个 spec）；客户端产物装载已由 `docs/ACCEPTANCE.md` §6 #9 关闭。
+> 基线：迁移前 `node --test` 六个 spec = **239 pass / 0 fail**。
+> 下面「剩余工作」一节保留为历史记录，**不要再按它续做**。
 
 ## 目标形态
 

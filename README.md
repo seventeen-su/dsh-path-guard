@@ -11,8 +11,11 @@
   | `write` | ✓ | ✓ | ✓ |
 - **豁免 = 更具体的规则**：`~/.ssh` 设为 `list`，再加一条 `~/.ssh/README.md` 设为 `read`，只读那一个文件。
 - **只对 AI 生效**：用户自己用 GUI 文件树/编辑器打开被保护文件不受影响。
-- **配置面**：DSH Web UI 的「设置 → 路径守卫」页面，改完立即生效。
-- **实现原则**：不接管任何服务、不覆盖任何上游 row，只经 4 个既有扩展点做增量拦截；卸载后无残留。
+- **配置面**：侧栏「插件」面板里本 bundle 的配置页，改完立即生效。
+- **实现原则**：不接管任何服务、不覆盖任何上游 row，只经 5 个既有扩展点做增量拦截
+  （工具层 3 个：`tools/pre-execute`、`ctx.tools.guard`、`tools/post-execute`；写入层 2 个：
+  `fs/write-intent`、`fs/edit-intent`）。另有一个**可选**的只读 HTTP 路由
+  `GET /path-guard/tools`（见「工具跟踪」一节），它不是拦截点。卸载后无残留。
 
 ## 安装
 
@@ -24,9 +27,13 @@ target: D:\Program\dsh-path-guard
 ```
 
 安装后 bundle 出现在 profile 的 bundles 列表里，插件行 `path-guard` 生效。
-配置页在 **设置 → 路径守卫**（命名空间 = row id `path-guard`）。
+配置页在**侧栏「插件」面板**：本 bundle 那一行上的「配置」，以及打开 bundle 卡片后的页面
+（命名空间 = row id `path-guard`）。
 
-**不需要任何安装脚本，也不需要构建步骤**：包是纯 JS，`install_bundle` 自己跑 `pnpm add`；
+**不需要安装脚本，但需要构建产物**：源码是 TypeScript，`npm run build` 把 `src/`、`client/`
+编译到 `lib/`，而 **`lib/` 是提交进仓库的产物**——`install_bundle` 只跑 `pnpm add`，**从不构建包**。
+所以改完源码必须自己 `npm run build` 并把 `lib/` 一起提交，否则 DSH 加载的仍是旧产物，
+**而且不会有任何报错**。`npm run typecheck` 跑三套 tsconfig 的类型检查。
 唯一的运行时依赖 `@deepseek-ai/schemastery` 写在 `dependencies` 里，由它一并装好。
 包名 `dsh-path-guard` 在 npm 上未被占用（不像 `dsh-desktop-notify` 那样存在同名包冲突风险）。
 
@@ -35,29 +42,36 @@ target: D:\Program\dsh-path-guard
 
 ## 在配置页里怎么改
 
-同一个编辑器注册在**三个地方**，你在哪找都能找到（都只在 bundle 启用、命名空间被服务时才出现）：
+同一个编辑器注册在**两个地方**，你在哪找都能找到（都只在 bundle 启用、命名空间被服务时才出现）：
 
 | 位置 | 插槽 |
 |---|---|
-| 设置对话框里独立的「路径守卫」导航项 | `settings.section` |
-| **插件列表 → dsh-path-guard 这一行上的「配置」** | `plugins.row.config`（key = `dsh-path-guard#path-guard`） |
-| 插件列表 → 打开该 bundle 卡片后的页面 | `plugins.bundle.config`（key = `dsh-path-guard`） |
+| **插件面板 → dsh-path-guard 这一行上的「配置」** | `plugins.row.config`（key = `dsh-path-guard#path-guard`） |
+| 插件面板 → 打开该 bundle 卡片后的页面 | `plugins.bundle.config`（key = `dsh-path-guard`） |
+
+刻意**没有** `settings.section` 导航项：官方客户端包里，`settings.section` 只由部署级页面
+（通用 / 模型 / 账户 / 代理预设）注册，插件自己的配置页一律注册到 `plugins.*`——两处都注册反而偏离标准。
 
 页面里能做的事：
 
-- **常用位置**：`~/.ssh` / `~/.aws` / `~/.gnupg` / `~/.docker` 一键加规则（点一下即可，之后可改档位）。
-- **每行的「浏览…」**：调 DSH 的目录选择器，把选中的目录填进该行，不用手打路径。
+- **路径规则表**：每行「路径 + 档位 + 备注」，可增行、删行、草稿式保存/放弃。
+- **每行的「浏览…」**：调 DSH 的目录选择器，把选中的目录填进该行，不用手打路径（无该 Remote 时按钮不出现）。
 - **档位下拉**：四档，选项文字直接写明该档允许什么。
-- **保存**：规则表是草稿式的——改完点「保存」才写回 profile；其余开关（总开关、默认档位、shell、exoticTools、自我保护、通知）改一下即时生效。
-- **「怎么用？看四个例子」**：页内展开的使用说明，含「完全禁止 / 仅文件名 / 只读 / 豁免」四个范例。
+- **工具信任表**：`match` 是一个既可直接输入、也可下拉选择的组合框——输入时按子串过滤
+  本插件已跟踪到的工具，点右侧箭头展开完整列表（见「工具跟踪」）。
+- **保存**：规则表与信任表是草稿式的——改完点「保存」才写回 profile；其余开关（总开关、默认档位、
+  shell、exoticTools、搜索脱敏、自我保护、通知）改一下即时生效。
+- **页内说明**：规则说明与信任说明**常驻显示**（曾经折叠在「看例子」按钮后面，那等于用一次点击
+  换更少的信息）。
 
 **豁免怎么写**：不需要特殊语法，**再加一条更具体的规则**就行。例如
 `~/.ssh` 设「仅文件名」，再写一条 `~/.ssh/README.md` 设「只读」——只有那一个文件可读。
 优先级是自动算的：先比命中目录的深度，再比字面量前缀长度，然后比通配符多少。
 
-> 客户端半页（`client/client.js`）**热重载**：改完刷新页面即可生效。
-> **宿主半页（`src/*.js`）不热重载**——Node 的 ESM 模块缓存不会因文件变化失效，
-> 需要在插件列表里把 bundle 关掉再打开（或在设置里禁用再启用），才会加载新的模块代。
+> 客户端半页（`client/client.ts` → `lib/client/client.js`）**热重载**：改完刷新页面即可生效。
+> **宿主半页（`src/*.ts` → `lib/*.js`）不热重载**——Node 的 ESM 模块缓存不会因文件变化失效，
+> 需要在插件面板里把 bundle 关掉再打开（或重启 DSH），才会加载新的模块代。
+> 注意：**两者都先要 `npm run build`**，`lib/` 才是真正被加载的那份。
 
 ## 规则写法
 
@@ -84,6 +98,7 @@ target: D:\Program\dsh-path-guard
 | `searchRedaction` | `true` | 把 `glob`/`grep` 结果里落在受保护路径上的条目剔除 |
 | `shell` | `scan` | `scan` 扫描 shell 命令文本；`deny` 直接禁掉 shell；`off` 不处理（已知漏洞） |
 | `exoticTools` | `deny` | 拒绝插件层无法观察的通道（MCP 工具、`run_code`、外部子代理） |
+| `unknownTools` | `check` | 未建模工具的判定档：`check` 只按规则判定它在参数里报出的路径（推荐）；`deny` 只要参数看起来像路径就拒（更严，会误伤）。本插件已逐个核对「不接触文件系统」的内置工具不受这一档影响。 |
 | `selfProtection` | `true` | 自我保护，**范围很窄**（见下）：① 禁止 AI 用文件工具改写 profile 组合文件；② `plugin_manager` 里**指名本插件**的动作被拒；③ `install_bundle`：注册表包名放行，**本地路径安装前会被实际读一遍**（有安装脚本或补丁提到本插件 → 拒；否则放行），git/tarball/URL 一律拒。**装注册表上的包、开关别的插件、装本地开发的插件都照常可用。** |
 
 ## 能挡住什么、挡不住什么
@@ -141,12 +156,89 @@ target: D:\Program\dsh-path-guard
 - 未建模工具通知**刻意不传 `sessionId`**：`push` 会在你正看着该会话时静默，而这条通知恰恰是为了你正看着它的那一刻——工具调用就发生在当前会话里，带会话门控等于永远收不到。它只带 `click: { type:'page', page:'plugins' }`。
 - **已知边界（上游的，不是本插件能修的）**：`page` 目标的白名单只有 `settings-plugins` 与 `plugins` 两个裸值，**没有携带 bundle 名的形态**；而 `page:plugins` 的处理里，`dsh-desktop-notify` 优先调用 `pluginNavigation.openBundle('dsh-desktop-notify')`——那个 bundle 名是**硬编码**的（其 `lib/client.js:187` / `src/client.ts:163`），所以面板会先停在它自己的包页，而不是列表。要让它直接落到本插件那一行，需要上游把 bundle 名从目标里取出来，而不是写死。
 
-实现方式：调用它对外注册的 Cordis 服务 `desktopNotify`（`push` / `pushAlways`），
+实现方式：调用它对外注册的 Cordis 服务 `desktopNotify`，
 **按可选服务处理**（`ctx.get('desktopNotify')` 每次现取）——没装该插件就什么都不发生，
 中途装上也能立即生效。同一拦截原因有 10 秒节流，避免模型反复重试时刷屏。
 
+**按上游协议对接**（`apiVersion` 基线 `1.0.0`；对接时实装 2.0.0，1.x 起的字段语义未变）：
+
+- 每条载荷声明 `v: '1.0.0'`。上游契约明确写了两条：**未知字段一律忽略**（不报错、不猜测），
+  声明的**主版本更高时仍然推送**并在结果里回带 `unsupportedVersion`。所以声明它不可能让某条通知发不出去。
+- **探测而不是猜**：上游明确要求调用方用 `apiVersion` + `capabilities` 判断能力。插件在首次投递时把
+  两者记一行日志（`desktopNotify apiVersion=… capabilities=[…]`），一次而非每次都记。
+- **走 `notify()` 而不是 `push()`**（门控路径）：只有结构化结果能区分「你正看着该会话所以静默」
+  「同文案命中上游去重窗口」「这台机器没有通知后端」——三者用 `push` 的布尔值看起来一模一样。
+  `pushAlways` 没有结构化版本，所以 `always` 那条路仍用它（否则「绕过门控」这个语义就丢了）。
+
 配置项 `notify`：`focused`（默认，走它的聚焦门控——你正在看的那个会话不弹，避免和聊天区重复）、
 `always`（绕过门控，任何情况都弹）、`off`。
+
+## 信任的确切范围
+
+`trustedTools` 命中即**跳过本插件的全部判定**，包括 shell 扫描、脚本扫描与「无法拦截的工具」这三条腿。
+唯一的例外是**自我保护**：它以**两个方向**都高于信任——自我保护开着时，`plugin_manager` **保持受管**，
+不管有没有被信任。
+
+第二条不是装饰。信任是一条关于「工具的文件访问」的声明；如果它能推翻插件自身的完整性保护，
+那就等于一行配置把「关掉插件」的能力交给了 AI。它同样管到 fail-closed 路径：插件自身内部出错时，
+一个被信任的 `plugin_manager` 仍然会被拒，而不是因为一个 bug 让组合变更**漏过去**。
+
+这条语义曾经写错（`&&` 与 `||` 混在一条表达式里、优先级只让信任挡住了第一条腿），
+现已改为显式分支，并由测试锁住「三条腿都被信任挡住 + `plugin_manager` 不被挡住 + 未信任时仍 fail-closed」三个方向。
+
+## 工具信任的候选列表
+
+「工具信任」里的 `match` 是一个**既可直接输入、也可下拉选择**的组合框：输入时按子串过滤候选，
+点右侧箭头展开完整列表。候选来自**本插件实际见过**的未建模工具，经同源路由
+`GET /path-guard/tools` 取——两半是不同 realm，客户端看不到宿主运行态，而第三方 bundle 没有
+`remote.*` 命名空间（那要走 DSH 的 API 网关声明），所以用路由；这也是 `dsh-desktop-notify`
+服务它整个 `/dnotify` 面的机制。**数据来源、持久化与上限见上一节「工具跟踪」。**
+
+## 工具跟踪（持续检测 + 拒绝时自学习）
+
+「工具信任」需要知道**本插件到底见过哪些工具**，否则用户面对一个空输入框。这条链路由
+`src/tracking.ts` 承担：
+
+- **持续检测**：每个**未建模**工具被叫到时记录一次（名字、首见/末见时间、次数、被拒次数）。
+  已建模的 `read`/`write`/`glob` 等不进这张表——它们本来就不需要信任。
+- **拒绝即学习**：某次拒绝如果是因为某个参数的**取值**像路径（而不是参数名），那么
+  「这个字段是路径字段」会被**按名字学下来**。此后该工具的判定从「猜取值形态」升级为
+  「按字段名精确判定」，这正是误报的主要来源被消除的地方。
+- **同族泛化**：学到 `notes_search` 的某个路径字段后，**同一前缀的已跟踪工具**（`notes_*`，
+  MCP 则是 `mcp__<server>__*`）一并继承该字段。之后才出现的新同族工具会在自己第一次被拒时学习。
+- **持久化**：写入 `<DSH_PROFILE_DIR>/path-guard-tools.json`（750ms 防抖 + 卸载时 flush）。
+  文件损坏、半写、形状不对一律**丢弃重建**，只记 debug 日志，绝不影响拦截。
+  上限：200 个工具（按末见时间淘汰最旧）、每工具 16 个字段。
+- **可读出口**：`GET /path-guard/tools` 返回
+  `{ "tools": string[], "lastUnmodelledAt": number|null, "records": ToolRecord[] }`。
+  `tools` 是向后兼容的名字列表（去重、字典序、上限 200）；`records` 是每条记录的完整元数据
+  （`name` / `firstSeenAt` / `lastSeenAt` / `seen` / `refused` / `fields` / `capabilities` /
+  `notified`），供前端展示与后续扩展，当前客户端只消费 `tools`。
+  路由先过 `connection.admit()`，未鉴权/跨源一律 401/403，连「插件装了没」都问不出来。
+- **纯属便利**：`fetch` 失败、非 200、非 JSON、形状不对、空数组——一律不渲染候选列表，
+  组合框仍然可以自由输入。没有 `webServer` 或没有鉴权服务时**不注册路由**（而不是挂一个没人能读的端点），
+  插件照常武装；所以 `webServer`/`connection` 是**可选获取**，不进 `inject`。
+
+## 已核对「不访问文件系统」的内置工具
+
+有一部分 DSH 内置工具的参数是**散文或标识符**——任务文本、作业 id、搜索词、代理提示。散文里经常出现
+看起来像路径的东西，而「未建模工具」的启发式是按**取值形态**判断的，分不出「这是一个路径参数」和
+「这是一段恰好是路径的文字」。实测撞到过：
+
+```
+todo_write({ todos: [{ content: 'C:/Users/…/.ssh/config' }] })   → 被拒
+```
+
+`todo_write` 只写任务列表、从不打开文件，拒它没有保护任何东西，只是把工具弄坏了。所以这些工具被
+**逐个核对后**声明为「不接触文件系统」（`todo_write`、`job_*`、`schedule_*`、`web_search` / `web_fetch`、
+`skill`、`ask_user_question` / `exit_plan_mode`、目标与团队/子代理编排类等）。
+
+这**不是按厂商的豁免**，是建模声明：列进来的每一个都被读过且不涉及文件。因此
+
+- 它们不参与路径判定，插件内部出错也不会 fail-closed 把它们收走；
+- **不构成普遍豁免**：未建模的第三方工具命中受保护路径时**仍然被拒**（有测试做反向对照）；
+- 边界：这张表是静态的，将来新增的内置工具会先按第三方工具处理（可用 `trustedTools` 覆盖）；
+  某个已列工具**以后长出**路径参数时，必须移到正式的工具表里——它说的是「已核对」，不是「已信任」。
 
 ## 许可证
 
@@ -164,10 +256,15 @@ target: D:\Program\dsh-path-guard
 ## 开发
 
 ```powershell
-node --test tests/host.spec.js tests/policy.spec.js tests/redact.spec.js
+npm run typecheck   # 三套 tsconfig：src / client / tests，零容忍
+npm test            # node --test，8 个 spec（含 build 产物冒烟）
+npm run build       # tsc → lib/（产物必须提交，见上）
 ```
 
-零构建步骤，纯 JS。`@deepseek-ai/schemastery` 是唯一运行时依赖（用于导出 `Config`）。
+源码是 **TypeScript 6.0.3**（`erasableSyntaxOnly`，为 TS 7 / Node 类型剥离铺路），
+靠 `tsc` 编译到 `lib/`，**没有打包器**。`@deepseek-ai/schemastery` 是唯一运行时依赖（用于导出 `Config`）。
 
 设计与调研过程见 [`docs/PLAN.md`](docs/PLAN.md)，
+架构与已接受的边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，
+验收记录见 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md)，
 研究留档在 [`reports/`](reports/)。
